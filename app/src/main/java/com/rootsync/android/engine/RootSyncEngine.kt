@@ -26,6 +26,7 @@ data class EngineResult(
 
 class RootSyncEngine(private val context: Context) {
     private val shell = RootShell()
+    private val controlShell = RootShell()
     private val runtimeDir = File(context.filesDir, "runtime").apply { mkdirs() }
     private val metadataDir = File(runtimeDir, "metadata").apply { mkdirs() }
     private val syncMetaPath: String
@@ -258,7 +259,7 @@ class RootSyncEngine(private val context: Context) {
             max connections = 1
             timeout = 300
             strict modes = true
-            refuse options = delete remove-source-files inplace append append-verify
+            refuse options = delete remove-source-files remove-sent-files inplace append append-verify
             address = $bindAddress
 
             $modules
@@ -268,8 +269,8 @@ class RootSyncEngine(private val context: Context) {
         stopServer(onLog = {})
         onLog(
             when (mode) {
-                SyncRole.SEND_ONLY -> "正在启动只发送服务端…"
-                SyncRole.RECEIVE_ONLY -> "正在启动只接收服务端…"
+                SyncRole.SEND_ONLY -> "正在为远端接收请求准备 send 模块…"
+                SyncRole.RECEIVE_ONLY -> "正在为远端发送请求准备 receive 模块…"
                 null -> "正在启动受限服务端（send 只读、receive 只写）…"
             }
         )
@@ -289,8 +290,8 @@ class RootSyncEngine(private val context: Context) {
             EngineResult(
                 true,
                 when (mode) {
-                    SyncRole.SEND_ONLY -> "服务端已启动：本机作为发送端"
-                    SyncRole.RECEIVE_ONLY -> "服务端已启动：本机作为接收端"
+                    SyncRole.SEND_ONLY -> "服务端已启动：本机发送源已可供远端接收"
+                    SyncRole.RECEIVE_ONLY -> "服务端已启动：本机接收目录已可供远端发送"
                     null -> "服务端已启动：支持只发送与只接收"
                 }
             )
@@ -324,7 +325,8 @@ class RootSyncEngine(private val context: Context) {
         secret: String,
         dryRun: Boolean,
         onLog: (String) -> Unit,
-        onProgress: (Float) -> Unit
+        onProgress: (Float) -> Unit,
+        onItem: (RsyncItem) -> Unit
     ): EngineResult = withContext(Dispatchers.IO) {
         if (!SafeInput.isValidIpv4(host)) return@withContext EngineResult(false, "请输入有效 IPv4 地址")
         SafeInput.validateStoragePath(destinationPath)?.let { return@withContext EngineResult(false, it) }
@@ -364,7 +366,7 @@ class RootSyncEngine(private val context: Context) {
             backupRunId = backupRunId(),
             dryRun = dryRun
         )
-        val transfer = executeTransfer(command, onLog, onProgress)
+        val transfer = executeTransfer(command, onLog, onProgress, onItem)
         if (transfer.exitCode != 0) {
             return@withContext EngineResult(
                 false,
@@ -404,7 +406,8 @@ class RootSyncEngine(private val context: Context) {
         secret: String,
         dryRun: Boolean,
         onLog: (String) -> Unit,
-        onProgress: (Float) -> Unit
+        onProgress: (Float) -> Unit,
+        onItem: (RsyncItem) -> Unit
     ): EngineResult = withContext(Dispatchers.IO) {
         if (!SafeInput.isValidIpv4(host)) return@withContext EngineResult(false, "请输入有效 IPv4 地址")
         SafeInput.validateStoragePath(sourcePath)?.let { return@withContext EngineResult(false, it) }
@@ -429,7 +432,7 @@ class RootSyncEngine(private val context: Context) {
             backupRunId = backupRunId(),
             dryRun = dryRun
         )
-        val transfer = executeTransfer(command, onLog, onProgress)
+        val transfer = executeTransfer(command, onLog, onProgress, onItem)
         if (transfer.exitCode != 0) {
             return@withContext EngineResult(
                 false,
@@ -447,13 +450,33 @@ class RootSyncEngine(private val context: Context) {
     private suspend fun executeTransfer(
         command: String,
         onLog: (String) -> Unit,
-        onProgress: (Float) -> Unit
-    ) = shell.execute(command) { line ->
+        onProgress: (Float) -> Unit,
+        onItem: (RsyncItem) -> Unit
+    ) = shell.execute(
+        "umask 077; echo \$\$ > ${SafeInput.shellQuote(File(runtimeDir, "transfer.pid").absolutePath)}; " +
+            "exec $command"
+    ) { line ->
         onLog(line)
+        RsyncOutputParser.parseItem(line)?.let(onItem)
         Regex("(?:^|\\s)([0-9]{1,3})%(?:\\s|$)")
             .find(line)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let {
                 onProgress(it.coerceIn(0, 100) / 100f)
             }
+    }
+
+    suspend fun pauseTransfer(): EngineResult = withContext(Dispatchers.IO) {
+        val pidFile = File(runtimeDir, "transfer.pid")
+        val command =
+            "pid_file=${SafeInput.shellQuote(pidFile.absolutePath)}; " +
+                "if [ -s \"\$pid_file\" ]; then pid=\$(cat \"\$pid_file\"); " +
+                "case \"\$pid\" in *[!0-9]*|'') ;; *) " +
+                "if [ -r \"/proc/\$pid/cmdline\" ] && " +
+                "tr '\\000' ' ' < \"/proc/\$pid/cmdline\" | grep -Fq 'rsync'; then " +
+                "kill -INT \"\$pid\" 2>/dev/null || true; fi ;; esac; fi"
+        val result = controlShell.execute(command)
+        shell.cancel()
+        if (result.exitCode == 0) EngineResult(true, "传输已暂停，临时分片已保留")
+        else EngineResult(false, "暂停信号发送失败", result.exitCode)
     }
 
     suspend fun isServerReachable(host: String, port: Int, timeoutMillis: Int = 1_500): Boolean =

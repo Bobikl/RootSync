@@ -71,6 +71,14 @@ data class PairAccepted(
     val role: SyncRole
 )
 
+data class TrustedPeerUpdate(
+    val deviceId: String,
+    val name: String,
+    val host: String,
+    val port: Int,
+    val secret: String? = null
+)
+
 data class StrategyUpdate(
     val deviceId: String,
     val name: String,
@@ -105,6 +113,30 @@ data class LogEntry(
     val message: String
 )
 
+enum class TransferStatus(val label: String) {
+    RUNNING("传输中"),
+    PAUSED("已暂停"),
+    COMPLETED("已完成")
+}
+
+data class TransferRecord(
+    val id: String,
+    val profileId: String?,
+    val deviceId: String?,
+    val peerName: String,
+    val host: String,
+    val port: Int,
+    val secret: String,
+    val role: SyncRole,
+    val sourcePath: String,
+    val destinationPath: String,
+    val status: TransferStatus,
+    val progress: Float = 0f,
+    val createdAtMillis: Long = System.currentTimeMillis(),
+    val updatedAtMillis: Long = System.currentTimeMillis(),
+    val message: String = ""
+)
+
 data class SyncUiState(
     val isChecking: Boolean = true,
     val isBusy: Boolean = false,
@@ -128,6 +160,14 @@ data class SyncUiState(
     val serverRunning: Boolean = false,
     val phase: String = "等待检查",
     val progress: Float? = null,
+    val estimatedCompletionTime: String? = null,
+    val isPreviewing: Boolean = false,
+    val transferPanelTitle: String = "差异与传输详情",
+    val transferFolders: List<String> = emptyList(),
+    val currentTransferFolder: String? = null,
+    val transferItemCount: Int = 0,
+    val transferFoldersTruncated: Boolean = false,
+    val transferRecord: TransferRecord? = null,
     val previewReady: Boolean = false,
     val lastResult: String? = null,
     val logs: List<LogEntry> = emptyList()

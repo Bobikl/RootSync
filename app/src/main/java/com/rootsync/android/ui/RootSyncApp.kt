@@ -71,6 +71,7 @@ import com.rootsync.android.domain.DiscoveredDevice
 import com.rootsync.android.domain.PeerProfile
 import com.rootsync.android.domain.SyncRole
 import com.rootsync.android.domain.SyncUiState
+import com.rootsync.android.domain.TransferStatus
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -155,6 +156,22 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
     ) { granted ->
         if (granted) viewModel.scanLan() else viewModel.onLanPermissionDenied()
     }
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { viewModel.execute() }
+    val executeWithNotification = {
+        if (
+            Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.POST_NOTIFICATIONS
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            viewModel.execute()
+        }
+    }
     val startLanScan = {
         if (
             Build.VERSION.SDK_INT >= 36 &&
@@ -238,7 +255,11 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                 )
             } else {
                 state.discoveredDevices.forEach { device ->
-                    DiscoveredDeviceRow(device, onPair = { viewModel.requestPair(device.deviceId) })
+                    DiscoveredDeviceRow(
+                        device = device,
+                        trusted = state.profiles.any { it.deviceId == device.deviceId },
+                        onPair = { viewModel.requestPair(device.deviceId) }
+                    )
                 }
             }
         }
@@ -290,9 +311,10 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                         label = {
                             Text(
                                 when (role) {
-                                    SyncRole.SEND_ONLY -> "本机只发送"
+                                    SyncRole.SEND_ONLY ->
+                                        "发送给${state.profileName.ifBlank { "远端" }}（对方接收）"
                                     SyncRole.RECEIVE_ONLY ->
-                                        "${state.profileName.ifBlank { "远端" }}只发送"
+                                        "从${state.profileName.ifBlank { "远端" }}接收"
                                 }
                             )
                         }
@@ -352,8 +374,91 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                         modifier = Modifier.fillMaxWidth()
                     )
                     Text("${(state.progress * 100).toInt()}%", style = MaterialTheme.typography.labelLarge)
+                    state.estimatedCompletionTime?.let {
+                        Text(
+                            it,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
                 } else if (state.isBusy) {
                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
+            }
+        }
+
+        SectionCard(
+            title = state.transferPanelTitle,
+            subtitle = "已识别 ${state.transferItemCount} 个差异/传输项目"
+        ) {
+            Surface(
+                color = MaterialTheme.colorScheme.surfaceContainerHighest,
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier.fillMaxWidth().height(220.dp)
+            ) {
+                Column(
+                    modifier = Modifier.padding(14.dp).verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(7.dp)
+                ) {
+                    state.currentTransferFolder?.let { folder ->
+                        Surface(
+                            color = MaterialTheme.colorScheme.primaryContainer,
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                "当前：$folder",
+                                modifier = Modifier.padding(10.dp),
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                    }
+                    if (state.transferFolders.isEmpty()) {
+                        Text(
+                            if (state.isBusy) "正在扫描文件夹，请稍候…" else "点击差异预览后，变化文件夹会显示在这里。",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    } else {
+                        state.transferFolders.forEach { folder ->
+                            Text("• $folder", style = MaterialTheme.typography.bodyMedium)
+                        }
+                    }
+                    if (state.transferFoldersTruncated) {
+                        Text(
+                            "项目较多，仅显示前 400 个文件夹。",
+                            color = MaterialTheme.colorScheme.tertiary,
+                            style = MaterialTheme.typography.labelMedium
+                        )
+                    }
+                }
+            }
+        }
+
+        state.transferRecord?.let { record ->
+            SectionCard(
+                title = "传输记录 · ${record.status.label}",
+                subtitle = "${record.peerName} · ${record.role.label}",
+                emphasized = record.status == TransferStatus.PAUSED
+            ) {
+                LinearProgressIndicator(
+                    progress = { record.progress.coerceIn(0f, 1f) },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Text("记录进度 ${(record.progress * 100).toInt()}%")
+                if (record.message.isNotBlank()) {
+                    Text(record.message, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                if (record.status == TransferStatus.PAUSED && !state.isBusy) {
+                    Button(onClick = executeWithNotification, modifier = Modifier.fillMaxWidth()) {
+                        Text("继续传输")
+                    }
+                }
+                OutlinedButton(
+                    onClick = viewModel::deleteTransferRecord,
+                    enabled = !state.isBusy,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("删除这条传输记录")
                 }
             }
         }
@@ -375,11 +480,20 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                 modifier = Modifier.weight(1f)
             ) { Text("差异预览") }
             Button(
-                onClick = if (state.isBusy) viewModel::cancel else viewModel::execute,
+                onClick = if (state.isBusy) {
+                    if (state.isPreviewing) viewModel::cancel else viewModel::pauseTransfer
+                } else executeWithNotification,
                 enabled = state.isBusy || state.canOperate,
                 modifier = Modifier.weight(1f)
             ) {
-                Text(if (state.isBusy) "取消" else "执行${state.role.label}")
+                Text(
+                    when {
+                        state.isBusy && state.isPreviewing -> "取消预览"
+                        state.isBusy -> "暂停传输"
+                        state.transferRecord?.status == TransferStatus.PAUSED -> "继续传输"
+                        else -> "执行${state.role.label}"
+                    }
+                )
             }
         }
         Spacer(Modifier.height(8.dp))
@@ -408,7 +522,11 @@ private fun ProfileRow(profile: PeerProfile, selected: Boolean, onClick: () -> U
                 )
             }
             Text(
-                (if (profile.role == SyncRole.SEND_ONLY) "本机只发送" else "${profile.name}只发送") +
+                (if (profile.role == SyncRole.SEND_ONLY) {
+                    "本机发送 → ${profile.name}接收"
+                } else {
+                    "${profile.name}发送 → 本机接收"
+                }) +
                     " · 零删除",
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.primary
@@ -418,7 +536,11 @@ private fun ProfileRow(profile: PeerProfile, selected: Boolean, onClick: () -> U
 }
 
 @Composable
-private fun DiscoveredDeviceRow(device: DiscoveredDevice, onPair: () -> Unit) {
+private fun DiscoveredDeviceRow(
+    device: DiscoveredDevice,
+    trusted: Boolean,
+    onPair: () -> Unit
+) {
     Surface(
         color = MaterialTheme.colorScheme.surfaceContainerHighest,
         shape = RoundedCornerShape(14.dp),
@@ -433,7 +555,7 @@ private fun DiscoveredDeviceRow(device: DiscoveredDevice, onPair: () -> Unit) {
                 Text(device.name, fontWeight = FontWeight.Medium)
                 Text("${device.host}:${device.port}", style = MaterialTheme.typography.bodySmall)
             }
-            Button(onClick = onPair) { Text("配对") }
+            Button(onClick = onPair) { Text(if (trusted) "已连接" else "配对") }
         }
     }
 }

@@ -27,6 +27,45 @@ object SafeInput {
     fun shellQuote(value: String): String = "'" + value.replace("'", "'\\''") + "'"
 }
 
+data class RsyncItem(
+    val itemizedChange: String,
+    val relativePath: String,
+    val folder: String,
+    val changeLabel: String
+)
+
+object RsyncOutputParser {
+    const val ITEM_PREFIX = "ROOTSYNC_ITEM:"
+
+    fun parseItem(line: String): RsyncItem? {
+        if (!line.startsWith(ITEM_PREFIX)) return null
+        val payload = line.removePrefix(ITEM_PREFIX)
+        val separator = payload.indexOf('|')
+        if (separator <= 0 || separator == payload.lastIndex) return null
+        val itemized = payload.substring(0, separator).trim()
+        if (itemized.startsWith("*deleting")) return null
+        val relativePath = payload.substring(separator + 1)
+            .substringBefore(" -> ")
+            .removePrefix("./")
+            .trim()
+        if (relativePath.isBlank()) return null
+        val normalized = relativePath.trimEnd('/')
+        val isDirectory = relativePath.endsWith('/') || itemized.getOrNull(1) == 'd'
+        val folder = when {
+            normalized.isBlank() -> "（根目录）"
+            isDirectory -> normalized
+            '/' in normalized -> normalized.substringBeforeLast('/')
+            else -> "（根目录）"
+        }
+        val changeLabel = when {
+            itemized.contains("+++++++++") -> "新增"
+            isDirectory -> "目录更新"
+            else -> "更新"
+        }
+        return RsyncItem(itemized, relativePath, folder, changeLabel)
+    }
+}
+
 object RsyncCommandBuilder {
     fun pull(
         rsyncPath: String,
@@ -46,7 +85,8 @@ object RsyncCommandBuilder {
             rsyncPath,
             "-rlt",
             "--human-readable",
-            "--info=progress2,stats2,name1",
+            "--info=progress2,stats2",
+            "--out-format=${RsyncOutputParser.ITEM_PREFIX}%i|%n%L",
             "--partial",
             "--partial-dir=.rsync-partial",
             "--delay-updates",
@@ -85,7 +125,8 @@ object RsyncCommandBuilder {
             rsyncPath,
             "-rlt",
             "--human-readable",
-            "--info=progress2,stats2,name1",
+            "--info=progress2,stats2",
+            "--out-format=${RsyncOutputParser.ITEM_PREFIX}%i|%n%L",
             "--partial",
             "--partial-dir=.rsync-partial",
             "--delay-updates",

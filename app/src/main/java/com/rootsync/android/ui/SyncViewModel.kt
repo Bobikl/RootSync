@@ -15,8 +15,13 @@ import com.rootsync.android.domain.StrategyUpdate
 import com.rootsync.android.domain.SyncPrepareRequest
 import com.rootsync.android.domain.SyncRole
 import com.rootsync.android.domain.SyncUiState
+import com.rootsync.android.domain.TransferRecord
+import com.rootsync.android.domain.TransferStatus
+import com.rootsync.android.domain.TrustedPeerUpdate
 import com.rootsync.android.engine.RootSyncEngine
+import com.rootsync.android.engine.RsyncItem
 import com.rootsync.android.engine.SafeInput
+import com.rootsync.android.service.TransferForegroundService
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -25,6 +30,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
+import java.time.LocalDateTime
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.util.UUID
@@ -38,16 +44,40 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     private val deviceName = resolveDeviceName(application)
     private val _state = MutableStateFlow(loadState())
     val state: StateFlow<SyncUiState> = _state.asStateFlow()
+    @Volatile private var pauseRequested = false
+    @Volatile private var lastTransferPersistMillis = 0L
     private val discovery = LanDiscoveryManager(
         context = application,
         deviceId = deviceId,
         deviceName = deviceName,
         localPort = { SafeInput.parsePort(_state.value.serverPortText) ?: SyncUiState.DEFAULT_RSYNC_PORT },
         localSecret = { _state.value.serverSecret },
+        isTrustedDevice = { remoteId ->
+            _state.value.profiles.any { it.deviceId == remoteId && !it.deviceId.startsWith("manual:") }
+        },
         onLog = { message -> appendLog("LAN", message) }
     )
 
     init {
+        _state.value.transferRecord?.takeIf { it.status == TransferStatus.RUNNING }?.let { record ->
+            _state.update {
+                it.copy(
+                    transferRecord = record.copy(
+                        status = TransferStatus.PAUSED,
+                        updatedAtMillis = System.currentTimeMillis(),
+                        message = "应用上次退出时传输中断，可点击继续传输"
+                    ),
+                    phase = "检测到未完成传输",
+                    progress = record.progress,
+                    lastResult = "上次传输已安全转为暂停，可继续"
+                )
+            }
+            persistTransferRecord()
+            TransferForegroundService.stop(application)
+            viewModelScope.launch { engine.pauseTransfer() }
+        }
+        // 新安装首次生成的密钥也立即落盘，避免进程在能力检查前退出后重新生成。
+        saveConfig()
         discovery.start()
         viewModelScope.launch {
             discovery.devices.collect { devices ->
@@ -72,6 +102,9 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         }
         viewModelScope.launch {
             discovery.syncPrepareRequests.collect { request -> handleSyncPrepareRequest(request) }
+        }
+        viewModelScope.launch {
+            discovery.trustedPeerUpdates.collect { update -> applyTrustedPeerUpdate(update) }
         }
         refreshCapabilities()
     }
@@ -110,6 +143,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             role = selected?.role ?: fallbackRole,
             profiles = profiles,
             selectedProfileId = selected?.id,
+            transferRecord = decodeTransferRecord(preferences.getString("transferRecord", null)),
             localIp = engine.localIpv4()
         )
     }
@@ -264,6 +298,9 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         val id = _state.value.selectedProfileId ?: return
         val removed = _state.value.profiles.firstOrNull { it.id == id } ?: return
         _state.update {
+            val removesTransfer = it.transferRecord?.let { record ->
+                record.profileId == removed.id || record.deviceId == removed.deviceId
+            } == true
             it.copy(
                 profiles = it.profiles.filterNot { profile -> profile.id == id },
                 selectedProfileId = null,
@@ -271,6 +308,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 remoteHost = "",
                 remoteSecret = "",
                 previewReady = false,
+                transferRecord = if (removesTransfer) null else it.transferRecord,
                 lastResult = "已删除 ${removed.name}"
             )
         }
@@ -295,6 +333,16 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     fun requestPair(deviceId: String) {
         val device = _state.value.discoveredDevices.firstOrNull { it.deviceId == deviceId } ?: return
         val current = _state.value
+        val trusted = current.profiles.firstOrNull { it.deviceId == deviceId }
+        if (trusted != null) {
+            selectProfile(trusted.id)
+            applyTrustedPeerUpdate(
+                TrustedPeerUpdate(device.deviceId, device.name, device.host, device.port)
+            )
+            discovery.reconnectTrusted(device)
+            _state.update { it.copy(lastResult = "正在恢复与 ${device.name} 的已保存连接") }
+            return
+        }
         discovery.requestPair(device, current.role)
         _state.update { it.copy(lastResult = "等待 ${device.name} 确认连接") }
     }
@@ -357,6 +405,31 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         saveConfig()
     }
 
+    private fun applyTrustedPeerUpdate(update: TrustedPeerUpdate) {
+        val current = _state.value
+        val existing = current.profiles.firstOrNull { it.deviceId == update.deviceId } ?: return
+        val rotatedSecret = update.secret?.takeIf { it.length >= SyncUiState.MIN_SECRET_LENGTH }
+        val updated = existing.copy(
+            name = update.name,
+            host = update.host,
+            port = update.port,
+            secret = rotatedSecret ?: existing.secret
+        )
+        _state.update { state ->
+            val selected = state.selectedProfileId == existing.id
+            state.copy(
+                profiles = state.profiles.map { if (it.id == existing.id) updated else it },
+                profileName = if (selected) updated.name else state.profileName,
+                remoteHost = if (selected) updated.host else state.remoteHost,
+                portText = if (selected) updated.port.toString() else state.portText,
+                remoteSecret = if (selected) updated.secret else state.remoteSecret,
+                selectedProfileId = if (selected) updated.id else state.selectedProfileId,
+                lastResult = if (rotatedSecret != null) "已恢复与 ${updated.name} 的信任连接" else state.lastResult
+            )
+        }
+        saveConfig()
+    }
+
     private fun publishCurrentStrategy() {
         val current = _state.value
         val profile = current.profiles.firstOrNull { it.id == current.selectedProfileId } ?: return
@@ -367,14 +440,18 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     private fun applyRemoteStrategy(update: StrategyUpdate) {
         val current = _state.value
         val existing = current.profiles.firstOrNull { it.deviceId == update.deviceId }
-        if (existing == null || existing.secret != update.secret) {
+        if (existing == null) {
             appendLog("WARN", "已忽略 ${update.name} 的未认证策略更新")
             return
+        }
+        if (existing.secret != update.secret) {
+            appendLog("LAN", "${update.name} 的配对密钥已自动轮换，保留原信任关系")
         }
         val localRole = update.role.opposite()
         val updatedProfile = existing.copy(
             name = update.name,
             host = update.host,
+            secret = update.secret,
             role = localRole
         )
         _state.update { state ->
@@ -385,6 +462,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 },
                 profileName = if (selected) updatedProfile.name else state.profileName,
                 remoteHost = if (selected) updatedProfile.host else state.remoteHost,
+                remoteSecret = if (selected) updatedProfile.secret else state.remoteSecret,
                 role = if (selected) localRole else state.role,
                 previewReady = if (selected) false else state.previewReady,
                 lastResult = "${update.name} 已设为${update.role.label}；本机自动切换为${localRole.label}"
@@ -401,10 +479,13 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         val initial = _state.value
         val profile = initial.profiles.firstOrNull { it.deviceId == request.deviceId }
         val port = SafeInput.parsePort(initial.serverPortText) ?: SyncUiState.DEFAULT_RSYNC_PORT
-        if (profile == null || profile.secret != request.secret) {
+        if (profile == null) {
             appendLog("WARN", "已拒绝 ${request.name} 的未认证同步准备请求")
-            discovery.answerSyncPreparation(request, false, "设备未配对或密钥已变更", port)
+            discovery.answerSyncPreparation(request, false, "设备未配对或已主动删除", port)
             return
+        }
+        if (profile.secret != request.secret) {
+            appendLog("LAN", "${request.name} 的密钥发生变化，按已保存设备 ID 自动恢复信任")
         }
         if (initial.isBusy) {
             discovery.answerSyncPreparation(request, false, "远端设备正在执行其他任务", port)
@@ -472,6 +553,15 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             putString("role", value.role.name)
             putString("profiles", encodeProfiles(value.profiles))
             putString("selectedProfileId", value.selectedProfileId)
+            value.transferRecord?.let { putString("transferRecord", encodeTransferRecord(it)) }
+                ?: remove("transferRecord")
+        }
+    }
+
+    private fun persistTransferRecord() {
+        preferences.edit {
+            _state.value.transferRecord?.let { putString("transferRecord", encodeTransferRecord(it)) }
+                ?: remove("transferRecord")
         }
     }
 
@@ -525,9 +615,34 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
 
     fun preview() = runTransfer(dryRun = true)
 
-    fun execute() = runTransfer(dryRun = false)
+    fun execute() {
+        if (_state.value.transferRecord?.status == TransferStatus.PAUSED) resumeTransfer()
+        else runTransfer(dryRun = false)
+    }
 
-    private fun runTransfer(dryRun: Boolean) {
+    fun resumeTransfer() {
+        val record = _state.value.transferRecord?.takeIf { it.status == TransferStatus.PAUSED } ?: return
+        val profile = _state.value.profiles.firstOrNull {
+            it.id == record.profileId || it.deviceId == record.deviceId
+        }
+        _state.update {
+            it.copy(
+                selectedProfileId = profile?.id ?: record.profileId,
+                profileName = profile?.name ?: record.peerName,
+                remoteHost = profile?.host ?: record.host,
+                portText = (profile?.port ?: record.port).toString(),
+                remoteSecret = profile?.secret ?: record.secret,
+                role = record.role,
+                sourcePath = record.sourcePath,
+                destinationPath = record.destinationPath,
+                lastResult = "正在继续上次未完成传输"
+            )
+        }
+        saveConfig()
+        runTransfer(dryRun = false, resumeRecord = record)
+    }
+
+    private fun runTransfer(dryRun: Boolean, resumeRecord: TransferRecord? = null) {
         val current = _state.value
         val rsync = current.capabilities.rsyncPath
         val port = SafeInput.parsePort(current.portText)
@@ -547,8 +662,65 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
 
         val action = if (current.role == SyncRole.SEND_ONLY) "只发送" else "只接收"
         launchBusy(if (dryRun) "正在预览${action}差异" else "正在执行$action") {
-            _state.update { it.copy(progress = if (dryRun) null else 0f, lastResult = null) }
-            val endpoint = ensureRemoteServerReady(current, port) ?: return@launchBusy
+            pauseRequested = false
+            val now = System.currentTimeMillis()
+            val activeRecord = if (dryRun) null else resumeRecord?.copy(
+                host = current.remoteHost,
+                port = port,
+                secret = current.remoteSecret,
+                status = TransferStatus.RUNNING,
+                updatedAtMillis = now,
+                message = "正在继续传输"
+            ) ?: TransferRecord(
+                id = UUID.randomUUID().toString(),
+                profileId = current.selectedProfileId,
+                deviceId = current.profiles.firstOrNull { it.id == current.selectedProfileId }?.deviceId,
+                peerName = current.profileName.ifBlank { current.remoteHost },
+                host = current.remoteHost,
+                port = port,
+                secret = current.remoteSecret,
+                role = current.role,
+                sourcePath = current.sourcePath,
+                destinationPath = current.destinationPath,
+                status = TransferStatus.RUNNING,
+                message = "正在建立连接"
+            )
+            _state.update {
+                it.copy(
+                    progress = if (dryRun) 0f else activeRecord?.progress ?: 0f,
+                    estimatedCompletionTime = null,
+                    isPreviewing = dryRun,
+                    transferPanelTitle = if (dryRun) "差异文件夹" else if (current.role == SyncRole.SEND_ONLY) {
+                        "正在上传的文件夹"
+                    } else {
+                        "正在接收的文件夹"
+                    },
+                    transferFolders = emptyList(),
+                    currentTransferFolder = null,
+                    transferItemCount = 0,
+                    transferFoldersTruncated = false,
+                    transferRecord = if (dryRun) it.transferRecord else activeRecord,
+                    lastResult = null
+                )
+            }
+            if (!dryRun) {
+                persistTransferRecord()
+                updateTransferNotification(action, "正在准备远端服务", null, 0f)
+            }
+            val endpoint = ensureRemoteServerReady(current, port)
+            if (endpoint == null) {
+                if (!dryRun) markTransferPaused("远端暂时不可用，传输已自动暂停")
+                else _state.update { it.copy(isPreviewing = false) }
+                return@launchBusy
+            }
+            val transferStartedAt = System.currentTimeMillis()
+            if (!dryRun) updateTransferNotification(action, "已连接，正在扫描文件", null, 0f)
+            val onProgress: (Float) -> Unit = { progress ->
+                updateTransferProgress(progress, transferStartedAt, dryRun, action)
+            }
+            val onItem: (RsyncItem) -> Unit = { item ->
+                updateTransferItem(item, dryRun, current.role)
+            }
             val result = if (current.role == SyncRole.SEND_ONLY) {
                 engine.push(
                     rsyncPath = rsync,
@@ -558,7 +730,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     secret = endpoint.secret,
                     dryRun = dryRun,
                     onLog = ::streamLog,
-                    onProgress = { progress -> _state.update { it.copy(progress = progress) } }
+                    onProgress = onProgress,
+                    onItem = onItem
                 )
             } else {
                 engine.pull(
@@ -569,32 +742,182 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     secret = endpoint.secret,
                     dryRun = dryRun,
                     onLog = ::streamLog,
-                    onProgress = { progress -> _state.update { it.copy(progress = progress) } }
+                    onProgress = onProgress,
+                    onItem = onItem
                 )
             }
+            if (!dryRun && pauseRequested) {
+                markTransferPaused("用户已暂停；临时分片保留，可继续传输")
+                pauseRequested = false
+                return@launchBusy
+            }
             _state.update {
+                val record = it.transferRecord
                 it.copy(
                     previewReady = dryRun && result.success,
                     progress = if (!dryRun && result.success) 1f else it.progress,
+                    estimatedCompletionTime = if (!dryRun && result.success) "已完成" else it.estimatedCompletionTime,
+                    isPreviewing = false,
+                    transferRecord = if (!dryRun && record != null) {
+                        record.copy(
+                            status = if (result.success) TransferStatus.COMPLETED else TransferStatus.PAUSED,
+                            progress = if (result.success) 1f else record.progress,
+                            updatedAtMillis = System.currentTimeMillis(),
+                            message = if (result.success) result.summary else "${result.summary}；已自动暂停"
+                        )
+                    } else record,
                     lastResult = result.summary,
-                    phase = result.summary
+                    phase = if (!dryRun && !result.success) "连接中断，已自动暂停" else result.summary
                 )
+            }
+            if (!dryRun) {
+                persistTransferRecord()
+                TransferForegroundService.stop(getApplication())
             }
             appendLog(if (result.success) "OK" else "ERROR", result.summary)
         }
+    }
+
+    fun pauseTransfer() {
+        if (!_state.value.isBusy || _state.value.isPreviewing) {
+            cancel()
+            return
+        }
+        pauseRequested = true
+        viewModelScope.launch {
+            val result = engine.pauseTransfer()
+            markTransferPaused(result.summary)
+            appendLog(if (result.success) "INFO" else "ERROR", result.summary)
+        }
+    }
+
+    fun deleteTransferRecord() {
+        if (_state.value.isBusy) return
+        _state.update {
+            it.copy(
+                transferRecord = null,
+                progress = null,
+                estimatedCompletionTime = null,
+                lastResult = "传输记录已删除；已下载的分片和用户文件未删除"
+            )
+        }
+        persistTransferRecord()
+    }
+
+    private fun updateTransferItem(item: RsyncItem, dryRun: Boolean, role: SyncRole) {
+        _state.update { state ->
+            val display = if (dryRun) "${item.changeLabel} · ${item.folder}" else item.folder
+            val alreadyShown = display in state.transferFolders
+            val canAppend = !alreadyShown && state.transferFolders.size < MAX_VISIBLE_TRANSFER_FOLDERS
+            state.copy(
+                transferFolders = if (canAppend) state.transferFolders + display else state.transferFolders,
+                currentTransferFolder = item.folder,
+                transferItemCount = state.transferItemCount + 1,
+                transferFoldersTruncated = state.transferFoldersTruncated || (!alreadyShown && !canAppend),
+                transferPanelTitle = if (dryRun) "差异文件夹" else if (role == SyncRole.SEND_ONLY) {
+                    "正在上传的文件夹"
+                } else {
+                    "正在接收的文件夹"
+                }
+            )
+        }
+    }
+
+    private fun updateTransferProgress(
+        progress: Float,
+        startedAtMillis: Long,
+        dryRun: Boolean,
+        action: String
+    ) {
+        val normalized = progress.coerceIn(0f, 1f)
+        val eta = if (dryRun) null else estimateCompletion(startedAtMillis, normalized)
+        _state.update { state ->
+            state.copy(
+                progress = normalized,
+                estimatedCompletionTime = eta,
+                transferRecord = state.transferRecord?.let { record ->
+                    if (dryRun) record else record.copy(
+                        progress = normalized,
+                        updatedAtMillis = System.currentTimeMillis(),
+                        message = state.currentTransferFolder?.let { "正在处理 $it" } ?: "正在传输"
+                    )
+                }
+            )
+        }
+        if (!dryRun) {
+            val now = System.currentTimeMillis()
+            if (now - lastTransferPersistMillis >= 1_000L || normalized >= 1f) {
+                lastTransferPersistMillis = now
+                persistTransferRecord()
+                val state = _state.value
+                updateTransferNotification(
+                    action,
+                    state.currentTransferFolder?.let { "正在处理：$it" } ?: "正在传输文件",
+                    eta,
+                    normalized
+                )
+            }
+        }
+    }
+
+    private fun estimateCompletion(startedAtMillis: Long, progress: Float): String? {
+        if (progress < 0.01f || progress >= 1f) return if (progress >= 1f) "已完成" else null
+        val elapsedMillis = (System.currentTimeMillis() - startedAtMillis).coerceAtLeast(1_000L)
+        val remainingSeconds = ((elapsedMillis / 1000.0) * (1.0 - progress) / progress)
+            .toLong().coerceAtLeast(1L)
+        if (remainingSeconds > 30L * 24L * 60L * 60L) return null
+        val finish = LocalDateTime.now().plusSeconds(remainingSeconds)
+            .format(DateTimeFormatter.ofPattern("MM-dd HH:mm:ss"))
+        return "预计 $finish 完成（剩余 ${formatDuration(remainingSeconds)}）"
+    }
+
+    private fun formatDuration(seconds: Long): String = when {
+        seconds >= 3600 -> "${seconds / 3600}小时${seconds % 3600 / 60}分"
+        seconds >= 60 -> "${seconds / 60}分${seconds % 60}秒"
+        else -> "${seconds}秒"
+    }
+
+    private fun updateTransferNotification(
+        action: String,
+        detail: String,
+        eta: String?,
+        progress: Float?
+    ) = TransferForegroundService.update(
+        context = getApplication(),
+        title = "RootSync 正在$action",
+        detail = detail,
+        eta = eta,
+        progress = progress
+    )
+
+    private fun markTransferPaused(message: String) {
+        _state.update { state ->
+            state.copy(
+                isPreviewing = false,
+                phase = "传输已暂停",
+                lastResult = message,
+                transferRecord = state.transferRecord?.copy(
+                    status = TransferStatus.PAUSED,
+                    updatedAtMillis = System.currentTimeMillis(),
+                    message = message
+                )
+            )
+        }
+        persistTransferRecord()
+        TransferForegroundService.stop(getApplication())
     }
 
     private suspend fun ensureRemoteServerReady(
         current: SyncUiState,
         configuredPort: Int
     ): RemoteEndpoint? {
-        if (engine.isServerReachable(current.remoteHost, configuredPort)) {
-            appendLog("LAN", "远端 rsync 端口已就绪：${current.remoteHost}:$configuredPort")
-            return RemoteEndpoint(current.remoteHost, configuredPort, current.remoteSecret)
-        }
-
+        val reachableBeforePrepare = engine.isServerReachable(current.remoteHost, configuredPort)
         val profile = current.profiles.firstOrNull { it.id == current.selectedProfileId }
         if (profile == null || profile.deviceId.startsWith("manual:")) {
+            if (reachableBeforePrepare) {
+                appendLog("LAN", "远端 rsync 端口已就绪：${current.remoteHost}:$configuredPort")
+                return RemoteEndpoint(current.remoteHost, configuredPort, current.remoteSecret)
+            }
             val message =
                 "无法连接远端 rsync 服务（错误 10）。请在远端服务页启动服务端，并核对 IP 与端口"
             appendLog("ERROR", message)
@@ -602,13 +925,20 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             return null
         }
 
-        appendLog("LAN", "远端端口未响应，正在请求 ${profile.name} 自动启动服务端")
+        appendLog(
+            "LAN",
+            "正在请求 ${profile.name} 按本次${current.role.label}方向准备正确的发送/接收模块"
+        )
         _state.update { it.copy(phase = "等待 ${profile.name} 准备服务端") }
         val prepared = discovery.requestSyncPreparation(
             host = current.remoteHost,
             role = current.role
         )
         if (prepared == null) {
+            if (reachableBeforePrepare) {
+                appendLog("WARN", "${profile.name} 未响应控制消息，继续使用其后台 rsync 服务")
+                return RemoteEndpoint(current.remoteHost, configuredPort, current.remoteSecret)
+            }
             val message = "${profile.name} 未响应服务准备请求；请保持远端 RootSync 打开"
             appendLog("ERROR", message)
             _state.update { it.copy(lastResult = message, phase = "远端无响应") }
@@ -650,7 +980,14 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
 
     fun cancel() {
         engine.cancel()
-        _state.update { it.copy(isBusy = false, phase = "任务已取消", lastResult = "任务已取消") }
+        _state.update {
+            it.copy(
+                isBusy = false,
+                isPreviewing = false,
+                phase = "任务已取消",
+                lastResult = "任务已取消"
+            )
+        }
         appendLog("WARN", "用户取消了当前任务")
     }
 
@@ -665,7 +1002,13 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             } catch (error: Exception) {
                 val message = error.message ?: error::class.java.simpleName
                 appendLog("ERROR", message)
-                _state.update { it.copy(lastResult = message, phase = "操作失败") }
+                if (_state.value.transferRecord?.status == TransferStatus.RUNNING &&
+                    !_state.value.isPreviewing
+                ) {
+                    markTransferPaused("$message；传输已自动暂停")
+                } else {
+                    _state.update { it.copy(lastResult = message, phase = "操作失败", isPreviewing = false) }
+                }
             } finally {
                 _state.update { it.copy(isBusy = false) }
             }
@@ -736,6 +1079,50 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         }.getOrElse { emptyList() }
     }
 
+    private fun encodeTransferRecord(record: TransferRecord): String = JSONObject().apply {
+        put("id", record.id)
+        put("profileId", record.profileId)
+        put("deviceId", record.deviceId)
+        put("peerName", record.peerName)
+        put("host", record.host)
+        put("port", record.port)
+        put("secret", record.secret)
+        put("role", record.role.name)
+        put("sourcePath", record.sourcePath)
+        put("destinationPath", record.destinationPath)
+        put("status", record.status.name)
+        put("progress", record.progress.toDouble())
+        put("createdAtMillis", record.createdAtMillis)
+        put("updatedAtMillis", record.updatedAtMillis)
+        put("message", record.message)
+    }.toString()
+
+    private fun decodeTransferRecord(raw: String?): TransferRecord? {
+        if (raw.isNullOrBlank()) return null
+        return runCatching {
+            val item = JSONObject(raw)
+            TransferRecord(
+                id = item.getString("id"),
+                profileId = item.optString("profileId").takeIf { it.isNotBlank() && it != "null" },
+                deviceId = item.optString("deviceId").takeIf { it.isNotBlank() && it != "null" },
+                peerName = item.optString("peerName", "远端设备"),
+                host = item.getString("host"),
+                port = item.optInt("port", SyncUiState.DEFAULT_RSYNC_PORT),
+                secret = item.optString("secret"),
+                role = runCatching { SyncRole.valueOf(item.getString("role")) }
+                    .getOrDefault(SyncRole.RECEIVE_ONLY),
+                sourcePath = item.optString("sourcePath", SyncUiState.DEFAULT_BILI_PATH),
+                destinationPath = item.optString("destinationPath", SyncUiState.DEFAULT_BILI_PATH),
+                status = runCatching { TransferStatus.valueOf(item.getString("status")) }
+                    .getOrDefault(TransferStatus.PAUSED),
+                progress = item.optDouble("progress", 0.0).toFloat().coerceIn(0f, 1f),
+                createdAtMillis = item.optLong("createdAtMillis", System.currentTimeMillis()),
+                updatedAtMillis = item.optLong("updatedAtMillis", System.currentTimeMillis()),
+                message = item.optString("message")
+            )
+        }.getOrNull()
+    }
+
     private fun migrateBiliPath(path: String): String =
         if (path == SyncUiState.LEGACY_BILI_PATH) SyncUiState.DEFAULT_BILI_PATH else path
 
@@ -747,6 +1134,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             Settings.Secure.getString(application.contentResolver, "bluetooth_name")
         }.getOrNull()?.trim().orEmpty()
         return globalName.ifBlank { secureName }.ifBlank { Build.MODEL }.ifBlank { "Android 设备" }
+    }
+
+    private companion object {
+        const val MAX_VISIBLE_TRANSFER_FOLDERS = 400
     }
 
     private data class RemoteEndpoint(val host: String, val port: Int, val secret: String)

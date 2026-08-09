@@ -15,6 +15,7 @@ import com.rootsync.android.domain.StrategyUpdate
 import com.rootsync.android.domain.SyncPrepareRequest
 import com.rootsync.android.domain.SyncPrepareResult
 import com.rootsync.android.domain.SyncRole
+import com.rootsync.android.domain.TrustedPeerUpdate
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -56,6 +57,7 @@ class LanDiscoveryManager(
     private val deviceName: String,
     private val localPort: () -> Int,
     private val localSecret: () -> String,
+    private val isTrustedDevice: (String) -> Boolean,
     private val onLog: (String) -> Unit
 ) {
     private val appContext = context.applicationContext
@@ -64,6 +66,8 @@ class LanDiscoveryManager(
     private val nsdManager = appContext.getSystemService(NsdManager::class.java)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val outgoingPairRequests = ConcurrentHashMap<String, PairIntent>()
+    private val trustedReconnectRequests = ConcurrentHashMap<String, String>()
+    private val trustedReconnectTimes = ConcurrentHashMap<String, Long>()
     private val prepareWaiters = ConcurrentHashMap<String, CompletableDeferred<SyncPrepareResult>>()
     private val resolveQueue = ConcurrentLinkedQueue<NsdServiceInfo>()
     private val resolving = AtomicBoolean(false)
@@ -101,6 +105,12 @@ class LanDiscoveryManager(
         onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
     val syncPrepareRequests: SharedFlow<SyncPrepareRequest> = _syncPrepareRequests.asSharedFlow()
+
+    private val _trustedPeerUpdates = MutableSharedFlow<TrustedPeerUpdate>(
+        extraBufferCapacity = 16,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val trustedPeerUpdates: SharedFlow<TrustedPeerUpdate> = _trustedPeerUpdates.asSharedFlow()
 
     fun start() {
         if (socket == null) startUdpListener()
@@ -143,6 +153,20 @@ class LanDiscoveryManager(
         scope.launch {
             send(message, InetAddress.getByName(device.host))
             onLog("已向 ${device.name} 发出配对请求")
+        }
+    }
+
+    fun reconnectTrusted(device: DiscoveredDevice) {
+        if (!isTrustedDevice(device.deviceId)) return
+        start()
+        val requestId = UUID.randomUUID().toString()
+        trustedReconnectRequests[requestId] = device.deviceId
+        val message = baseMessage(TYPE_TRUSTED_HELLO)
+            .put("requestId", requestId)
+            .put("secret", localSecret())
+        scope.launch {
+            send(message, InetAddress.getByName(device.host))
+            onLog("正在恢复与 ${device.name} 的已信任连接")
         }
     }
 
@@ -468,6 +492,32 @@ class LanDiscoveryManager(
                 val requestId = message.optString("requestId")
                 if (outgoingPairRequests.remove(requestId) != null) onLog("$remoteName 拒绝了配对请求")
             }
+            TYPE_TRUSTED_HELLO -> {
+                val requestId = message.optString("requestId")
+                val secret = message.optString("secret")
+                if (requestId.isNotBlank() && secret.length >= 6 && isTrustedDevice(remoteDeviceId)) {
+                    addOrUpdateDevice(remoteDeviceId, remoteName, host, remotePort, refreshTrust = false)
+                    _trustedPeerUpdates.tryEmit(
+                        TrustedPeerUpdate(remoteDeviceId, remoteName, host, remotePort, secret)
+                    )
+                    val reply = baseMessage(TYPE_TRUSTED_ACK)
+                        .put("requestId", requestId)
+                        .put("secret", localSecret())
+                    scope.launch { send(reply, sender) }
+                }
+            }
+            TYPE_TRUSTED_ACK -> {
+                val requestId = message.optString("requestId")
+                val expectedDeviceId = trustedReconnectRequests.remove(requestId)
+                val secret = message.optString("secret")
+                if (expectedDeviceId == remoteDeviceId && secret.length >= 6) {
+                    addOrUpdateDevice(remoteDeviceId, remoteName, host, remotePort, refreshTrust = false)
+                    _trustedPeerUpdates.tryEmit(
+                        TrustedPeerUpdate(remoteDeviceId, remoteName, host, remotePort, secret)
+                    )
+                    onLog("已自动恢复与 $remoteName 的信任连接")
+                }
+            }
             TYPE_STRATEGY_UPDATE -> {
                 val secret = message.optString("secret")
                 val role = parseRole(message.optString("role"))
@@ -524,11 +574,25 @@ class LanDiscoveryManager(
     private fun parseRole(value: String): SyncRole? =
         runCatching { SyncRole.valueOf(value) }.getOrNull()
 
-    private fun addOrUpdateDevice(deviceId: String, name: String, host: String, port: Int) {
+    private fun addOrUpdateDevice(
+        deviceId: String,
+        name: String,
+        host: String,
+        port: Int,
+        refreshTrust: Boolean = true
+    ) {
         val device = DiscoveredDevice(deviceId, name, host, port)
         _devices.update { current ->
             (current.filterNot { it.deviceId == deviceId } + device)
                 .sortedBy { it.name.lowercase() }
+        }
+        if (isTrustedDevice(deviceId)) {
+            _trustedPeerUpdates.tryEmit(TrustedPeerUpdate(deviceId, name, host, port))
+            if (refreshTrust) {
+                val now = System.currentTimeMillis()
+                val previous = trustedReconnectTimes.put(deviceId, now) ?: 0L
+                if (now - previous >= TRUST_RECONNECT_COOLDOWN_MS) reconnectTrusted(device)
+            }
         }
     }
 
@@ -597,10 +661,13 @@ class LanDiscoveryManager(
         private const val TYPE_PAIR_REQUEST = "pair_request"
         private const val TYPE_PAIR_ACCEPT = "pair_accept"
         private const val TYPE_PAIR_DENY = "pair_deny"
+        private const val TYPE_TRUSTED_HELLO = "trusted_hello"
+        private const val TYPE_TRUSTED_ACK = "trusted_ack"
         private const val TYPE_STRATEGY_UPDATE = "strategy_update"
         private const val TYPE_SYNC_PREPARE = "sync_prepare"
         private const val TYPE_SYNC_READY = "sync_ready"
         private const val PREPARE_TIMEOUT_MS = 30_000L
+        private const val TRUST_RECONNECT_COOLDOWN_MS = 10_000L
     }
 
     private data class PairIntent(val role: SyncRole)

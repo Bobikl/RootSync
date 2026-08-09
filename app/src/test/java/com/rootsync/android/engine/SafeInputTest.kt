@@ -59,6 +59,10 @@ class SafeInputTest {
         assertTrue(push.contains("/receive/"))
         assertTrue(pull.contains("--backup"))
         assertTrue(push.contains("--backup"))
+        assertTrue(pull.contains("--partial-dir=.rsync-partial"))
+        assertTrue(push.contains("--partial-dir=.rsync-partial"))
+        assertTrue(pull.contains("ROOTSYNC_ITEM:%i|%n%L"))
+        assertTrue(push.contains("ROOTSYNC_ITEM:%i|%n%L"))
         assertTrue(pull.contains(".rootsync-history/20260809-210000-000"))
         assertTrue(push.contains(".rootsync-history/20260809-210000-000"))
         assertFalse(pull.contains("--delete"))
@@ -74,5 +78,19 @@ class SafeInputTest {
         assertTrue(RsyncCommandBuilder.isDeletionOption("--remove-source-files"))
         assertTrue(RsyncCommandBuilder.isDeletionOption("--remove-sent-files"))
         assertFalse(RsyncCommandBuilder.isDeletionOption("--backup"))
+    }
+
+    @Test
+    fun parsesChangedFoldersFromStableRsyncOutput() {
+        val file = RsyncOutputParser.parseItem(
+            "ROOTSYNC_ITEM:>f+++++++++|season/episode/video.m4s"
+        )
+        val directory = RsyncOutputParser.parseItem(
+            "ROOTSYNC_ITEM:cd+++++++++|season/episode/"
+        )
+        assertEquals("season/episode", file?.folder)
+        assertEquals("新增", file?.changeLabel)
+        assertEquals("season/episode", directory?.folder)
+        assertNull(RsyncOutputParser.parseItem("1,024 25% 1.2MB/s 0:00:01"))
     }
 }
