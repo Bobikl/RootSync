@@ -104,6 +104,7 @@ data class SyncUiState(
 
     companion object {
         const val DEFAULT_RSYNC_PORT = 8873
+        const val MIN_SECRET_LENGTH = 6
         const val DEFAULT_BILI_PATH =
             "/storage/emulated/0/Android/data/tv.danmaku.bili/download"
         const val LEGACY_BILI_PATH =

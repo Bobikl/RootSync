@@ -161,7 +161,9 @@ class RootSyncEngine(private val context: Context) {
     ): EngineResult = withContext(Dispatchers.IO) {
         SafeInput.validateStoragePath(sourcePath)?.let { return@withContext EngineResult(false, it) }
         SafeInput.validateStoragePath(destinationPath)?.let { return@withContext EngineResult(false, it) }
-        if (secret.length < 16) return@withContext EngineResult(false, "配对密钥无效")
+        if (secret.length < com.rootsync.android.domain.SyncUiState.MIN_SECRET_LENGTH) {
+            return@withContext EngineResult(false, "配对密钥至少需要 6 位")
+        }
 
         val sourceReady = shell.execute(
             "test -d ${SafeInput.shellQuote(sourcePath)} && test -r ${SafeInput.shellQuote(sourcePath)}"

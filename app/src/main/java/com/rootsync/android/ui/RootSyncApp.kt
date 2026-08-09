@@ -1,8 +1,13 @@
 package com.rootsync.android.ui
 
+import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -45,6 +50,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
@@ -59,6 +65,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.core.content.ContextCompat
 import com.rootsync.android.domain.CapabilityCheck
 import com.rootsync.android.domain.CheckState
 import com.rootsync.android.domain.DiscoveredDevice
@@ -140,6 +147,37 @@ fun RootSyncApp(viewModel: SyncViewModel) {
 
 @Composable
 private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: PaddingValues) {
+    val context = LocalContext.current
+    val nearbyPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) viewModel.scanLan() else viewModel.onLanPermissionDenied()
+    }
+    val startLanScan = {
+        if (
+            Build.VERSION.SDK_INT >= 36 &&
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.NEARBY_WIFI_DEVICES
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            nearbyPermissionLauncher.launch(Manifest.permission.NEARBY_WIFI_DEVICES)
+        } else {
+            viewModel.scanLan()
+        }
+    }
+    LaunchedEffect(Unit) {
+        if (
+            Build.VERSION.SDK_INT >= 36 &&
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.NEARBY_WIFI_DEVICES
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            // 两端都要获得局域网权限，才能在首次打开时互相发现并接收配对请求。
+            nearbyPermissionLauncher.launch(Manifest.permission.NEARBY_WIFI_DEVICES)
+        }
+    }
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -179,10 +217,10 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
 
         SectionCard(
             title = "自动扫描局域网",
-            subtitle = "使用 UDP 8874 发现；点击设备后，对方会出现连接确认弹窗"
+            subtitle = "使用 Android NSD/mDNS + UDP 8874 双通道发现"
         ) {
             Button(
-                onClick = viewModel::scanLan,
+                onClick = startLanScan,
                 enabled = !state.isScanning,
                 modifier = Modifier.fillMaxWidth()
             ) {
@@ -408,6 +446,7 @@ private fun ServerPage(state: SyncUiState, viewModel: SyncViewModel, padding: Pa
             emphasized = state.serverRunning
         ) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                AssistChip(onClick = {}, label = { Text(state.deviceName) })
                 AssistChip(onClick = {}, label = { Text("IP  ${state.localIp}") })
                 AssistChip(onClick = {}, label = { Text("端口  ${state.serverPortText}") })
             }
@@ -435,19 +474,15 @@ private fun ServerPage(state: SyncUiState, viewModel: SyncViewModel, padding: Pa
                 minLines = 2,
                 modifier = Modifier.fillMaxWidth()
             )
-            Text("本机配对密钥", style = MaterialTheme.typography.labelLarge)
-            Surface(
-                color = MaterialTheme.colorScheme.surfaceContainerHighest,
-                shape = RoundedCornerShape(14.dp),
+            OutlinedTextField(
+                value = state.serverSecret,
+                onValueChange = viewModel::setServerSecret,
+                enabled = !state.serverRunning,
+                label = { Text("本机密钥（可自定义）") },
+                supportingText = { Text("至少 6 位；局域网内两端一致即可") },
+                singleLine = true,
                 modifier = Modifier.fillMaxWidth()
-            ) {
-                Text(
-                    state.serverSecret,
-                    fontFamily = FontFamily.Monospace,
-                    modifier = Modifier.padding(14.dp),
-                    style = MaterialTheme.typography.bodySmall
-                )
-            }
+            )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 TextButton(onClick = {
                     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager

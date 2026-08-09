@@ -2,6 +2,12 @@ package com.rootsync.android.discovery
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
+import android.net.wifi.WifiManager
+import android.os.Build
 import com.rootsync.android.domain.DiscoveredDevice
 import com.rootsync.android.domain.PairAccepted
 import com.rootsync.android.domain.PairRequest
@@ -10,6 +16,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -28,7 +35,15 @@ import java.net.InetSocketAddress
 import java.net.SocketException
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
+/**
+ * 局域网发现使用两条互为回退的通道：
+ * 1. Android NSD / DNS-SD，负责跨机型可靠发现；
+ * 2. UDP 广播，负责快速发现与配对请求/应答。
+ */
 class LanDiscoveryManager(
     context: Context,
     private val deviceId: String,
@@ -38,9 +53,20 @@ class LanDiscoveryManager(
     private val onLog: (String) -> Unit
 ) {
     private val appContext = context.applicationContext
+    private val connectivity = appContext.getSystemService(ConnectivityManager::class.java)
+    private val wifiManager = appContext.getSystemService(WifiManager::class.java)
+    private val nsdManager = appContext.getSystemService(NsdManager::class.java)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val outgoingPairRequests = ConcurrentHashMap.newKeySet<String>()
+    private val resolveQueue = ConcurrentLinkedQueue<NsdServiceInfo>()
+    private val resolving = AtomicBoolean(false)
+    private val scanGeneration = AtomicInteger(0)
     private var socket: DatagramSocket? = null
+    private var multicastLock: WifiManager.MulticastLock? = null
+    private var registrationListener: NsdManager.RegistrationListener? = null
+    private var discoveryListener: NsdManager.DiscoveryListener? = null
+    private var registeredServiceName: String? = null
+    @Volatile private var nsdDiscovering = false
 
     private val _devices = MutableStateFlow<List<DiscoveredDevice>>(emptyList())
     val devices: StateFlow<List<DiscoveredDevice>> = _devices.asStateFlow()
@@ -58,35 +84,9 @@ class LanDiscoveryManager(
     val pairAccepted: SharedFlow<PairAccepted> = _pairAccepted.asSharedFlow()
 
     fun start() {
-        if (socket != null) return
-        val opened = try {
-            DatagramSocket(null).apply {
-                reuseAddress = true
-                broadcast = true
-                bind(InetSocketAddress(DISCOVERY_PORT))
-            }
-        } catch (error: Exception) {
-            onLog("局域网发现监听失败：${error.message ?: error::class.java.simpleName}")
-            return
-        }
-        socket = opened
-        scope.launch {
-            try {
-                val buffer = ByteArray(MAX_PACKET_SIZE)
-                while (isActive) {
-                    val packet = DatagramPacket(buffer, buffer.size)
-                    opened.receive(packet)
-                    handlePacket(
-                        payload = String(packet.data, packet.offset, packet.length, Charsets.UTF_8),
-                        sender = packet.address
-                    )
-                }
-            } catch (_: SocketException) {
-                // 正常 stop() 会关闭 socket；端口占用则由下一次 scan 的日志提示。
-            } catch (error: Exception) {
-                onLog("局域网发现监听失败：${error.message ?: error::class.java.simpleName}")
-            }
-        }
+        if (socket == null) startUdpListener()
+        acquireMulticastLock()
+        registerNsdService()
     }
 
     fun scan() {
@@ -95,10 +95,18 @@ class LanDiscoveryManager(
             val cutoff = System.currentTimeMillis() - DEVICE_TTL_MS
             devices.filter { it.lastSeenMillis >= cutoff }
         }
+
+        val generation = scanGeneration.incrementAndGet()
+        startNsdDiscovery()
         scope.launch {
             val message = baseMessage(TYPE_DISCOVER)
-            broadcastAddresses().forEach { address -> send(message, address) }
-            onLog("已发送 UDP 局域网扫描，端口 $DISCOVERY_PORT")
+            repeat(UDP_SCAN_BURSTS) { index ->
+                broadcastAddresses().forEach { address -> send(message, address) }
+                if (index < UDP_SCAN_BURSTS - 1) delay(UDP_SCAN_INTERVAL_MS)
+            }
+            onLog("正在使用 NSD/mDNS 与 UDP 广播扫描局域网")
+            delay(SCAN_WINDOW_MS - UDP_SCAN_INTERVAL_MS * (UDP_SCAN_BURSTS - 1))
+            if (scanGeneration.get() == generation) stopNsdDiscovery()
         }
     }
 
@@ -118,8 +126,7 @@ class LanDiscoveryManager(
     fun answerPair(request: PairRequest, allow: Boolean) {
         start()
         val type = if (allow) TYPE_PAIR_ACCEPT else TYPE_PAIR_DENY
-        val message = baseMessage(type)
-            .put("requestId", request.requestId)
+        val message = baseMessage(type).put("requestId", request.requestId)
         if (allow) message.put("secret", localSecret())
         scope.launch {
             send(message, InetAddress.getByName(request.host))
@@ -128,9 +135,207 @@ class LanDiscoveryManager(
     }
 
     fun stop() {
+        stopNsdDiscovery()
+        registrationListener?.let { listener ->
+            runCatching { nsdManager.unregisterService(listener) }
+        }
+        registrationListener = null
+        registeredServiceName = null
+        multicastLock?.let { lock ->
+            if (lock.isHeld) runCatching { lock.release() }
+        }
+        multicastLock = null
         socket?.close()
         socket = null
         scope.cancel()
+    }
+
+    private fun startUdpListener() {
+        val opened = try {
+            DatagramSocket(null).apply {
+                reuseAddress = true
+                broadcast = true
+                bind(InetSocketAddress(DISCOVERY_PORT))
+            }
+        } catch (error: Exception) {
+            onLog("UDP 发现监听失败：${error.message ?: error::class.java.simpleName}")
+            return
+        }
+        wifiNetwork()?.let { network ->
+            runCatching { network.bindSocket(opened) }
+                .onFailure { error ->
+                    onLog("UDP 无法绑定 Wi-Fi，继续使用系统默认网络：${error.message ?: error::class.java.simpleName}")
+                }
+        }
+        socket = opened
+        scope.launch {
+            try {
+                val buffer = ByteArray(MAX_PACKET_SIZE)
+                while (isActive) {
+                    val packet = DatagramPacket(buffer, buffer.size)
+                    opened.receive(packet)
+                    handlePacket(
+                        payload = String(packet.data, packet.offset, packet.length, Charsets.UTF_8),
+                        sender = packet.address
+                    )
+                }
+            } catch (_: SocketException) {
+                // stop() 关闭 socket 后会正常退出。
+            } catch (error: Exception) {
+                onLog("UDP 发现监听异常：${error.message ?: error::class.java.simpleName}")
+            }
+        }
+    }
+
+    private fun acquireMulticastLock() {
+        if (multicastLock?.isHeld == true) return
+        multicastLock = runCatching {
+            wifiManager.createMulticastLock("RootSync:LanDiscovery").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }.onFailure { error ->
+            onLog("无法启用 Wi-Fi 组播接收：${error.message ?: error::class.java.simpleName}")
+        }.getOrNull()
+    }
+
+    private fun registerNsdService() {
+        if (registrationListener != null) return
+        val serviceInfo = NsdServiceInfo().apply {
+            // 服务实例名保持短 ASCII，避免中文设备名超过 mDNS 单标签 63 字节限制。
+            // 实际显示名称放在 TXT 属性 deviceName 中。
+            serviceName = "RootSync-${deviceId.take(12)}"
+            serviceType = NSD_SERVICE_TYPE
+            port = localPort()
+            setAttribute("deviceId", deviceId)
+            setAttribute("deviceName", deviceName.take(64))
+            setAttribute("protocol", PROTOCOL_VERSION.toString())
+        }
+        val listener = object : NsdManager.RegistrationListener {
+            override fun onServiceRegistered(info: NsdServiceInfo) {
+                registeredServiceName = info.serviceName
+                onLog("NSD 服务已注册：${info.serviceName}")
+            }
+
+            override fun onRegistrationFailed(info: NsdServiceInfo, errorCode: Int) {
+                registrationListener = null
+                onLog("NSD 服务注册失败：$errorCode")
+            }
+
+            override fun onServiceUnregistered(info: NsdServiceInfo) {
+                registeredServiceName = null
+            }
+
+            override fun onUnregistrationFailed(info: NsdServiceInfo, errorCode: Int) {
+                onLog("NSD 服务注销失败：$errorCode")
+            }
+        }
+        registrationListener = listener
+        runCatching {
+            nsdManager.registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, listener)
+        }.onFailure { error ->
+            registrationListener = null
+            onLog("NSD 不可用：${error.message ?: error::class.java.simpleName}")
+        }
+    }
+
+    private fun startNsdDiscovery() {
+        if (nsdDiscovering) return
+        val listener = object : NsdManager.DiscoveryListener {
+            override fun onDiscoveryStarted(serviceType: String) {
+                onLog("NSD 扫描已启动")
+            }
+
+            override fun onServiceFound(info: NsdServiceInfo) {
+                if (!info.serviceType.startsWith("_rootsync._tcp")) return
+                if (info.serviceName == registeredServiceName) return
+                resolveQueue.offer(info)
+                resolveNextNsdService()
+            }
+
+            override fun onServiceLost(info: NsdServiceInfo) {
+                // 设备列表依靠 TTL 清理，避免 Wi-Fi 抖动导致条目闪烁。
+            }
+
+            override fun onDiscoveryStopped(serviceType: String) {
+                nsdDiscovering = false
+            }
+
+            override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
+                nsdDiscovering = false
+                discoveryListener = null
+                onLog("NSD 扫描启动失败：$errorCode")
+            }
+
+            override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {
+                nsdDiscovering = false
+                discoveryListener = null
+                onLog("NSD 扫描停止失败：$errorCode")
+            }
+        }
+        discoveryListener = listener
+        nsdDiscovering = true
+        runCatching {
+            nsdManager.discoverServices(NSD_SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, listener)
+        }.onFailure { error ->
+            nsdDiscovering = false
+            discoveryListener = null
+            onLog("NSD 扫描异常：${error.message ?: error::class.java.simpleName}")
+        }
+    }
+
+    private fun stopNsdDiscovery() {
+        val listener = discoveryListener ?: return
+        if (nsdDiscovering) runCatching { nsdManager.stopServiceDiscovery(listener) }
+        discoveryListener = null
+        nsdDiscovering = false
+    }
+
+    @Suppress("DEPRECATION")
+    private fun resolveNextNsdService() {
+        if (!resolving.compareAndSet(false, true)) return
+        val next = resolveQueue.poll()
+        if (next == null) {
+            resolving.set(false)
+            return
+        }
+        runCatching {
+            nsdManager.resolveService(next, object : NsdManager.ResolveListener {
+                override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
+                    resolving.set(false)
+                    onLog("NSD 地址解析失败：$errorCode")
+                    resolveNextNsdService()
+                }
+
+                override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
+                    addResolvedNsdDevice(serviceInfo)
+                    resolving.set(false)
+                    resolveNextNsdService()
+                }
+            })
+        }.onFailure { error ->
+            resolving.set(false)
+            onLog("NSD 地址解析异常：${error.message ?: error::class.java.simpleName}")
+            resolveNextNsdService()
+        }
+    }
+
+    private fun addResolvedNsdDevice(info: NsdServiceInfo) {
+        val remoteDeviceId = info.attributes["deviceId"]?.toString(Charsets.UTF_8).orEmpty()
+        if (remoteDeviceId.isBlank() || remoteDeviceId == deviceId) return
+        val remoteName = info.attributes["deviceName"]?.toString(Charsets.UTF_8)
+            ?.takeIf { it.isNotBlank() }
+            ?: info.serviceName.removePrefix("RootSync-").substringBeforeLast('-')
+        val address = if (Build.VERSION.SDK_INT >= 34) {
+            info.hostAddresses.firstOrNull { it is Inet4Address } ?: info.host
+        } else {
+            @Suppress("DEPRECATION")
+            info.host
+        }
+        val host = address?.hostAddress?.takeIf { it.count { char -> char == '.' } == 3 } ?: return
+        val port = info.port.takeIf { it in 1024..65535 } ?: 8873
+        addOrUpdateDevice(remoteDeviceId, remoteName, host, port)
+        onLog("NSD 发现设备：$remoteName ($host:$port)")
     }
 
     private fun handlePacket(payload: String, sender: InetAddress) {
@@ -148,7 +353,7 @@ class LanDiscoveryManager(
             TYPE_PAIR_REQUEST -> {
                 val requestId = message.optString("requestId")
                 val secret = message.optString("secret")
-                if (requestId.isNotBlank() && secret.length >= 16) {
+                if (requestId.isNotBlank() && secret.length >= 6) {
                     _pairRequests.tryEmit(
                         PairRequest(requestId, remoteDeviceId, remoteName, host, remotePort, secret)
                     )
@@ -157,7 +362,7 @@ class LanDiscoveryManager(
             TYPE_PAIR_ACCEPT -> {
                 val requestId = message.optString("requestId")
                 val secret = message.optString("secret")
-                if (outgoingPairRequests.remove(requestId) && secret.length >= 16) {
+                if (outgoingPairRequests.remove(requestId) && secret.length >= 6) {
                     addOrUpdateDevice(remoteDeviceId, remoteName, host, remotePort)
                     _pairAccepted.tryEmit(
                         PairAccepted(remoteDeviceId, remoteName, host, remotePort, secret)
@@ -198,11 +403,21 @@ class LanDiscoveryManager(
         }
     }
 
+    private fun wifiNetwork(): Network? {
+        val active = connectivity.activeNetwork
+        if (active != null && connectivity.getNetworkCapabilities(active)
+                ?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+        ) return active
+        return connectivity.allNetworks.firstOrNull { network ->
+            connectivity.getNetworkCapabilities(network)
+                ?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+        }
+    }
+
     private fun broadcastAddresses(): Set<InetAddress> {
         val result = linkedSetOf(InetAddress.getByName("255.255.255.255"))
         runCatching {
-            val connectivity = appContext.getSystemService(ConnectivityManager::class.java)
-            val properties = connectivity.getLinkProperties(connectivity.activeNetwork)
+            val properties = connectivity.getLinkProperties(wifiNetwork())
             properties?.linkAddresses
                 ?.filter { it.address is Inet4Address && !it.address.isLoopbackAddress }
                 ?.forEach { link ->
@@ -221,10 +436,14 @@ class LanDiscoveryManager(
 
     companion object {
         const val DISCOVERY_PORT = 8874
+        const val SCAN_WINDOW_MS = 8_000L
+        private const val NSD_SERVICE_TYPE = "_rootsync._tcp."
         private const val MAGIC = "ROOTSYNC_LAN"
-        private const val PROTOCOL_VERSION = 1
+        private const val PROTOCOL_VERSION = 2
+        private const val UDP_SCAN_BURSTS = 3
+        private const val UDP_SCAN_INTERVAL_MS = 700L
         private const val MAX_PACKET_SIZE = 4096
-        private const val DEVICE_TTL_MS = 60_000L
+        private const val DEVICE_TTL_MS = 90_000L
         private const val TYPE_DISCOVER = "discover"
         private const val TYPE_ANNOUNCE = "announce"
         private const val TYPE_PAIR_REQUEST = "pair_request"

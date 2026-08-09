@@ -2,6 +2,7 @@ package com.rootsync.android.ui
 
 import android.app.Application
 import android.os.Build
+import android.provider.Settings
 import androidx.core.content.edit
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -32,10 +33,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     private val deviceId = preferences.getString("deviceId", null) ?: UUID.randomUUID().toString().also {
         preferences.edit { putString("deviceId", it) }
     }
-    private val deviceName = listOf(Build.MANUFACTURER, Build.MODEL)
-        .filter { it.isNotBlank() }
-        .joinToString(" ")
-        .ifBlank { "Android 设备" }
+    private val deviceName = resolveDeviceName(application)
     private val _state = MutableStateFlow(loadState())
     val state: StateFlow<SyncUiState> = _state.asStateFlow()
     private val discovery = LanDiscoveryManager(
@@ -152,6 +150,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     fun setRemoteSecret(value: String) = updateConfig {
         copy(remoteSecret = value.trim().take(128), previewReady = false)
     }
+    fun setServerSecret(value: String) = updateConfig {
+        copy(
+            serverSecret = value.filterNot { it.isISOControl() }.trim().take(64),
+            previewReady = false
+        )
+    }
     fun setRole(value: SyncRole) = updateConfig { copy(role = value, previewReady = false) }
     fun setMirror(value: Boolean) = updateConfig { copy(mirror = value, previewReady = false) }
 
@@ -183,7 +187,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         when {
             !SafeInput.isValidIpv4(current.remoteHost) -> appendLog("ERROR", "请输入有效的远端 IPv4 地址")
             port == null -> appendLog("ERROR", "端口必须位于 1024–65535")
-            current.remoteSecret.length < 16 -> appendLog("ERROR", "配对密钥至少需要 16 位")
+            current.remoteSecret.length < SyncUiState.MIN_SECRET_LENGTH ->
+                appendLog("ERROR", "密钥至少需要 ${SyncUiState.MIN_SECRET_LENGTH} 位")
             else -> {
                 val id = current.selectedProfileId ?: UUID.randomUUID().toString()
                 val existing = current.profiles.firstOrNull { it.id == id }
@@ -271,9 +276,14 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         _state.update { it.copy(isScanning = true) }
         discovery.scan()
         viewModelScope.launch {
-            delay(3_000)
+            delay(LanDiscoveryManager.SCAN_WINDOW_MS)
             _state.update { it.copy(isScanning = false) }
         }
+    }
+
+    fun onLanPermissionDenied() {
+        appendLog("ERROR", "未授予“附近设备”权限，Android 16 可能会阻止局域网扫描")
+        _state.update { it.copy(isScanning = false, lastResult = "请允许附近设备权限后重新扫描") }
     }
 
     fun requestPair(deviceId: String) {
@@ -418,7 +428,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             rsync == null -> "内置 rsync 不可执行"
             !SafeInput.isValidIpv4(current.remoteHost) -> "请输入有效的远端 IPv4 地址"
             port == null -> "端口必须位于 1024–65535"
-            current.remoteSecret.length < 16 -> "请完成配对或输入远端密钥"
+            current.remoteSecret.length < SyncUiState.MIN_SECRET_LENGTH -> "请完成配对或输入远端密钥"
             else -> SafeInput.validateStoragePath(localPath)
         }
         if (validation != null || rsync == null || port == null) {
@@ -559,4 +569,14 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun migrateBiliPath(path: String): String =
         if (path == SyncUiState.LEGACY_BILI_PATH) SyncUiState.DEFAULT_BILI_PATH else path
+
+    private fun resolveDeviceName(application: Application): String {
+        val globalName = runCatching {
+            Settings.Global.getString(application.contentResolver, Settings.Global.DEVICE_NAME)
+        }.getOrNull()?.trim().orEmpty()
+        val secureName = runCatching {
+            Settings.Secure.getString(application.contentResolver, "bluetooth_name")
+        }.getOrNull()?.trim().orEmpty()
+        return globalName.ifBlank { secureName }.ifBlank { Build.MODEL }.ifBlank { "Android 设备" }
+    }
 }
