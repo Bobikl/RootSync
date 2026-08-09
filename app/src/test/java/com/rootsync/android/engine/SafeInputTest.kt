@@ -119,4 +119,22 @@ class SafeInputTest {
         assertEquals("season/episode", directory?.folder)
         assertNull(RsyncOutputParser.parseItem("1,024 25% 1.2MB/s 0:00:01"))
     }
+
+    @Test
+    fun keepsOnlyCurrentRsyncDaemonLaunchAndSurfacesBindFailure() {
+        val lines = RsyncServerLogParser.currentLaunchLines(
+            listOf(
+                "ROOTSYNC_START_old",
+                "old permission denied",
+                "ROOTSYNC_START_current",
+                "rsyncd version 3.4.4 starting",
+                "failed to bind socket: Address already in use",
+                "rsync error: error in socket IO (code 10)"
+            )
+        )
+        val summary = RsyncServerLogParser.summarize(lines)
+        assertFalse(lines.any { it.contains("old permission") })
+        assertTrue(summary?.contains("Address already in use") == true)
+        assertTrue(summary?.contains("socket IO") == true)
+    }
 }

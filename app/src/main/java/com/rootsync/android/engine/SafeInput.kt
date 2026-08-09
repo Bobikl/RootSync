@@ -66,6 +66,28 @@ object RsyncOutputParser {
     }
 }
 
+object RsyncServerLogParser {
+    fun currentLaunchLines(tail: List<String>): List<String> {
+        val markerIndex = tail.indexOfLast { it.trim().startsWith("ROOTSYNC_START_") }
+        return (if (markerIndex >= 0) tail.drop(markerIndex + 1) else tail)
+            .map(String::trim)
+            .filter { it.isNotBlank() && !it.startsWith("ROOTSYNC_START_") }
+            .takeLast(40)
+    }
+
+    fun summarize(lines: List<String>): String? {
+        val normalized = lines.map(String::trim).filter(String::isNotBlank).takeLast(40)
+        if (normalized.isEmpty()) return null
+        val errors = normalized.filter { line ->
+            val lower = line.lowercase()
+            lower.contains("fail") || lower.contains("error") || lower.contains("bind") ||
+                lower.contains("address") || lower.contains("socket") || lower.contains("config") ||
+                lower.contains("pid") || lower.contains("permission")
+        }
+        return (errors.ifEmpty { normalized }.takeLast(3)).joinToString(" | ").take(360)
+    }
+}
+
 object RsyncCommandBuilder {
     fun pull(
         rsyncPath: String,

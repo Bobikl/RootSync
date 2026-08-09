@@ -10,6 +10,7 @@ import com.rootsync.android.domain.SyncRangeMode
 import com.rootsync.android.domain.SyncRole
 import com.rootsync.android.root.RootShell
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.net.Inet4Address
@@ -285,7 +286,25 @@ class RootSyncEngine(private val context: Context) {
             """.trimIndent() + "\n"
         )
 
-        stopServer(onLog = {})
+        val stopResult = stopServer(onLog)
+        if (!stopResult.success) {
+            return@withContext EngineResult(false, "无法停止旧 rsync 服务：${stopResult.summary}")
+        }
+        var portReleased = !isServerReachable(bindAddress, port, timeoutMillis = 150)
+        repeat(15) {
+            if (!portReleased) {
+                delay(100)
+                portReleased = !isServerReachable(bindAddress, port, timeoutMillis = 150)
+            }
+        }
+        if (!portReleased) {
+            val detail = serverFailureDetail(logFile, emptyList(), onLog)
+            return@withContext EngineResult(
+                false,
+                "端口 $port 仍被旧服务或其他程序占用${detail?.let { "：$it" }.orEmpty()}",
+                98
+            )
+        }
         onLog(
             when (mode) {
                 SyncRole.SEND_ONLY -> "正在为远端接收请求准备 send 模块…"
@@ -294,19 +313,42 @@ class RootSyncEngine(private val context: Context) {
                 null -> "正在启动受限服务端（send 只读、receive 只写）…"
             }
         )
+        val launchMarker = "ROOTSYNC_START_${backupRunId()}"
+        shell.execute(
+            "printf '%s\\n' ${SafeInput.shellQuote(launchMarker)} >> " +
+                SafeInput.shellQuote(logFile.absolutePath)
+        )
         val result = shell.execute(
             "${SafeInput.shellQuote(rsyncPath)} --daemon --port=$port " +
                 "--config=${SafeInput.shellQuote(config.absolutePath)}",
             onLog
         )
         if (result.exitCode != 0) {
-            return@withContext EngineResult(false, "rsync 服务启动失败", result.exitCode)
+            val detail = serverFailureDetail(logFile, result.output, onLog)
+            return@withContext EngineResult(
+                false,
+                "rsync 服务启动失败${detail?.let { "：$it" }.orEmpty()}",
+                result.exitCode
+            )
         }
         val check = shell.execute(
-            "test -s ${SafeInput.shellQuote(pidFile.absolutePath)} && " +
-                "kill -0 \$(cat ${SafeInput.shellQuote(pidFile.absolutePath)})"
+            "pid_file=${SafeInput.shellQuote(pidFile.absolutePath)}; attempt=0; " +
+                "while [ \"\$attempt\" -lt 30 ]; do " +
+                "if [ -s \"\$pid_file\" ]; then pid=\$(cat \"\$pid_file\"); " +
+                "case \"\$pid\" in *[!0-9]*|'') ;; *) " +
+                "if kill -0 \"\$pid\" 2>/dev/null; then exit 0; fi ;; esac; fi; " +
+                "attempt=\$((attempt + 1)); sleep 0.1; done; exit 1"
         )
+        var listening = false
         if (check.exitCode == 0) {
+            repeat(20) {
+                if (!listening) {
+                    listening = isServerReachable(bindAddress, port, timeoutMillis = 200)
+                    if (!listening) delay(100)
+                }
+            }
+        }
+        if (check.exitCode == 0 && listening) {
             EngineResult(
                 true,
                 when (mode) {
@@ -317,7 +359,16 @@ class RootSyncEngine(private val context: Context) {
                 }
             )
         } else {
-            EngineResult(false, "rsync 未保持运行，请查看服务端日志", check.exitCode)
+            val detail = serverFailureDetail(logFile, result.output + check.output, onLog)
+            EngineResult(
+                false,
+                if (check.exitCode != 0) {
+                    "rsync 后台进程未保持运行${detail?.let { "：$it" }.orEmpty()}"
+                } else {
+                    "rsync 进程已启动但端口 $port 不可访问${detail?.let { "：$it" }.orEmpty()}"
+                },
+                if (check.exitCode != 0) check.exitCode else 10
+            )
         }
     }
 
@@ -326,16 +377,38 @@ class RootSyncEngine(private val context: Context) {
         val configFile = File(runtimeDir, "rsyncd.conf")
         val command =
             "pid_file=${SafeInput.shellQuote(pidFile.absolutePath)}; " +
-                "if [ -s \"\$pid_file\" ]; then pid=\$(cat \"\$pid_file\"); " +
+                "status=0; if [ -s \"\$pid_file\" ]; then pid=\$(cat \"\$pid_file\"); " +
                 "case \"\$pid\" in *[!0-9]*|'') ;; *) " +
                 "if [ -r \"/proc/\$pid/cmdline\" ] && " +
                 "tr '\\000' ' ' < \"/proc/\$pid/cmdline\" | " +
                 "grep -Fq ${SafeInput.shellQuote(configFile.absolutePath)}; then " +
-                "kill \"\$pid\" 2>/dev/null; fi ;; esac; " +
-                "rm -f \"\$pid_file\"; fi"
+                "kill \"\$pid\" 2>/dev/null; attempt=0; " +
+                "while kill -0 \"\$pid\" 2>/dev/null && [ \"\$attempt\" -lt 20 ]; do " +
+                "attempt=\$((attempt + 1)); sleep 0.1; done; " +
+                "if kill -0 \"\$pid\" 2>/dev/null; then kill -KILL \"\$pid\" 2>/dev/null; sleep 0.1; fi; " +
+                "if kill -0 \"\$pid\" 2>/dev/null; then echo '旧 rsync 进程无法停止'; status=1; fi; " +
+                "fi ;; esac; rm -f \"\$pid_file\"; fi; exit \"\$status\""
         val result = shell.execute(command, onLog)
         return if (result.exitCode == 0) EngineResult(true, "服务端已停止")
         else EngineResult(false, "停止服务端失败", result.exitCode)
+    }
+
+    private suspend fun serverFailureDetail(
+        logFile: File,
+        launchOutput: List<String>,
+        onLog: (String) -> Unit
+    ): String? {
+        val tail = shell.execute(
+            "if [ -f ${SafeInput.shellQuote(logFile.absolutePath)} ]; then " +
+                "tail -n 40 ${SafeInput.shellQuote(logFile.absolutePath)}; fi"
+        ).output
+        val lines = (launchOutput + RsyncServerLogParser.currentLaunchLines(tail)).takeLast(40)
+        lines.forEach { onLog("rsyncd：$it") }
+        if (lines.isEmpty()) {
+            onLog("rsyncd：未写出详细错误；已完成 PID、端口和旧进程检查")
+            return null
+        }
+        return RsyncServerLogParser.summarize(lines)
     }
 
     suspend fun pull(
