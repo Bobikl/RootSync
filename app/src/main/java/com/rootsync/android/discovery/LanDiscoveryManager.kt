@@ -85,7 +85,6 @@ class LanDiscoveryManager(
 
     fun start() {
         if (socket == null) startUdpListener()
-        acquireMulticastLock()
         registerNsdService()
     }
 
@@ -97,6 +96,7 @@ class LanDiscoveryManager(
         }
 
         val generation = scanGeneration.incrementAndGet()
+        acquireMulticastLock()
         startNsdDiscovery()
         scope.launch {
             val message = baseMessage(TYPE_DISCOVER)
@@ -106,7 +106,10 @@ class LanDiscoveryManager(
             }
             onLog("正在使用 NSD/mDNS 与 UDP 广播扫描局域网")
             delay(SCAN_WINDOW_MS - UDP_SCAN_INTERVAL_MS * (UDP_SCAN_BURSTS - 1))
-            if (scanGeneration.get() == generation) stopNsdDiscovery()
+            if (scanGeneration.get() == generation) {
+                stopNsdDiscovery()
+                releaseMulticastLock()
+            }
         }
     }
 
@@ -141,10 +144,7 @@ class LanDiscoveryManager(
         }
         registrationListener = null
         registeredServiceName = null
-        multicastLock?.let { lock ->
-            if (lock.isHeld) runCatching { lock.release() }
-        }
-        multicastLock = null
+        releaseMulticastLock()
         socket?.close()
         socket = null
         scope.cancel()
@@ -197,6 +197,13 @@ class LanDiscoveryManager(
         }.onFailure { error ->
             onLog("无法启用 Wi-Fi 组播接收：${error.message ?: error::class.java.simpleName}")
         }.getOrNull()
+    }
+
+    private fun releaseMulticastLock() {
+        multicastLock?.let { lock ->
+            if (lock.isHeld) runCatching { lock.release() }
+        }
+        multicastLock = null
     }
 
     private fun registerNsdService() {
