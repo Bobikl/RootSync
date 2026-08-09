@@ -89,6 +89,9 @@ fun RootSyncApp(viewModel: SyncViewModel) {
                         Text(request.name, fontWeight = FontWeight.SemiBold)
                         Text("${request.host}:${request.port}")
                         Text(
+                            "对方策略：${request.role.label}；本机会自动设为${request.role.opposite().label}。"
+                        )
+                        Text(
                             "允许后会保存为独立设备策略，并交换本机 rsync 配对密钥。",
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -278,14 +281,22 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
 
         SectionCard(
             title = "同步策略",
-            subtitle = "方向与镜像策略分离，因此不同设备可使用完全不同的组合"
+            subtitle = "按数据流向显示；一端改方向后，另一端会自动采用相反的本机动作"
         ) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 SyncRole.entries.forEach { role ->
                     FilterChip(
                         selected = state.role == role,
                         onClick = { viewModel.setRole(role) },
-                        label = { Text(role.label) }
+                        label = {
+                            Text(
+                                when (role) {
+                                    SyncRole.SEND_ONLY -> "本机只发送"
+                                    SyncRole.RECEIVE_ONLY ->
+                                        "${state.profileName.ifBlank { "远端" }}只发送"
+                                }
+                            )
+                        }
                     )
                 }
             }
@@ -307,8 +318,8 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
             }
             Text(
                 if (state.role == SyncRole.SEND_ONLY)
-                    "本机把发送源目录推送到远端 receive 区域；远端需先启动服务。"
-                else "本机从远端 send 区域主动拉取到本机接收目录；远端需先启动服务。",
+                    "数据方向：本机 → ${state.profileName.ifBlank { "远端" }}；预览时会自动请求远端准备服务。"
+                else "数据方向：${state.profileName.ifBlank { "远端" }} → 本机；本机执行时主动拉取。",
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
@@ -400,7 +411,8 @@ private fun ProfileRow(profile: PeerProfile, selected: Boolean, onClick: () -> U
                 )
             }
             Text(
-                profile.role.label + if (profile.mirror) " · 镜像" else " · 更新",
+                (if (profile.role == SyncRole.SEND_ONLY) "本机只发送" else "${profile.name}只发送") +
+                    if (profile.mirror) " · 镜像" else " · 更新",
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.primary
             )

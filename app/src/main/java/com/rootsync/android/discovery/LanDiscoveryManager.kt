@@ -11,6 +11,11 @@ import android.os.Build
 import com.rootsync.android.domain.DiscoveredDevice
 import com.rootsync.android.domain.PairAccepted
 import com.rootsync.android.domain.PairRequest
+import com.rootsync.android.domain.StrategyUpdate
+import com.rootsync.android.domain.SyncPrepareRequest
+import com.rootsync.android.domain.SyncPrepareResult
+import com.rootsync.android.domain.SyncRole
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -26,6 +31,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -57,7 +63,8 @@ class LanDiscoveryManager(
     private val wifiManager = appContext.getSystemService(WifiManager::class.java)
     private val nsdManager = appContext.getSystemService(NsdManager::class.java)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val outgoingPairRequests = ConcurrentHashMap.newKeySet<String>()
+    private val outgoingPairRequests = ConcurrentHashMap<String, PairIntent>()
+    private val prepareWaiters = ConcurrentHashMap<String, CompletableDeferred<SyncPrepareResult>>()
     private val resolveQueue = ConcurrentLinkedQueue<NsdServiceInfo>()
     private val resolving = AtomicBoolean(false)
     private val scanGeneration = AtomicInteger(0)
@@ -82,6 +89,18 @@ class LanDiscoveryManager(
         onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
     val pairAccepted: SharedFlow<PairAccepted> = _pairAccepted.asSharedFlow()
+
+    private val _strategyUpdates = MutableSharedFlow<StrategyUpdate>(
+        extraBufferCapacity = 8,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val strategyUpdates: SharedFlow<StrategyUpdate> = _strategyUpdates.asSharedFlow()
+
+    private val _syncPrepareRequests = MutableSharedFlow<SyncPrepareRequest>(
+        extraBufferCapacity = 8,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val syncPrepareRequests: SharedFlow<SyncPrepareRequest> = _syncPrepareRequests.asSharedFlow()
 
     fun start() {
         if (socket == null) startUdpListener()
@@ -113,13 +132,15 @@ class LanDiscoveryManager(
         }
     }
 
-    fun requestPair(device: DiscoveredDevice) {
+    fun requestPair(device: DiscoveredDevice, role: SyncRole, mirror: Boolean) {
         start()
         val requestId = UUID.randomUUID().toString()
-        outgoingPairRequests += requestId
+        outgoingPairRequests[requestId] = PairIntent(role, mirror)
         val message = baseMessage(TYPE_PAIR_REQUEST)
             .put("requestId", requestId)
             .put("secret", localSecret())
+            .put("role", role.name)
+            .put("mirror", mirror)
         scope.launch {
             send(message, InetAddress.getByName(device.host))
             onLog("已向 ${device.name} 发出配对请求")
@@ -135,6 +156,60 @@ class LanDiscoveryManager(
             send(message, InetAddress.getByName(request.host))
             onLog(if (allow) "已允许 ${request.name} 连接" else "已拒绝 ${request.name} 连接")
         }
+    }
+
+    fun sendStrategy(host: String, role: SyncRole, mirror: Boolean) {
+        start()
+        val message = baseMessage(TYPE_STRATEGY_UPDATE)
+            .put("secret", localSecret())
+            .put("role", role.name)
+            .put("mirror", mirror)
+        scope.launch {
+            send(message, InetAddress.getByName(host))
+            onLog("已发送设备策略：${role.label}${if (mirror) " · 镜像" else " · 更新"}")
+        }
+    }
+
+    suspend fun requestSyncPreparation(
+        host: String,
+        role: SyncRole,
+        mirror: Boolean,
+        timeoutMillis: Long = PREPARE_TIMEOUT_MS
+    ): SyncPrepareResult? {
+        start()
+        val requestId = UUID.randomUUID().toString()
+        val waiter = CompletableDeferred<SyncPrepareResult>()
+        prepareWaiters[requestId] = waiter
+        val message = baseMessage(TYPE_SYNC_PREPARE)
+            .put("requestId", requestId)
+            .put("secret", localSecret())
+            .put("role", role.name)
+            .put("mirror", mirror)
+        scope.launch {
+            send(message, InetAddress.getByName(host))
+            onLog("已请求远端自动准备 rsync 服务")
+        }
+        return try {
+            withTimeoutOrNull(timeoutMillis) { waiter.await() }
+        } finally {
+            prepareWaiters.remove(requestId, waiter)
+        }
+    }
+
+    fun answerSyncPreparation(
+        request: SyncPrepareRequest,
+        ready: Boolean,
+        messageText: String,
+        port: Int
+    ) {
+        start()
+        val message = baseMessage(TYPE_SYNC_READY)
+            .put("requestId", request.requestId)
+            .put("ready", ready)
+            .put("message", messageText.take(240))
+            .put("port", port)
+        if (ready) message.put("secret", localSecret())
+        scope.launch { send(message, InetAddress.getByName(request.host)) }
     }
 
     fun stop() {
@@ -360,28 +435,102 @@ class LanDiscoveryManager(
             TYPE_PAIR_REQUEST -> {
                 val requestId = message.optString("requestId")
                 val secret = message.optString("secret")
-                if (requestId.isNotBlank() && secret.length >= 6) {
+                val role = parseRole(message.optString("role"))
+                if (requestId.isNotBlank() && secret.length >= 6 && role != null) {
                     _pairRequests.tryEmit(
-                        PairRequest(requestId, remoteDeviceId, remoteName, host, remotePort, secret)
+                        PairRequest(
+                            requestId,
+                            remoteDeviceId,
+                            remoteName,
+                            host,
+                            remotePort,
+                            secret,
+                            role,
+                            message.optBoolean("mirror", true)
+                        )
                     )
                 }
             }
             TYPE_PAIR_ACCEPT -> {
                 val requestId = message.optString("requestId")
                 val secret = message.optString("secret")
-                if (outgoingPairRequests.remove(requestId) && secret.length >= 6) {
+                val intent = outgoingPairRequests.remove(requestId)
+                if (intent != null && secret.length >= 6) {
                     addOrUpdateDevice(remoteDeviceId, remoteName, host, remotePort)
                     _pairAccepted.tryEmit(
-                        PairAccepted(remoteDeviceId, remoteName, host, remotePort, secret)
+                        PairAccepted(
+                            remoteDeviceId,
+                            remoteName,
+                            host,
+                            remotePort,
+                            secret,
+                            intent.role,
+                            intent.mirror
+                        )
                     )
                 }
             }
             TYPE_PAIR_DENY -> {
                 val requestId = message.optString("requestId")
-                if (outgoingPairRequests.remove(requestId)) onLog("$remoteName 拒绝了配对请求")
+                if (outgoingPairRequests.remove(requestId) != null) onLog("$remoteName 拒绝了配对请求")
+            }
+            TYPE_STRATEGY_UPDATE -> {
+                val secret = message.optString("secret")
+                val role = parseRole(message.optString("role"))
+                if (secret.length >= 6 && role != null) {
+                    _strategyUpdates.tryEmit(
+                        StrategyUpdate(
+                            remoteDeviceId,
+                            remoteName,
+                            host,
+                            secret,
+                            role,
+                            message.optBoolean("mirror", true)
+                        )
+                    )
+                }
+            }
+            TYPE_SYNC_PREPARE -> {
+                val requestId = message.optString("requestId")
+                val secret = message.optString("secret")
+                val role = parseRole(message.optString("role"))
+                if (requestId.isNotBlank() && secret.length >= 6 && role != null) {
+                    _syncPrepareRequests.tryEmit(
+                        SyncPrepareRequest(
+                            requestId,
+                            remoteDeviceId,
+                            remoteName,
+                            host,
+                            secret,
+                            role,
+                            message.optBoolean("mirror", true)
+                        )
+                    )
+                }
+            }
+            TYPE_SYNC_READY -> {
+                val requestId = message.optString("requestId")
+                val ready = message.optBoolean("ready", false)
+                val secret = message.optString("secret")
+                val result = SyncPrepareResult(
+                    requestId = requestId,
+                    deviceId = remoteDeviceId,
+                    name = remoteName,
+                    host = host,
+                    port = remotePort,
+                    ready = ready,
+                    message = message.optString("message").ifBlank {
+                        if (ready) "远端服务已准备" else "远端服务准备失败"
+                    },
+                    secret = secret
+                )
+                prepareWaiters.remove(requestId)?.complete(result)
             }
         }
     }
+
+    private fun parseRole(value: String): SyncRole? =
+        runCatching { SyncRole.valueOf(value) }.getOrNull()
 
     private fun addOrUpdateDevice(deviceId: String, name: String, host: String, port: Int) {
         val device = DiscoveredDevice(deviceId, name, host, port)
@@ -446,7 +595,7 @@ class LanDiscoveryManager(
         const val SCAN_WINDOW_MS = 8_000L
         private const val NSD_SERVICE_TYPE = "_rootsync._tcp."
         private const val MAGIC = "ROOTSYNC_LAN"
-        private const val PROTOCOL_VERSION = 2
+        private const val PROTOCOL_VERSION = 3
         private const val UDP_SCAN_BURSTS = 3
         private const val UDP_SCAN_INTERVAL_MS = 700L
         private const val MAX_PACKET_SIZE = 4096
@@ -456,5 +605,11 @@ class LanDiscoveryManager(
         private const val TYPE_PAIR_REQUEST = "pair_request"
         private const val TYPE_PAIR_ACCEPT = "pair_accept"
         private const val TYPE_PAIR_DENY = "pair_deny"
+        private const val TYPE_STRATEGY_UPDATE = "strategy_update"
+        private const val TYPE_SYNC_PREPARE = "sync_prepare"
+        private const val TYPE_SYNC_READY = "sync_ready"
+        private const val PREPARE_TIMEOUT_MS = 30_000L
     }
+
+    private data class PairIntent(val role: SyncRole, val mirror: Boolean)
 }

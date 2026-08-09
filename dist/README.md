@@ -1,11 +1,11 @@
 ﻿# RootSync APK
 
-- 文件：`RootSync-v0.2.1-debug-arm64.apk`
+- 文件：`RootSync-v0.2.2-debug-arm64.apk`
 - applicationId：`com.rootsync.android.debug`
-- versionCode / versionName：`3` / `0.2.1-debug`
+- versionCode / versionName：`4` / `0.2.2-debug`
 - minSdk / targetSdk：`26` / `36`
 - ABI：`arm64-v8a`
-- APK SHA-256：`952668B85FF268B4DE22A33FD818FA386A7F1B70FF61BA33603BF20D0251F840`
+- APK SHA-256：`8CFC739A5010AE83C641B1213BCBF550184C76EB9F387FE5FCE66E3019A5B5A4`
 - 内置 rsync 3.4.4 SHA-256：`38FF6DE1B36F18CE391DF512713192F3129B733C8F2FE55122DA26B0A600A6E9`
 - 签名：Android Debug，APK Signature Scheme v2
 

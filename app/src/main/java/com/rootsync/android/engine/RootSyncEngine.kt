@@ -6,11 +6,14 @@ import android.net.NetworkCapabilities
 import com.rootsync.android.domain.CapabilityCheck
 import com.rootsync.android.domain.CheckState
 import com.rootsync.android.domain.DeviceCapabilities
+import com.rootsync.android.domain.SyncRole
 import com.rootsync.android.root.RootShell
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.net.Inet4Address
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.security.SecureRandom
 
 data class EngineResult(
@@ -157,7 +160,8 @@ class RootSyncEngine(private val context: Context) {
         destinationPath: String,
         port: Int,
         secret: String,
-        onLog: (String) -> Unit
+        onLog: (String) -> Unit,
+        mode: SyncRole? = null
     ): EngineResult = withContext(Dispatchers.IO) {
         SafeInput.validateStoragePath(sourcePath)?.let { return@withContext EngineResult(false, it) }
         SafeInput.validateStoragePath(destinationPath)?.let { return@withContext EngineResult(false, it) }
@@ -165,17 +169,23 @@ class RootSyncEngine(private val context: Context) {
             return@withContext EngineResult(false, "配对密钥至少需要 6 位")
         }
 
-        val sourceReady = shell.execute(
-            "test -d ${SafeInput.shellQuote(sourcePath)} && test -r ${SafeInput.shellQuote(sourcePath)}"
-        )
-        if (sourceReady.exitCode != 0) {
-            return@withContext EngineResult(false, "发送源目录不存在或不可读：$sourcePath")
+        val servesSendModule = mode != SyncRole.RECEIVE_ONLY
+        val servesReceiveModule = mode != SyncRole.SEND_ONLY
+        if (servesSendModule) {
+            val sourceReady = shell.execute(
+                "test -d ${SafeInput.shellQuote(sourcePath)} && test -r ${SafeInput.shellQuote(sourcePath)}"
+            )
+            if (sourceReady.exitCode != 0) {
+                return@withContext EngineResult(false, "发送源目录不存在或不可读：$sourcePath")
+            }
         }
-        val destinationReady = shell.execute(
-            "mkdir -p ${SafeInput.shellQuote(destinationPath)} && test -w ${SafeInput.shellQuote(destinationPath)}"
-        )
-        if (destinationReady.exitCode != 0) {
-            return@withContext EngineResult(false, "接收目录无法创建或不可写：$destinationPath")
+        if (servesReceiveModule) {
+            val destinationReady = shell.execute(
+                "mkdir -p ${SafeInput.shellQuote(destinationPath)} && test -w ${SafeInput.shellQuote(destinationPath)}"
+            )
+            if (destinationReady.exitCode != 0) {
+                return@withContext EngineResult(false, "接收目录无法创建或不可写：$destinationPath")
+            }
         }
 
         val bindAddress = localIpv4()
@@ -183,28 +193,57 @@ class RootSyncEngine(private val context: Context) {
             return@withContext EngineResult(false, "未找到可绑定的 Wi-Fi IPv4 地址")
         }
 
-        onLog("正在生成发送源目录时间快照…")
         val snapshot = File(metadataDir, "source.snapshot")
-        val snapshotResult = shell.execute(
-            listOf(syncMetaPath, "snapshot", sourcePath, snapshot.absolutePath)
-                .joinToString(" ") { SafeInput.shellQuote(it) },
-            onLog
-        )
-        if (snapshotResult.exitCode != 0) {
-            return@withContext EngineResult(false, "目录时间快照失败", snapshotResult.exitCode)
+        if (servesSendModule) {
+            onLog("正在生成发送源目录时间快照…")
+            val snapshotResult = shell.execute(
+                listOf(syncMetaPath, "snapshot", sourcePath, snapshot.absolutePath)
+                    .joinToString(" ") { SafeInput.shellQuote(it) },
+                onLog
+            )
+            if (snapshotResult.exitCode != 0) {
+                return@withContext EngineResult(false, "目录时间快照失败", snapshotResult.exitCode)
+            }
         }
 
         val secrets = File(runtimeDir, "rsync.secrets")
-        secrets.writeText("sync-user:$secret\n")
-        secrets.setReadable(false, false)
-        secrets.setReadable(true, true)
-        secrets.setWritable(false, false)
-        secrets.setWritable(true, true)
+        if (!writeRootOwnedSecret(secrets, "sync-user:$secret")) {
+            return@withContext EngineResult(false, "无法创建 ROOT 所有的 rsync 密钥文件")
+        }
 
         val config = File(runtimeDir, "rsyncd.conf")
         val pidFile = File(runtimeDir, "rsyncd.pid")
         val lockFile = File(runtimeDir, "rsyncd.lock")
         val logFile = File(runtimeDir, "rsyncd.log")
+        val modules = buildString {
+            if (servesSendModule) append(
+                """
+                [send]
+                path = $sourcePath
+                read only = true
+                auth users = sync-user
+                secrets file = ${secrets.absolutePath}
+
+                [meta]
+                path = ${metadataDir.absolutePath}
+                read only = true
+                auth users = sync-user
+                secrets file = ${secrets.absolutePath}
+                """.trimIndent()
+            )
+            if (servesSendModule && servesReceiveModule) append("\n\n")
+            if (servesReceiveModule) append(
+                """
+                [receive]
+                path = $destinationPath
+                read only = false
+                write only = true
+                munge symlinks = true
+                auth users = sync-user
+                secrets file = ${secrets.absolutePath}
+                """.trimIndent()
+            )
+        }
         config.writeText(
             """
             pid file = ${pidFile.absolutePath}
@@ -219,30 +258,18 @@ class RootSyncEngine(private val context: Context) {
             strict modes = true
             address = $bindAddress
 
-            [send]
-            path = $sourcePath
-            read only = true
-            auth users = sync-user
-            secrets file = ${secrets.absolutePath}
-
-            [receive]
-            path = $destinationPath
-            read only = false
-            write only = true
-            munge symlinks = true
-            auth users = sync-user
-            secrets file = ${secrets.absolutePath}
-
-            [meta]
-            path = ${metadataDir.absolutePath}
-            read only = true
-            auth users = sync-user
-            secrets file = ${secrets.absolutePath}
-            """.trimIndent()
+            $modules
+            """.trimIndent() + "\n"
         )
 
         stopServer(onLog = {})
-        onLog("正在启动受限服务端（send 只读、receive 只写）…")
+        onLog(
+            when (mode) {
+                SyncRole.SEND_ONLY -> "正在启动只发送服务端…"
+                SyncRole.RECEIVE_ONLY -> "正在启动只接收服务端…"
+                null -> "正在启动受限服务端（send 只读、receive 只写）…"
+            }
+        )
         val result = shell.execute(
             "${SafeInput.shellQuote(rsyncPath)} --daemon --port=$port " +
                 "--config=${SafeInput.shellQuote(config.absolutePath)}",
@@ -256,7 +283,14 @@ class RootSyncEngine(private val context: Context) {
                 "kill -0 \$(cat ${SafeInput.shellQuote(pidFile.absolutePath)})"
         )
         if (check.exitCode == 0) {
-            EngineResult(true, "服务端已启动：支持只发送与只接收")
+            EngineResult(
+                true,
+                when (mode) {
+                    SyncRole.SEND_ONLY -> "服务端已启动：本机作为发送端"
+                    SyncRole.RECEIVE_ONLY -> "服务端已启动：本机作为接收端"
+                    null -> "服务端已启动：支持只发送与只接收"
+                }
+            )
         } else {
             EngineResult(false, "rsync 未保持运行，请查看服务端日志", check.exitCode)
         }
@@ -299,7 +333,10 @@ class RootSyncEngine(private val context: Context) {
             return@withContext EngineResult(false, "本机接收目录无法创建或不可写")
         }
 
-        val password = writeClientPassword(secret)
+        val password = File(runtimeDir, "client.password")
+        if (!writeRootOwnedSecret(password, secret)) {
+            return@withContext EngineResult(false, "无法准备 ROOT 所有的客户端密钥文件")
+        }
         val remoteSnapshot = File(runtimeDir, "remote.snapshot")
         if (!dryRun) {
             onLog("下载发送端目录时间清单…")
@@ -327,7 +364,11 @@ class RootSyncEngine(private val context: Context) {
         )
         val transfer = executeTransfer(command, onLog, onProgress)
         if (transfer.exitCode != 0) {
-            return@withContext EngineResult(false, "rsync 返回错误 ${transfer.exitCode}", transfer.exitCode)
+            return@withContext EngineResult(
+                false,
+                rsyncFailureSummary(transfer.exitCode, transfer.text),
+                transfer.exitCode
+            )
         }
         if (dryRun) return@withContext EngineResult(true, previewSummary(mirror))
 
@@ -377,7 +418,10 @@ class RootSyncEngine(private val context: Context) {
             return@withContext EngineResult(false, "本机发送源目录不存在或不可读")
         }
 
-        val password = writeClientPassword(secret)
+        val password = File(runtimeDir, "client.password")
+        if (!writeRootOwnedSecret(password, secret)) {
+            return@withContext EngineResult(false, "无法准备 ROOT 所有的客户端密钥文件")
+        }
         onLog(if (dryRun) "开始只发送差异预览…" else "开始只发送增量传输…")
         val command = RsyncCommandBuilder.push(
             rsyncPath = rsyncPath,
@@ -390,7 +434,11 @@ class RootSyncEngine(private val context: Context) {
         )
         val transfer = executeTransfer(command, onLog, onProgress)
         if (transfer.exitCode != 0) {
-            return@withContext EngineResult(false, "rsync 返回错误 ${transfer.exitCode}", transfer.exitCode)
+            return@withContext EngineResult(
+                false,
+                rsyncFailureSummary(transfer.exitCode, transfer.text),
+                transfer.exitCode
+            )
         }
         if (dryRun) EngineResult(true, previewSummary(mirror))
         else {
@@ -411,12 +459,42 @@ class RootSyncEngine(private val context: Context) {
             }
     }
 
-    private fun writeClientPassword(secret: String): File = File(runtimeDir, "client.password").apply {
-        writeText(secret + "\n")
-        setReadable(false, false)
-        setReadable(true, true)
-        setWritable(false, false)
-        setWritable(true, true)
+    suspend fun isServerReachable(host: String, port: Int, timeoutMillis: Int = 1_500): Boolean =
+        withContext(Dispatchers.IO) {
+            if (!SafeInput.isValidIpv4(host) || port !in 1024..65535) return@withContext false
+            runCatching {
+                Socket().use { socket ->
+                    socket.connect(InetSocketAddress(host, port), timeoutMillis)
+                }
+                true
+            }.getOrDefault(false)
+        }
+
+    private suspend fun writeRootOwnedSecret(file: File, value: String): Boolean {
+        val command =
+            "umask 077; printf '%s\\n' ${SafeInput.shellQuote(value)} > " +
+                "${SafeInput.shellQuote(file.absolutePath)} && " +
+                "chown 0:0 ${SafeInput.shellQuote(file.absolutePath)} && " +
+                "chmod 600 ${SafeInput.shellQuote(file.absolutePath)}"
+        return shell.execute(command).exitCode == 0
+    }
+
+    private fun rsyncFailureSummary(exitCode: Int, output: String): String {
+        val detail = output.lineSequence()
+            .map { it.trim() }
+            .lastOrNull { it.isNotBlank() && !it.startsWith("rsync error:") }
+            ?.take(120)
+        val summary = when (exitCode) {
+            5 -> "远端 rsync 服务拒绝连接或密钥不匹配"
+            10 -> "无法建立或维持远端 rsync Socket 连接"
+            12 -> "远端 rsync 协议数据流中断"
+            23 -> "部分文件传输失败"
+            25 -> "镜像删除超过 100 项，已按安全限制停止"
+            30 -> "rsync 数据传输超时"
+            35 -> "等待远端 rsync 服务连接超时"
+            else -> "rsync 返回错误 $exitCode"
+        }
+        return if (detail.isNullOrBlank()) "$summary（错误 $exitCode）" else "$summary：$detail"
     }
 
     private fun previewSummary(mirror: Boolean): String = if (mirror) {

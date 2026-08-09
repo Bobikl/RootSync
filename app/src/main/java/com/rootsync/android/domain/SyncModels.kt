@@ -2,7 +2,12 @@ package com.rootsync.android.domain
 
 enum class SyncRole(val label: String) {
     SEND_ONLY("只发送"),
-    RECEIVE_ONLY("只接收")
+    RECEIVE_ONLY("只接收");
+
+    fun opposite(): SyncRole = when (this) {
+        SEND_ONLY -> RECEIVE_ONLY
+        RECEIVE_ONLY -> SEND_ONLY
+    }
 }
 
 enum class CheckState {
@@ -54,7 +59,9 @@ data class PairRequest(
     val name: String,
     val host: String,
     val port: Int,
-    val secret: String
+    val secret: String,
+    val role: SyncRole,
+    val mirror: Boolean
 )
 
 data class PairAccepted(
@@ -62,6 +69,38 @@ data class PairAccepted(
     val name: String,
     val host: String,
     val port: Int,
+    val secret: String,
+    val role: SyncRole,
+    val mirror: Boolean
+)
+
+data class StrategyUpdate(
+    val deviceId: String,
+    val name: String,
+    val host: String,
+    val secret: String,
+    val role: SyncRole,
+    val mirror: Boolean
+)
+
+data class SyncPrepareRequest(
+    val requestId: String,
+    val deviceId: String,
+    val name: String,
+    val host: String,
+    val secret: String,
+    val role: SyncRole,
+    val mirror: Boolean
+)
+
+data class SyncPrepareResult(
+    val requestId: String,
+    val deviceId: String,
+    val name: String,
+    val host: String,
+    val port: Int,
+    val ready: Boolean,
+    val message: String,
     val secret: String
 )
 

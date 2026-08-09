@@ -11,6 +11,8 @@ import com.rootsync.android.domain.LogEntry
 import com.rootsync.android.domain.PairAccepted
 import com.rootsync.android.domain.PairRequest
 import com.rootsync.android.domain.PeerProfile
+import com.rootsync.android.domain.StrategyUpdate
+import com.rootsync.android.domain.SyncPrepareRequest
 import com.rootsync.android.domain.SyncRole
 import com.rootsync.android.domain.SyncUiState
 import com.rootsync.android.engine.RootSyncEngine
@@ -64,6 +66,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 appendLog("OK", "已与 ${accepted.name} 完成局域网配对")
                 _state.update { it.copy(lastResult = "已连接 ${accepted.name}") }
             }
+        }
+        viewModelScope.launch {
+            discovery.strategyUpdates.collect { update -> applyRemoteStrategy(update) }
+        }
+        viewModelScope.launch {
+            discovery.syncPrepareRequests.collect { request -> handleSyncPrepareRequest(request) }
         }
         refreshCapabilities()
     }
@@ -156,8 +164,15 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             previewReady = false
         )
     }
-    fun setRole(value: SyncRole) = updateConfig { copy(role = value, previewReady = false) }
-    fun setMirror(value: Boolean) = updateConfig { copy(mirror = value, previewReady = false) }
+    fun setRole(value: SyncRole) {
+        updateConfig { copy(role = value, previewReady = false) }
+        publishCurrentStrategy()
+    }
+
+    fun setMirror(value: Boolean) {
+        updateConfig { copy(mirror = value, previewReady = false) }
+        publishCurrentStrategy()
+    }
 
     private fun updateConfig(block: SyncUiState.() -> SyncUiState) {
         _state.update { it.block().syncSelectedProfile() }
@@ -214,6 +229,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 saveConfig()
                 appendLog("OK", "已保存设备策略：${profile.name} / ${profile.role.label}")
+                publishCurrentStrategy()
             }
         }
     }
@@ -288,7 +304,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
 
     fun requestPair(deviceId: String) {
         val device = _state.value.discoveredDevices.firstOrNull { it.deviceId == deviceId } ?: return
-        discovery.requestPair(device)
+        val current = _state.value
+        discovery.requestPair(device, current.role, current.mirror)
         _state.update { it.copy(lastResult = "等待 ${device.name} 确认连接") }
     }
 
@@ -304,7 +321,15 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun PairRequest.toAccepted() = PairAccepted(deviceId, name, host, port, secret)
+    private fun PairRequest.toAccepted() = PairAccepted(
+        deviceId = deviceId,
+        name = name,
+        host = host,
+        port = port,
+        secret = secret,
+        role = role.opposite(),
+        mirror = mirror
+    )
 
     private fun upsertPairedDevice(device: PairAccepted) {
         val current = _state.value
@@ -313,7 +338,9 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             name = device.name,
             host = device.host,
             port = device.port,
-            secret = device.secret
+            secret = device.secret,
+            role = device.role,
+            mirror = device.mirror
         ) ?: PeerProfile(
             id = UUID.randomUUID().toString(),
             deviceId = device.deviceId,
@@ -321,6 +348,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             host = device.host,
             port = device.port,
             secret = device.secret,
+            role = device.role,
+            mirror = device.mirror,
             sourcePath = current.sourcePath,
             destinationPath = current.destinationPath
         )
@@ -340,6 +369,111 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         saveConfig()
+    }
+
+    private fun publishCurrentStrategy() {
+        val current = _state.value
+        val profile = current.profiles.firstOrNull { it.id == current.selectedProfileId } ?: return
+        if (profile.deviceId.startsWith("manual:")) return
+        discovery.sendStrategy(profile.host, current.role, current.mirror)
+    }
+
+    private fun applyRemoteStrategy(update: StrategyUpdate) {
+        val current = _state.value
+        val existing = current.profiles.firstOrNull { it.deviceId == update.deviceId }
+        if (existing == null || existing.secret != update.secret) {
+            appendLog("WARN", "已忽略 ${update.name} 的未认证策略更新")
+            return
+        }
+        val localRole = update.role.opposite()
+        val updatedProfile = existing.copy(
+            name = update.name,
+            host = update.host,
+            role = localRole,
+            mirror = update.mirror
+        )
+        _state.update { state ->
+            val selected = state.selectedProfileId == existing.id
+            state.copy(
+                profiles = state.profiles.map { profile ->
+                    if (profile.id == existing.id) updatedProfile else profile
+                },
+                profileName = if (selected) updatedProfile.name else state.profileName,
+                remoteHost = if (selected) updatedProfile.host else state.remoteHost,
+                role = if (selected) localRole else state.role,
+                mirror = if (selected) update.mirror else state.mirror,
+                previewReady = if (selected) false else state.previewReady,
+                lastResult = "${update.name} 已设为${update.role.label}；本机自动切换为${localRole.label}"
+            )
+        }
+        saveConfig()
+        appendLog(
+            "LAN",
+            "策略已同步：${update.name} ${update.role.label}，本机 ${localRole.label}" +
+                if (update.mirror) " · 镜像" else " · 更新"
+        )
+    }
+
+    private suspend fun handleSyncPrepareRequest(request: SyncPrepareRequest) {
+        val initial = _state.value
+        val profile = initial.profiles.firstOrNull { it.deviceId == request.deviceId }
+        val port = SafeInput.parsePort(initial.serverPortText) ?: SyncUiState.DEFAULT_RSYNC_PORT
+        if (profile == null || profile.secret != request.secret) {
+            appendLog("WARN", "已拒绝 ${request.name} 的未认证同步准备请求")
+            discovery.answerSyncPreparation(request, false, "设备未配对或密钥已变更", port)
+            return
+        }
+        if (initial.isBusy) {
+            discovery.answerSyncPreparation(request, false, "远端设备正在执行其他任务", port)
+            return
+        }
+
+        applyRemoteStrategy(
+            StrategyUpdate(
+                request.deviceId,
+                request.name,
+                request.host,
+                request.secret,
+                request.role,
+                request.mirror
+            )
+        )
+        val localRole = request.role.opposite()
+        val activeProfile = _state.value.profiles.first { it.deviceId == request.deviceId }
+        val rsync = _state.value.capabilities.rsyncPath
+        if (rsync == null) {
+            discovery.answerSyncPreparation(request, false, "远端 ROOT/rsync 能力尚未就绪", port)
+            return
+        }
+
+        _state.update { it.copy(isBusy = true, phase = "正在为 ${request.name} 准备服务端") }
+        val result = try {
+            engine.startServer(
+                rsyncPath = rsync,
+                sourcePath = activeProfile.sourcePath,
+                destinationPath = activeProfile.destinationPath,
+                port = port,
+                secret = _state.value.serverSecret,
+                onLog = ::streamLog,
+                mode = localRole
+            )
+        } catch (error: Exception) {
+            com.rootsync.android.engine.EngineResult(
+                false,
+                error.message ?: error::class.java.simpleName
+            )
+        } finally {
+            _state.update { it.copy(isBusy = false) }
+        }
+        _state.update {
+            it.copy(
+                serverRunning = result.success,
+                phase = result.summary,
+                lastResult = result.summary
+            )
+        }
+        appendLog(if (result.success) "OK" else "ERROR", "${request.name}：${result.summary}")
+        discovery.answerSyncPreparation(request, result.success, result.summary, port)
     }
 
     private fun saveConfig() {
@@ -440,13 +574,14 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         val action = if (current.role == SyncRole.SEND_ONLY) "只发送" else "只接收"
         launchBusy(if (dryRun) "正在预览${action}差异" else "正在执行$action") {
             _state.update { it.copy(progress = if (dryRun) null else 0f, lastResult = null) }
+            val endpoint = ensureRemoteServerReady(current, port) ?: return@launchBusy
             val result = if (current.role == SyncRole.SEND_ONLY) {
                 engine.push(
                     rsyncPath = rsync,
-                    host = current.remoteHost,
-                    port = port,
+                    host = endpoint.host,
+                    port = endpoint.port,
                     sourcePath = current.sourcePath,
-                    secret = current.remoteSecret,
+                    secret = endpoint.secret,
                     mirror = current.mirror,
                     dryRun = dryRun,
                     onLog = ::streamLog,
@@ -455,10 +590,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             } else {
                 engine.pull(
                     rsyncPath = rsync,
-                    host = current.remoteHost,
-                    port = port,
+                    host = endpoint.host,
+                    port = endpoint.port,
                     destinationPath = current.destinationPath,
-                    secret = current.remoteSecret,
+                    secret = endpoint.secret,
                     mirror = current.mirror,
                     dryRun = dryRun,
                     onLog = ::streamLog,
@@ -475,6 +610,71 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             }
             appendLog(if (result.success) "OK" else "ERROR", result.summary)
         }
+    }
+
+    private suspend fun ensureRemoteServerReady(
+        current: SyncUiState,
+        configuredPort: Int
+    ): RemoteEndpoint? {
+        if (engine.isServerReachable(current.remoteHost, configuredPort)) {
+            appendLog("LAN", "远端 rsync 端口已就绪：${current.remoteHost}:$configuredPort")
+            return RemoteEndpoint(current.remoteHost, configuredPort, current.remoteSecret)
+        }
+
+        val profile = current.profiles.firstOrNull { it.id == current.selectedProfileId }
+        if (profile == null || profile.deviceId.startsWith("manual:")) {
+            val message =
+                "无法连接远端 rsync 服务（错误 10）。请在远端服务页启动服务端，并核对 IP 与端口"
+            appendLog("ERROR", message)
+            _state.update { it.copy(lastResult = message, phase = "远端服务未启动") }
+            return null
+        }
+
+        appendLog("LAN", "远端端口未响应，正在请求 ${profile.name} 自动启动服务端")
+        _state.update { it.copy(phase = "等待 ${profile.name} 准备服务端") }
+        val prepared = discovery.requestSyncPreparation(
+            host = current.remoteHost,
+            role = current.role,
+            mirror = current.mirror
+        )
+        if (prepared == null) {
+            val message = "${profile.name} 未响应服务准备请求；请保持远端 RootSync 打开"
+            appendLog("ERROR", message)
+            _state.update { it.copy(lastResult = message, phase = "远端无响应") }
+            return null
+        }
+        if (!prepared.ready) {
+            val message = "${profile.name} 无法启动服务端：${prepared.message}"
+            appendLog("ERROR", message)
+            _state.update { it.copy(lastResult = message, phase = "远端服务准备失败") }
+            return null
+        }
+
+        val preparedPort = prepared.port.takeIf { it in 1024..65535 } ?: configuredPort
+        val preparedSecret = prepared.secret.takeIf {
+            it.length >= SyncUiState.MIN_SECRET_LENGTH
+        } ?: current.remoteSecret
+        _state.update { state ->
+            state.copy(
+                portText = preparedPort.toString(),
+                remoteSecret = preparedSecret,
+                profiles = state.profiles.map { item ->
+                    if (item.id == profile.id) {
+                        item.copy(port = preparedPort, secret = preparedSecret, host = prepared.host)
+                    } else item
+                }
+            )
+        }
+        saveConfig()
+        delay(300)
+        if (!engine.isServerReachable(prepared.host, preparedPort, timeoutMillis = 2_500)) {
+            val message = "${profile.name} 报告服务已启动，但端口 $preparedPort 仍无法连接"
+            appendLog("ERROR", message)
+            _state.update { it.copy(lastResult = message, phase = "远端端口不可达") }
+            return null
+        }
+        appendLog("OK", "${profile.name} 已自动准备 rsync 服务")
+        return RemoteEndpoint(prepared.host, preparedPort, preparedSecret)
     }
 
     fun cancel() {
@@ -579,4 +779,6 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         }.getOrNull()?.trim().orEmpty()
         return globalName.ifBlank { secureName }.ifBlank { Build.MODEL }.ifBlank { "Android 设备" }
     }
+
+    private data class RemoteEndpoint(val host: String, val port: Int, val secret: String)
 }

@@ -3,7 +3,7 @@
 面向已 ROOT Android 手机的局域网 rsync 同步工具，依据
 `Android_ROOT_rsync_开发大纲.md` 开发。当前版本为 arm64 技术验证 APK。
 
-## 当前版本（0.2.1）
+## 当前版本（0.2.2）
 
 - Kotlin、Jetpack Compose、Material 3；`compileSdk/targetSdk 36`，适配 Android 15/16；
 - APK 内置经上游签名验证的 **rsync 3.4.4 arm64**，无需额外安装 ROOT rsync 模块；
@@ -14,6 +14,9 @@
 - 扫描时申请附近设备权限、绑定 Wi-Fi 网络并启用组播接收，修复部分 Android 16/小米设备扫描不到的问题；
 - 默认设备名称读取系统“设备名称”，不再使用厂商与型号拼接；
 - 本机密钥支持手动自定义，最少 6 位；
+- 配对设备的方向和镜像策略会同步到另一端，并自动换算为另一端的相反本机动作；
+- 差异预览前检测远端 TCP 端口，未启动时通过已认证的局域网控制消息请求远端自动准备 rsync 服务；
+- rsync 客户端和服务端密钥文件改为 ROOT 所有、0600 权限，修复 ROOT 模式的密钥文件校验与部分错误 10；
 - rsync daemon 提供受限的 `send` 只读模块和 `receive` 只写模块；
 - dry-run、最多 100 项删除保护、partial 续传、超时和实时日志；
 - 修正默认哔哩哔哩包名为 `tv.danmaku.bili`；本机接收目录不存在时由 ROOT 自动创建；
@@ -31,7 +34,7 @@
 
 APK 输出：`app/build/outputs/apk/debug/app-debug.apk`
 
-已构建版本：`dist/RootSync-v0.2.1-debug-arm64.apk`
+已构建版本：`dist/RootSync-v0.2.2-debug-arm64.apk`
 
 ## 两机使用
 

@@ -1,5 +1,7 @@
 package com.rootsync.android.engine
 
+import com.rootsync.android.domain.SyncRole
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
@@ -7,6 +9,12 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SafeInputTest {
+    @Test
+    fun keepsBothSidesOfDirectionComplementary() {
+        assertEquals(SyncRole.RECEIVE_ONLY, SyncRole.SEND_ONLY.opposite())
+        assertEquals(SyncRole.SEND_ONLY, SyncRole.RECEIVE_ONLY.opposite())
+    }
+
     @Test
     fun acceptsPrivateLanIpv4() {
         assertTrue(SafeInput.isValidIpv4("192.168.1.20"))
