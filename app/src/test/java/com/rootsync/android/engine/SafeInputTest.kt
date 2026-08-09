@@ -42,7 +42,7 @@ class SafeInputTest {
             port = 8873,
             destination = "/storage/emulated/0/receive",
             passwordFile = "/data/user/0/app/password",
-            mirror = true,
+            backupRunId = "20260809-210000-000",
             dryRun = true
         )
         val push = RsyncCommandBuilder.push(
@@ -51,13 +51,28 @@ class SafeInputTest {
             port = 8873,
             source = "/storage/emulated/0/send",
             passwordFile = "/data/user/0/app/password",
-            mirror = false,
+            backupRunId = "20260809-210000-000",
             dryRun = false
         )
         assertTrue(pull.contains("/send/"))
-        assertTrue(pull.contains("--delete-delay"))
         assertTrue(pull.contains("--dry-run"))
         assertTrue(push.contains("/receive/"))
-        assertFalse(push.contains("--delete-delay"))
+        assertTrue(pull.contains("--backup"))
+        assertTrue(push.contains("--backup"))
+        assertTrue(pull.contains(".rootsync-history/20260809-210000-000"))
+        assertTrue(push.contains(".rootsync-history/20260809-210000-000"))
+        assertFalse(pull.contains("--delete"))
+        assertFalse(push.contains("--delete"))
+        assertFalse(pull.contains("--remove-source-files"))
+        assertFalse(push.contains("--remove-source-files"))
+    }
+
+    @Test
+    fun identifiesEverySourceOrDestinationDeletionOption() {
+        assertTrue(RsyncCommandBuilder.isDeletionOption("--delete"))
+        assertTrue(RsyncCommandBuilder.isDeletionOption("--delete-delay"))
+        assertTrue(RsyncCommandBuilder.isDeletionOption("--remove-source-files"))
+        assertTrue(RsyncCommandBuilder.isDeletionOption("--remove-sent-files"))
+        assertFalse(RsyncCommandBuilder.isDeletionOption("--backup"))
     }
 }

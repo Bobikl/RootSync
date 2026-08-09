@@ -132,15 +132,14 @@ class LanDiscoveryManager(
         }
     }
 
-    fun requestPair(device: DiscoveredDevice, role: SyncRole, mirror: Boolean) {
+    fun requestPair(device: DiscoveredDevice, role: SyncRole) {
         start()
         val requestId = UUID.randomUUID().toString()
-        outgoingPairRequests[requestId] = PairIntent(role, mirror)
+        outgoingPairRequests[requestId] = PairIntent(role)
         val message = baseMessage(TYPE_PAIR_REQUEST)
             .put("requestId", requestId)
             .put("secret", localSecret())
             .put("role", role.name)
-            .put("mirror", mirror)
         scope.launch {
             send(message, InetAddress.getByName(device.host))
             onLog("已向 ${device.name} 发出配对请求")
@@ -158,22 +157,20 @@ class LanDiscoveryManager(
         }
     }
 
-    fun sendStrategy(host: String, role: SyncRole, mirror: Boolean) {
+    fun sendStrategy(host: String, role: SyncRole) {
         start()
         val message = baseMessage(TYPE_STRATEGY_UPDATE)
             .put("secret", localSecret())
             .put("role", role.name)
-            .put("mirror", mirror)
         scope.launch {
             send(message, InetAddress.getByName(host))
-            onLog("已发送设备策略：${role.label}${if (mirror) " · 镜像" else " · 更新"}")
+            onLog("已发送零删除设备策略：${role.label}")
         }
     }
 
     suspend fun requestSyncPreparation(
         host: String,
         role: SyncRole,
-        mirror: Boolean,
         timeoutMillis: Long = PREPARE_TIMEOUT_MS
     ): SyncPrepareResult? {
         start()
@@ -184,7 +181,6 @@ class LanDiscoveryManager(
             .put("requestId", requestId)
             .put("secret", localSecret())
             .put("role", role.name)
-            .put("mirror", mirror)
         scope.launch {
             send(message, InetAddress.getByName(host))
             onLog("已请求远端自动准备 rsync 服务")
@@ -445,8 +441,7 @@ class LanDiscoveryManager(
                             host,
                             remotePort,
                             secret,
-                            role,
-                            message.optBoolean("mirror", true)
+                            role
                         )
                     )
                 }
@@ -464,8 +459,7 @@ class LanDiscoveryManager(
                             host,
                             remotePort,
                             secret,
-                            intent.role,
-                            intent.mirror
+                            intent.role
                         )
                     )
                 }
@@ -484,8 +478,7 @@ class LanDiscoveryManager(
                             remoteName,
                             host,
                             secret,
-                            role,
-                            message.optBoolean("mirror", true)
+                            role
                         )
                     )
                 }
@@ -502,8 +495,7 @@ class LanDiscoveryManager(
                             remoteName,
                             host,
                             secret,
-                            role,
-                            message.optBoolean("mirror", true)
+                            role
                         )
                     )
                 }
@@ -595,7 +587,7 @@ class LanDiscoveryManager(
         const val SCAN_WINDOW_MS = 8_000L
         private const val NSD_SERVICE_TYPE = "_rootsync._tcp."
         private const val MAGIC = "ROOTSYNC_LAN"
-        private const val PROTOCOL_VERSION = 3
+        private const val PROTOCOL_VERSION = 4
         private const val UDP_SCAN_BURSTS = 3
         private const val UDP_SCAN_INTERVAL_MS = 700L
         private const val MAX_PACKET_SIZE = 4096
@@ -611,5 +603,5 @@ class LanDiscoveryManager(
         private const val PREPARE_TIMEOUT_MS = 30_000L
     }
 
-    private data class PairIntent(val role: SyncRole, val mirror: Boolean)
+    private data class PairIntent(val role: SyncRole)
 }

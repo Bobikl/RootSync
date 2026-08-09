@@ -108,7 +108,6 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 ?: engine.generateSecret(),
             remoteSecret = selected?.secret ?: preferences.getString("remoteSecret", "").orEmpty(),
             role = selected?.role ?: fallbackRole,
-            mirror = selected?.mirror ?: preferences.getBoolean("mirror", true),
             profiles = profiles,
             selectedProfileId = selected?.id,
             localIp = engine.localIpv4()
@@ -169,11 +168,6 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         publishCurrentStrategy()
     }
 
-    fun setMirror(value: Boolean) {
-        updateConfig { copy(mirror = value, previewReady = false) }
-        publishCurrentStrategy()
-    }
-
     private fun updateConfig(block: SyncUiState.() -> SyncUiState) {
         _state.update { it.block().syncSelectedProfile() }
         saveConfig()
@@ -188,7 +182,6 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 port = SafeInput.parsePort(portText) ?: profile.port,
                 secret = remoteSecret,
                 role = role,
-                mirror = mirror,
                 sourcePath = sourcePath,
                 destinationPath = destinationPath
             )
@@ -215,7 +208,6 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     port = port,
                     secret = current.remoteSecret,
                     role = current.role,
-                    mirror = current.mirror,
                     sourcePath = current.sourcePath,
                     destinationPath = current.destinationPath
                 )
@@ -244,7 +236,6 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 portText = profile.port.toString(),
                 remoteSecret = profile.secret,
                 role = profile.role,
-                mirror = profile.mirror,
                 sourcePath = profile.sourcePath,
                 destinationPath = profile.destinationPath,
                 previewReady = false,
@@ -262,7 +253,6 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 remoteHost = "",
                 remoteSecret = "",
                 role = SyncRole.RECEIVE_ONLY,
-                mirror = true,
                 previewReady = false,
                 lastResult = null
             )
@@ -305,7 +295,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     fun requestPair(deviceId: String) {
         val device = _state.value.discoveredDevices.firstOrNull { it.deviceId == deviceId } ?: return
         val current = _state.value
-        discovery.requestPair(device, current.role, current.mirror)
+        discovery.requestPair(device, current.role)
         _state.update { it.copy(lastResult = "等待 ${device.name} 确认连接") }
     }
 
@@ -327,8 +317,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         host = host,
         port = port,
         secret = secret,
-        role = role.opposite(),
-        mirror = mirror
+        role = role.opposite()
     )
 
     private fun upsertPairedDevice(device: PairAccepted) {
@@ -339,8 +328,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             host = device.host,
             port = device.port,
             secret = device.secret,
-            role = device.role,
-            mirror = device.mirror
+            role = device.role
         ) ?: PeerProfile(
             id = UUID.randomUUID().toString(),
             deviceId = device.deviceId,
@@ -349,7 +337,6 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             port = device.port,
             secret = device.secret,
             role = device.role,
-            mirror = device.mirror,
             sourcePath = current.sourcePath,
             destinationPath = current.destinationPath
         )
@@ -362,7 +349,6 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 portText = profile.port.toString(),
                 remoteSecret = profile.secret,
                 role = profile.role,
-                mirror = profile.mirror,
                 sourcePath = profile.sourcePath,
                 destinationPath = profile.destinationPath,
                 previewReady = false
@@ -375,7 +361,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         val current = _state.value
         val profile = current.profiles.firstOrNull { it.id == current.selectedProfileId } ?: return
         if (profile.deviceId.startsWith("manual:")) return
-        discovery.sendStrategy(profile.host, current.role, current.mirror)
+        discovery.sendStrategy(profile.host, current.role)
     }
 
     private fun applyRemoteStrategy(update: StrategyUpdate) {
@@ -389,8 +375,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         val updatedProfile = existing.copy(
             name = update.name,
             host = update.host,
-            role = localRole,
-            mirror = update.mirror
+            role = localRole
         )
         _state.update { state ->
             val selected = state.selectedProfileId == existing.id
@@ -401,7 +386,6 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 profileName = if (selected) updatedProfile.name else state.profileName,
                 remoteHost = if (selected) updatedProfile.host else state.remoteHost,
                 role = if (selected) localRole else state.role,
-                mirror = if (selected) update.mirror else state.mirror,
                 previewReady = if (selected) false else state.previewReady,
                 lastResult = "${update.name} 已设为${update.role.label}；本机自动切换为${localRole.label}"
             )
@@ -409,8 +393,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         saveConfig()
         appendLog(
             "LAN",
-            "策略已同步：${update.name} ${update.role.label}，本机 ${localRole.label}" +
-                if (update.mirror) " · 镜像" else " · 更新"
+            "零删除策略已同步：${update.name} ${update.role.label}，本机 ${localRole.label}"
         )
     }
 
@@ -434,8 +417,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 request.name,
                 request.host,
                 request.secret,
-                request.role,
-                request.mirror
+                request.role
             )
         )
         val localRole = request.role.opposite()
@@ -488,7 +470,6 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             putString("serverSecret", value.serverSecret)
             putString("remoteSecret", value.remoteSecret)
             putString("role", value.role.name)
-            putBoolean("mirror", value.mirror)
             putString("profiles", encodeProfiles(value.profiles))
             putString("selectedProfileId", value.selectedProfileId)
         }
@@ -544,14 +525,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
 
     fun preview() = runTransfer(dryRun = true)
 
-    fun execute() {
-        if (_state.value.mirror && !_state.value.previewReady) {
-            appendLog("WARN", "镜像删除前必须先完成差异预览")
-            _state.update { it.copy(lastResult = "请先执行镜像预览") }
-            return
-        }
-        runTransfer(dryRun = false)
-    }
+    fun execute() = runTransfer(dryRun = false)
 
     private fun runTransfer(dryRun: Boolean) {
         val current = _state.value
@@ -582,7 +556,6 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     port = endpoint.port,
                     sourcePath = current.sourcePath,
                     secret = endpoint.secret,
-                    mirror = current.mirror,
                     dryRun = dryRun,
                     onLog = ::streamLog,
                     onProgress = { progress -> _state.update { it.copy(progress = progress) } }
@@ -594,7 +567,6 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     port = endpoint.port,
                     destinationPath = current.destinationPath,
                     secret = endpoint.secret,
-                    mirror = current.mirror,
                     dryRun = dryRun,
                     onLog = ::streamLog,
                     onProgress = { progress -> _state.update { it.copy(progress = progress) } }
@@ -634,8 +606,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         _state.update { it.copy(phase = "等待 ${profile.name} 准备服务端") }
         val prepared = discovery.requestSyncPreparation(
             host = current.remoteHost,
-            role = current.role,
-            mirror = current.mirror
+            role = current.role
         )
         if (prepared == null) {
             val message = "${profile.name} 未响应服务准备请求；请保持远端 RootSync 打开"
@@ -728,7 +699,6 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 put("port", profile.port)
                 put("secret", profile.secret)
                 put("role", profile.role.name)
-                put("mirror", profile.mirror)
                 put("sourcePath", profile.sourcePath)
                 put("destinationPath", profile.destinationPath)
             })
@@ -753,7 +723,6 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                             port = item.optInt("port", SyncUiState.DEFAULT_RSYNC_PORT),
                             secret = item.optString("secret"),
                             role = role,
-                            mirror = item.optBoolean("mirror", true),
                             sourcePath = migrateBiliPath(
                                 item.optString("sourcePath", SyncUiState.DEFAULT_BILI_PATH)
                             ),

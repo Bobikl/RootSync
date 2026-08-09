@@ -40,7 +40,6 @@ data class PeerProfile(
     val port: Int = SyncUiState.DEFAULT_RSYNC_PORT,
     val secret: String,
     val role: SyncRole = SyncRole.RECEIVE_ONLY,
-    val mirror: Boolean = true,
     val sourcePath: String = SyncUiState.DEFAULT_BILI_PATH,
     val destinationPath: String = SyncUiState.DEFAULT_BILI_PATH
 )
@@ -60,8 +59,7 @@ data class PairRequest(
     val host: String,
     val port: Int,
     val secret: String,
-    val role: SyncRole,
-    val mirror: Boolean
+    val role: SyncRole
 )
 
 data class PairAccepted(
@@ -70,8 +68,7 @@ data class PairAccepted(
     val host: String,
     val port: Int,
     val secret: String,
-    val role: SyncRole,
-    val mirror: Boolean
+    val role: SyncRole
 )
 
 data class StrategyUpdate(
@@ -79,8 +76,7 @@ data class StrategyUpdate(
     val name: String,
     val host: String,
     val secret: String,
-    val role: SyncRole,
-    val mirror: Boolean
+    val role: SyncRole
 )
 
 data class SyncPrepareRequest(
@@ -89,8 +85,7 @@ data class SyncPrepareRequest(
     val name: String,
     val host: String,
     val secret: String,
-    val role: SyncRole,
-    val mirror: Boolean
+    val role: SyncRole
 )
 
 data class SyncPrepareResult(
@@ -125,7 +120,6 @@ data class SyncUiState(
     val serverSecret: String = "",
     val remoteSecret: String = "",
     val role: SyncRole = SyncRole.RECEIVE_ONLY,
-    val mirror: Boolean = true,
     val profiles: List<PeerProfile> = emptyList(),
     val selectedProfileId: String? = null,
     val discoveredDevices: List<DiscoveredDevice> = emptyList(),

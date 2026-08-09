@@ -15,6 +15,8 @@ import java.net.Inet4Address
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.security.SecureRandom
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
 
 data class EngineResult(
     val success: Boolean,
@@ -256,6 +258,7 @@ class RootSyncEngine(private val context: Context) {
             max connections = 1
             timeout = 300
             strict modes = true
+            refuse options = delete remove-source-files inplace append append-verify
             address = $bindAddress
 
             $modules
@@ -319,7 +322,6 @@ class RootSyncEngine(private val context: Context) {
         port: Int,
         destinationPath: String,
         secret: String,
-        mirror: Boolean,
         dryRun: Boolean,
         onLog: (String) -> Unit,
         onProgress: (Float) -> Unit
@@ -359,7 +361,7 @@ class RootSyncEngine(private val context: Context) {
             port = port,
             destination = destinationPath,
             passwordFile = password.absolutePath,
-            mirror = mirror,
+            backupRunId = backupRunId(),
             dryRun = dryRun
         )
         val transfer = executeTransfer(command, onLog, onProgress)
@@ -370,12 +372,8 @@ class RootSyncEngine(private val context: Context) {
                 transfer.exitCode
             )
         }
-        if (dryRun) return@withContext EngineResult(true, previewSummary(mirror))
+        if (dryRun) return@withContext EngineResult(true, previewSummary())
 
-        shell.execute(
-            "find ${SafeInput.shellQuote(destinationPath)} -depth -type d " +
-                "-name .rsync-partial -empty -delete 2>/dev/null || true"
-        )
         onLog("按目录深度从深到浅恢复 mtime…")
         val restore = shell.execute(
             listOf(syncMetaPath, "restore", destinationPath, remoteSnapshot.absolutePath)
@@ -394,7 +392,7 @@ class RootSyncEngine(private val context: Context) {
             EngineResult(false, "接收完成，但部分目录时间超过 2 秒误差", verify.exitCode)
         } else {
             onProgress(1f)
-            EngineResult(true, "只接收完成，目录时间验证通过")
+            EngineResult(true, "只接收完成；未删除目标端数据，覆盖前版本已保存到 .rootsync-history")
         }
     }
 
@@ -404,7 +402,6 @@ class RootSyncEngine(private val context: Context) {
         port: Int,
         sourcePath: String,
         secret: String,
-        mirror: Boolean,
         dryRun: Boolean,
         onLog: (String) -> Unit,
         onProgress: (Float) -> Unit
@@ -429,7 +426,7 @@ class RootSyncEngine(private val context: Context) {
             port = port,
             source = sourcePath,
             passwordFile = password.absolutePath,
-            mirror = mirror,
+            backupRunId = backupRunId(),
             dryRun = dryRun
         )
         val transfer = executeTransfer(command, onLog, onProgress)
@@ -440,10 +437,10 @@ class RootSyncEngine(private val context: Context) {
                 transfer.exitCode
             )
         }
-        if (dryRun) EngineResult(true, previewSummary(mirror))
+        if (dryRun) EngineResult(true, previewSummary())
         else {
             onProgress(1f)
-            EngineResult(true, "只发送完成；文件与目录 mtime 已交由 rsync 保留")
+            EngineResult(true, "只发送完成；未删除目标端数据，覆盖前版本已保存到 .rootsync-history")
         }
     }
 
@@ -489,7 +486,6 @@ class RootSyncEngine(private val context: Context) {
             10 -> "无法建立或维持远端 rsync Socket 连接"
             12 -> "远端 rsync 协议数据流中断"
             23 -> "部分文件传输失败"
-            25 -> "镜像删除超过 100 项，已按安全限制停止"
             30 -> "rsync 数据传输超时"
             35 -> "等待远端 rsync 服务连接超时"
             else -> "rsync 返回错误 $exitCode"
@@ -497,11 +493,11 @@ class RootSyncEngine(private val context: Context) {
         return if (detail.isNullOrBlank()) "$summary（错误 $exitCode）" else "$summary：$detail"
     }
 
-    private fun previewSummary(mirror: Boolean): String = if (mirror) {
-        "预览完成；镜像删除硬限制为 100 项"
-    } else {
-        "预览完成；仅新增和更新，不删除目标端独有内容"
-    }
+    private fun previewSummary(): String =
+        "预览完成；零删除模式只新增或更新，覆盖前版本会保存到 .rootsync-history"
+
+    private fun backupRunId(): String =
+        LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSS"))
 
     fun cancel() = shell.cancel()
 

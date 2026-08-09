@@ -34,12 +34,13 @@ object RsyncCommandBuilder {
         port: Int,
         destination: String,
         passwordFile: String,
-        mirror: Boolean,
+        backupRunId: String,
         dryRun: Boolean
     ): String {
         require(SafeInput.isValidIpv4(host))
         require(SafeInput.validateStoragePath(destination) == null)
         require(port in 1024..65535)
+        require(backupRunId.matches(Regex("[0-9]{8}-[0-9]{6}-[0-9]{3}")))
 
         val args = mutableListOf(
             rsyncPath,
@@ -49,6 +50,9 @@ object RsyncCommandBuilder {
             "--partial",
             "--partial-dir=.rsync-partial",
             "--delay-updates",
+            "--backup",
+            "--backup-dir=.rootsync-history/$backupRunId",
+            "--exclude=/.rootsync-history/***",
             "--timeout=300",
             "--contimeout=30",
             "--no-perms",
@@ -57,9 +61,9 @@ object RsyncCommandBuilder {
             "--password-file=$passwordFile"
         )
         if (dryRun) args += listOf("--dry-run", "--itemize-changes")
-        if (mirror) args += listOf("--delete-delay", "--max-delete=100")
         args += "rsync://sync-user@$host:$port/send/"
         args += destination.trimEnd('/') + "/"
+        require(args.none(::isDeletionOption)) { "零删除模式禁止生成删除参数" }
         return args.joinToString(" ") { SafeInput.shellQuote(it) }
     }
 
@@ -69,12 +73,13 @@ object RsyncCommandBuilder {
         port: Int,
         source: String,
         passwordFile: String,
-        mirror: Boolean,
+        backupRunId: String,
         dryRun: Boolean
     ): String {
         require(SafeInput.isValidIpv4(host))
         require(SafeInput.validateStoragePath(source) == null)
         require(port in 1024..65535)
+        require(backupRunId.matches(Regex("[0-9]{8}-[0-9]{6}-[0-9]{3}")))
 
         val args = mutableListOf(
             rsyncPath,
@@ -84,6 +89,9 @@ object RsyncCommandBuilder {
             "--partial",
             "--partial-dir=.rsync-partial",
             "--delay-updates",
+            "--backup",
+            "--backup-dir=.rootsync-history/$backupRunId",
+            "--exclude=/.rootsync-history/***",
             "--timeout=300",
             "--contimeout=30",
             "--no-perms",
@@ -92,9 +100,18 @@ object RsyncCommandBuilder {
             "--password-file=$passwordFile"
         )
         if (dryRun) args += listOf("--dry-run", "--itemize-changes")
-        if (mirror) args += listOf("--delete-delay", "--max-delete=100")
         args += source.trimEnd('/') + "/"
         args += "rsync://sync-user@$host:$port/receive/"
+        require(args.none(::isDeletionOption)) { "零删除模式禁止生成删除参数" }
         return args.joinToString(" ") { SafeInput.shellQuote(it) }
+    }
+
+    internal fun isDeletionOption(argument: String): Boolean {
+        val normalized = argument.substringBefore('=').lowercase()
+        return normalized == "--delete" ||
+            normalized.startsWith("--delete-") ||
+            normalized == "--del" ||
+            normalized == "--remove-source-files" ||
+            normalized == "--remove-sent-files"
     }
 }

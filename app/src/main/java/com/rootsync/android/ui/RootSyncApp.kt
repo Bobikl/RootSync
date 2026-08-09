@@ -44,7 +44,6 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -193,7 +192,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
 
         SectionCard(
             title = "设备策略",
-            subtitle = "每台设备独立保存方向、镜像开关、地址和目录"
+            subtitle = "每台设备独立保存方向、地址和目录；所有传输强制零删除"
         ) {
             if (state.profiles.isEmpty()) {
                 Text("还没有保存的设备，可手动填写或从局域网扫描配对。")
@@ -300,21 +299,19 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                     )
                 }
             }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+            Surface(
+                color = MaterialTheme.colorScheme.tertiaryContainer,
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier.fillMaxWidth()
             ) {
-                Column(Modifier.weight(1f)) {
-                    Text("镜像目标端", fontWeight = FontWeight.Medium)
+                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("零删除保护已强制开启", fontWeight = FontWeight.SemiBold)
                     Text(
-                        if (state.mirror) "删除目标端多余内容；执行前必须预览，最多删除 100 项"
-                        else "只新增或更新，不删除目标端独有内容",
+                        "不会删除来源端或目标端文件；目标端独有内容始终保留，覆盖前版本保存到 .rootsync-history。",
                         style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        color = MaterialTheme.colorScheme.onTertiaryContainer
                     )
                 }
-                Switch(checked = state.mirror, onCheckedChange = viewModel::setMirror)
             }
             Text(
                 if (state.role == SyncRole.SEND_ONLY)
@@ -412,7 +409,7 @@ private fun ProfileRow(profile: PeerProfile, selected: Boolean, onClick: () -> U
             }
             Text(
                 (if (profile.role == SyncRole.SEND_ONLY) "本机只发送" else "${profile.name}只发送") +
-                    if (profile.mirror) " · 镜像" else " · 更新",
+                    " · 零删除",
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.primary
             )
