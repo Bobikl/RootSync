@@ -71,6 +71,7 @@ import com.rootsync.android.domain.CapabilityCheck
 import com.rootsync.android.domain.CheckState
 import com.rootsync.android.domain.DiscoveredDevice
 import com.rootsync.android.domain.PeerProfile
+import com.rootsync.android.domain.SyncActivityType
 import com.rootsync.android.domain.SyncRangeMode
 import com.rootsync.android.domain.SyncRole
 import com.rootsync.android.domain.SyncUiState
@@ -120,7 +121,13 @@ fun RootSyncApp(viewModel: SyncViewModel) {
                         Column {
                             Text("RootSync", fontWeight = FontWeight.SemiBold)
                             Text(
-                                state.phase,
+                                state.remoteActivity?.let { activity ->
+                                    if (activity.type == SyncActivityType.PREVIEW) {
+                                        "${activity.name} 正在扫描差异文件夹"
+                                    } else {
+                                        "${activity.name} 正在与本机同步"
+                                    }
+                                } ?: state.phase,
                                 style = MaterialTheme.typography.labelMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 maxLines = 1,
@@ -213,6 +220,28 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         StatusHero(state, viewModel::refreshCapabilities)
+
+        state.remoteActivity?.let { activity ->
+            SectionCard(
+                title = if (activity.type == SyncActivityType.PREVIEW) {
+                    "${activity.name} 正在扫描差异文件夹"
+                } else {
+                    "${activity.name} 正在与本机同步"
+                },
+                subtitle = "这是对方设备发起的任务，本机正在提供受限 rsync 服务。",
+                emphasized = true
+            ) {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                Text(
+                    if (activity.type == SyncActivityType.PREVIEW) {
+                        "对方正在比较双方目录，扫描完成后此提示会自动消失。"
+                    } else {
+                        "对方正在按已保存策略传输文件；零删除保护保持开启。"
+                    },
+                    color = MaterialTheme.colorScheme.onSecondaryContainer
+                )
+            }
+        }
 
         SectionCard(
             title = "设备策略",
@@ -438,6 +467,30 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
             }
         }
 
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+            OutlinedButton(
+                onClick = viewModel::preview,
+                enabled = state.canOperate,
+                modifier = Modifier.weight(1f)
+            ) { Text("差异预览") }
+            Button(
+                onClick = if (state.isBusy) {
+                    if (state.isPreviewing) viewModel::cancel else viewModel::pauseTransfer
+                } else executeWithNotification,
+                enabled = state.isBusy || state.canOperate,
+                modifier = Modifier.weight(1f)
+            ) {
+                Text(
+                    when {
+                        state.isBusy && state.isPreviewing -> "取消预览"
+                        state.isBusy -> "暂停传输"
+                        state.transferRecord?.status == TransferStatus.PAUSED -> "继续传输"
+                        else -> "执行${state.role.label}"
+                    }
+                )
+            }
+        }
+
         AnimatedVisibility(state.isBusy || state.progress != null) {
             SectionCard(title = state.phase) {
                 if (state.progress != null) {
@@ -472,6 +525,17 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                     modifier = Modifier.padding(14.dp).verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(7.dp)
                 ) {
+                    state.previewStatusText?.let { status ->
+                        Text(
+                            status,
+                            color = if (status.startsWith("扫描失败") || status.startsWith("无法")) {
+                                MaterialTheme.colorScheme.error
+                            } else {
+                                MaterialTheme.colorScheme.primary
+                            },
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
                     state.currentTransferFolder?.let { folder ->
                         Surface(
                             color = MaterialTheme.colorScheme.primaryContainer,
@@ -486,10 +550,13 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                         }
                     }
                     if (state.transferFolders.isEmpty()) {
-                        Text(
-                            if (state.isBusy) "正在扫描文件夹，请稍候…" else "点击差异预览后，变化文件夹会显示在这里。",
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                        if (state.previewStatusText == null) {
+                            Text(
+                                if (state.isBusy) "正在扫描文件夹，请稍候…"
+                                else "点击差异预览后，变化文件夹会显示在这里。",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
                     } else {
                         state.transferFolders.forEach { folder ->
                             Text("• $folder", style = MaterialTheme.typography.bodyMedium)
@@ -545,29 +612,6 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
             }
         }
 
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-            OutlinedButton(
-                onClick = viewModel::preview,
-                enabled = state.canOperate,
-                modifier = Modifier.weight(1f)
-            ) { Text("差异预览") }
-            Button(
-                onClick = if (state.isBusy) {
-                    if (state.isPreviewing) viewModel::cancel else viewModel::pauseTransfer
-                } else executeWithNotification,
-                enabled = state.isBusy || state.canOperate,
-                modifier = Modifier.weight(1f)
-            ) {
-                Text(
-                    when {
-                        state.isBusy && state.isPreviewing -> "取消预览"
-                        state.isBusy -> "暂停传输"
-                        state.transferRecord?.status == TransferStatus.PAUSED -> "继续传输"
-                        else -> "执行${state.role.label}"
-                    }
-                )
-            }
-        }
         Spacer(Modifier.height(8.dp))
     }
 }
@@ -580,19 +624,16 @@ private fun ProfileRow(profile: PeerProfile, selected: Boolean, onClick: () -> U
         shape = RoundedCornerShape(14.dp),
         modifier = Modifier.fillMaxWidth().clickable(onClick = onClick)
     ) {
-        Row(
+        Column(
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 11.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+            verticalArrangement = Arrangement.spacedBy(5.dp)
         ) {
-            Column(Modifier.weight(1f)) {
-                Text(profile.name, fontWeight = FontWeight.SemiBold)
-                Text(
-                    "${profile.host}:${profile.port}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
+            Text(profile.name, fontWeight = FontWeight.SemiBold, maxLines = 1)
+            Text(
+                "${profile.host}:${profile.port}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
             Text(
                 when (profile.role) {
                     SyncRole.SEND_ONLY -> "本机发送 → ${profile.name}接收"
@@ -600,7 +641,8 @@ private fun ProfileRow(profile: PeerProfile, selected: Boolean, onClick: () -> U
                     SyncRole.BIDIRECTIONAL -> "本机 ⇄ ${profile.name}"
                 } + " · ${profile.rangeMode.label} · 零删除",
                 style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.primary
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.fillMaxWidth()
             )
         }
     }

@@ -17,6 +17,11 @@ enum class SyncRangeMode(val label: String) {
     SINCE("指定时间至今")
 }
 
+enum class SyncActivityType {
+    PREVIEW,
+    TRANSFER
+}
+
 enum class CheckState {
     CHECKING,
     PASS,
@@ -111,7 +116,8 @@ data class SyncPrepareRequest(
     val role: SyncRole,
     val rangeMode: SyncRangeMode,
     val sinceEpochMillis: Long?,
-    val untilEpochMillis: Long
+    val untilEpochMillis: Long,
+    val isPreview: Boolean
 )
 
 data class SyncPrepareResult(
@@ -123,6 +129,22 @@ data class SyncPrepareResult(
     val ready: Boolean,
     val message: String,
     val secret: String
+)
+
+data class SyncActivityUpdate(
+    val deviceId: String,
+    val name: String,
+    val host: String,
+    val secret: String,
+    val type: SyncActivityType,
+    val active: Boolean
+)
+
+data class RemoteSyncActivity(
+    val deviceId: String,
+    val name: String,
+    val type: SyncActivityType,
+    val startedAtMillis: Long = System.currentTimeMillis()
 )
 
 data class LogEntry(
@@ -191,6 +213,8 @@ data class SyncUiState(
     val transferFoldersTruncated: Boolean = false,
     val transferRecord: TransferRecord? = null,
     val previewReady: Boolean = false,
+    val previewStatusText: String? = null,
+    val remoteActivity: RemoteSyncActivity? = null,
     val lastResult: String? = null,
     val logs: List<LogEntry> = emptyList()
 ) {

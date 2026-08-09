@@ -12,6 +12,8 @@ import com.rootsync.android.domain.DiscoveredDevice
 import com.rootsync.android.domain.PairAccepted
 import com.rootsync.android.domain.PairRequest
 import com.rootsync.android.domain.StrategyUpdate
+import com.rootsync.android.domain.SyncActivityType
+import com.rootsync.android.domain.SyncActivityUpdate
 import com.rootsync.android.domain.SyncPrepareRequest
 import com.rootsync.android.domain.SyncPrepareResult
 import com.rootsync.android.domain.SyncRangeMode
@@ -33,6 +35,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import java.net.DatagramPacket
@@ -106,6 +109,12 @@ class LanDiscoveryManager(
         onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
     val syncPrepareRequests: SharedFlow<SyncPrepareRequest> = _syncPrepareRequests.asSharedFlow()
+
+    private val _syncActivityUpdates = MutableSharedFlow<SyncActivityUpdate>(
+        extraBufferCapacity = 16,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val syncActivityUpdates: SharedFlow<SyncActivityUpdate> = _syncActivityUpdates.asSharedFlow()
 
     private val _trustedPeerUpdates = MutableSharedFlow<TrustedPeerUpdate>(
         extraBufferCapacity = 16,
@@ -213,6 +222,7 @@ class LanDiscoveryManager(
         rangeMode: SyncRangeMode,
         sinceEpochMillis: Long?,
         untilEpochMillis: Long,
+        isPreview: Boolean,
         timeoutMillis: Long = PREPARE_TIMEOUT_MS
     ): SyncPrepareResult? {
         start()
@@ -225,6 +235,7 @@ class LanDiscoveryManager(
             .put("role", role.name)
             .put("rangeMode", rangeMode.name)
             .put("untilEpochMillis", untilEpochMillis)
+            .put("isPreview", isPreview)
         sinceEpochMillis?.let { message.put("sinceEpochMillis", it) }
         scope.launch {
             send(message, InetAddress.getByName(host))
@@ -236,6 +247,20 @@ class LanDiscoveryManager(
             prepareWaiters.remove(requestId, waiter)
         }
     }
+
+    suspend fun sendSyncActivity(host: String, type: SyncActivityType, active: Boolean) =
+        withContext(Dispatchers.IO) {
+            start()
+            val message = baseMessage(TYPE_SYNC_ACTIVITY)
+                .put("secret", localSecret())
+                .put("activity", type.name)
+                .put("active", active)
+            val address = InetAddress.getByName(host)
+            repeat(2) { index ->
+                send(message, address)
+                if (index == 0) delay(80)
+            }
+        }
 
     fun answerSyncPreparation(
         request: SyncPrepareRequest,
@@ -575,6 +600,7 @@ class LanDiscoveryManager(
                 val rangeMode = parseRangeMode(message.optString("rangeMode"))
                 val since = parseSince(message, rangeMode)
                 val until = message.optLong("untilEpochMillis", -1L)
+                val isPreview = message.optBoolean("isPreview", false)
                 if (requestId.isNotBlank() && secret.length >= 6 && role != null && rangeMode != null &&
                     (rangeMode == SyncRangeMode.ALL || since != null) && until > 0L
                 ) {
@@ -588,7 +614,26 @@ class LanDiscoveryManager(
                             role,
                             rangeMode,
                             since,
-                            until
+                            until,
+                            isPreview
+                        )
+                    )
+                }
+            }
+            TYPE_SYNC_ACTIVITY -> {
+                val secret = message.optString("secret")
+                val activity = runCatching {
+                    SyncActivityType.valueOf(message.optString("activity"))
+                }.getOrNull()
+                if (secret.length >= 6 && activity != null && isTrustedDevice(remoteDeviceId)) {
+                    _syncActivityUpdates.tryEmit(
+                        SyncActivityUpdate(
+                            deviceId = remoteDeviceId,
+                            name = remoteName,
+                            host = host,
+                            secret = secret,
+                            type = activity,
+                            active = message.optBoolean("active", false)
                         )
                     )
                 }
@@ -717,6 +762,7 @@ class LanDiscoveryManager(
         private const val TYPE_STRATEGY_UPDATE = "strategy_update"
         private const val TYPE_SYNC_PREPARE = "sync_prepare"
         private const val TYPE_SYNC_READY = "sync_ready"
+        private const val TYPE_SYNC_ACTIVITY = "sync_activity"
         private const val PREPARE_TIMEOUT_MS = 30_000L
         private const val TRUST_RECONNECT_COOLDOWN_MS = 10_000L
     }
