@@ -74,12 +74,15 @@ object RsyncCommandBuilder {
         destination: String,
         passwordFile: String,
         backupRunId: String,
+        filesFrom: String?,
+        bidirectional: Boolean,
         dryRun: Boolean
     ): String {
         require(SafeInput.isValidIpv4(host))
         require(SafeInput.validateStoragePath(destination) == null)
         require(port in 1024..65535)
         require(backupRunId.matches(Regex("[0-9]{8}-[0-9]{6}-[0-9]{3}")))
+        require(filesFrom == null || filesFrom.startsWith("/data/"))
 
         val args = mutableListOf(
             rsyncPath,
@@ -100,6 +103,8 @@ object RsyncCommandBuilder {
             "--no-group",
             "--password-file=$passwordFile"
         )
+        filesFrom?.let { args += listOf("--files-from=$it", "--from0") }
+        if (bidirectional) args += listOf("--update", "--checksum")
         if (dryRun) args += listOf("--dry-run", "--itemize-changes")
         args += "rsync://sync-user@$host:$port/send/"
         args += destination.trimEnd('/') + "/"
@@ -114,12 +119,15 @@ object RsyncCommandBuilder {
         source: String,
         passwordFile: String,
         backupRunId: String,
+        filesFrom: String?,
+        bidirectional: Boolean,
         dryRun: Boolean
     ): String {
         require(SafeInput.isValidIpv4(host))
         require(SafeInput.validateStoragePath(source) == null)
         require(port in 1024..65535)
         require(backupRunId.matches(Regex("[0-9]{8}-[0-9]{6}-[0-9]{3}")))
+        require(filesFrom == null || filesFrom.startsWith("/data/"))
 
         val args = mutableListOf(
             rsyncPath,
@@ -140,6 +148,8 @@ object RsyncCommandBuilder {
             "--no-group",
             "--password-file=$passwordFile"
         )
+        filesFrom?.let { args += listOf("--files-from=$it", "--from0") }
+        if (bidirectional) args += listOf("--update", "--checksum")
         if (dryRun) args += listOf("--dry-run", "--itemize-changes")
         args += source.trimEnd('/') + "/"
         args += "rsync://sync-user@$host:$port/receive/"

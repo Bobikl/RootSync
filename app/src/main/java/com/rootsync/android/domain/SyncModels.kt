@@ -2,12 +2,19 @@ package com.rootsync.android.domain
 
 enum class SyncRole(val label: String) {
     SEND_ONLY("只发送"),
-    RECEIVE_ONLY("只接收");
+    RECEIVE_ONLY("只接收"),
+    BIDIRECTIONAL("双向同步");
 
     fun opposite(): SyncRole = when (this) {
         SEND_ONLY -> RECEIVE_ONLY
         RECEIVE_ONLY -> SEND_ONLY
+        BIDIRECTIONAL -> BIDIRECTIONAL
     }
+}
+
+enum class SyncRangeMode(val label: String) {
+    ALL("全部内容"),
+    SINCE("指定时间至今")
 }
 
 enum class CheckState {
@@ -40,6 +47,8 @@ data class PeerProfile(
     val port: Int = SyncUiState.DEFAULT_RSYNC_PORT,
     val secret: String,
     val role: SyncRole = SyncRole.RECEIVE_ONLY,
+    val rangeMode: SyncRangeMode = SyncRangeMode.ALL,
+    val sinceEpochMillis: Long? = null,
     val sourcePath: String = SyncUiState.DEFAULT_BILI_PATH,
     val destinationPath: String = SyncUiState.DEFAULT_BILI_PATH
 )
@@ -59,7 +68,9 @@ data class PairRequest(
     val host: String,
     val port: Int,
     val secret: String,
-    val role: SyncRole
+    val role: SyncRole,
+    val rangeMode: SyncRangeMode,
+    val sinceEpochMillis: Long?
 )
 
 data class PairAccepted(
@@ -68,7 +79,9 @@ data class PairAccepted(
     val host: String,
     val port: Int,
     val secret: String,
-    val role: SyncRole
+    val role: SyncRole,
+    val rangeMode: SyncRangeMode,
+    val sinceEpochMillis: Long?
 )
 
 data class TrustedPeerUpdate(
@@ -84,7 +97,9 @@ data class StrategyUpdate(
     val name: String,
     val host: String,
     val secret: String,
-    val role: SyncRole
+    val role: SyncRole,
+    val rangeMode: SyncRangeMode,
+    val sinceEpochMillis: Long?
 )
 
 data class SyncPrepareRequest(
@@ -93,7 +108,10 @@ data class SyncPrepareRequest(
     val name: String,
     val host: String,
     val secret: String,
-    val role: SyncRole
+    val role: SyncRole,
+    val rangeMode: SyncRangeMode,
+    val sinceEpochMillis: Long?,
+    val untilEpochMillis: Long
 )
 
 data class SyncPrepareResult(
@@ -128,6 +146,8 @@ data class TransferRecord(
     val port: Int,
     val secret: String,
     val role: SyncRole,
+    val rangeMode: SyncRangeMode,
+    val sinceEpochMillis: Long?,
     val sourcePath: String,
     val destinationPath: String,
     val status: TransferStatus,
@@ -152,6 +172,8 @@ data class SyncUiState(
     val serverSecret: String = "",
     val remoteSecret: String = "",
     val role: SyncRole = SyncRole.RECEIVE_ONLY,
+    val rangeMode: SyncRangeMode = SyncRangeMode.ALL,
+    val sinceEpochMillis: Long? = null,
     val profiles: List<PeerProfile> = emptyList(),
     val selectedProfileId: String? = null,
     val discoveredDevices: List<DiscoveredDevice> = emptyList(),

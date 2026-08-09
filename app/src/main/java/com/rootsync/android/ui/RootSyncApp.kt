@@ -1,6 +1,8 @@
 package com.rootsync.android.ui
 
 import android.Manifest
+import android.app.DatePickerDialog
+import android.app.TimePickerDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -69,9 +71,13 @@ import com.rootsync.android.domain.CapabilityCheck
 import com.rootsync.android.domain.CheckState
 import com.rootsync.android.domain.DiscoveredDevice
 import com.rootsync.android.domain.PeerProfile
+import com.rootsync.android.domain.SyncRangeMode
 import com.rootsync.android.domain.SyncRole
 import com.rootsync.android.domain.SyncUiState
 import com.rootsync.android.domain.TransferStatus
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -89,7 +95,8 @@ fun RootSyncApp(viewModel: SyncViewModel) {
                         Text(request.name, fontWeight = FontWeight.SemiBold)
                         Text("${request.host}:${request.port}")
                         Text(
-                            "对方策略：${request.role.label}；本机会自动设为${request.role.opposite().label}。"
+                            "对方策略：${request.role.label} · ${request.rangeMode.label}；" +
+                                "本机会自动设为${request.role.opposite().label}。"
                         )
                         Text(
                             "允许后会保存为独立设备策略，并交换本机 rsync 配对密钥。",
@@ -301,13 +308,14 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
 
         SectionCard(
             title = "同步策略",
-            subtitle = "按数据流向显示；一端改方向后，另一端会自动采用相反的本机动作"
+            subtitle = "先选方向，再选同步全部内容或指定时间至今"
         ) {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 SyncRole.entries.forEach { role ->
                     FilterChip(
                         selected = state.role == role,
                         onClick = { viewModel.setRole(role) },
+                        modifier = Modifier.fillMaxWidth(),
                         label = {
                             Text(
                                 when (role) {
@@ -315,12 +323,64 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                                         "发送给${state.profileName.ifBlank { "远端" }}（对方接收）"
                                     SyncRole.RECEIVE_ONLY ->
                                         "从${state.profileName.ifBlank { "远端" }}接收"
+                                    SyncRole.BIDIRECTIONAL ->
+                                        "与${state.profileName.ifBlank { "远端" }}双向同步"
                                 }
                             )
                         }
                     )
                 }
             }
+            Text("同步范围", style = MaterialTheme.typography.labelLarge)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                SyncRangeMode.entries.forEach { rangeMode ->
+                    FilterChip(
+                        selected = state.rangeMode == rangeMode,
+                        onClick = { viewModel.setRangeMode(rangeMode) },
+                        label = { Text(rangeMode.label) },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+            if (state.rangeMode == SyncRangeMode.SINCE) {
+                Surface(
+                    color = MaterialTheme.colorScheme.secondaryContainer,
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("起始时间", style = MaterialTheme.typography.labelMedium)
+                            Text(
+                                formatSyncTime(state.sinceEpochMillis),
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                "包含该时间至点击同步时发生变化的文件",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                            )
+                        }
+                        OutlinedButton(onClick = {
+                            showDateTimePicker(
+                                context = context,
+                                initialMillis = state.sinceEpochMillis
+                                    ?: System.currentTimeMillis() - 24L * 60L * 60L * 1000L,
+                                onPicked = viewModel::setSinceEpochMillis
+                            )
+                        }) { Text("选择") }
+                    }
+                }
+            }
+            Text(
+                "该范围同时适用于只发送、只接收和双向同步。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
             Surface(
                 color = MaterialTheme.colorScheme.tertiaryContainer,
                 shape = RoundedCornerShape(14.dp),
@@ -336,27 +396,39 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                 }
             }
             Text(
-                if (state.role == SyncRole.SEND_ONLY)
-                    "数据方向：本机 → ${state.profileName.ifBlank { "远端" }}；预览时会自动请求远端准备服务。"
-                else "数据方向：${state.profileName.ifBlank { "远端" }} → 本机；本机执行时主动拉取。",
+                when (state.role) {
+                    SyncRole.SEND_ONLY ->
+                        "数据方向：本机 → ${state.profileName.ifBlank { "远端" }}；预览时会自动请求远端准备服务。"
+                    SyncRole.RECEIVE_ONLY ->
+                        "数据方向：${state.profileName.ifBlank { "远端" }} → 本机；本机执行时主动拉取。"
+                    SyncRole.BIDIRECTIONAL ->
+                        "先接收再发送；较新修改时间优先，并用校验和确认差异。覆盖前版本保留在 .rootsync-history。"
+                },
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
 
         SectionCard(title = "本机目录") {
-            if (state.role == SyncRole.SEND_ONLY) {
-                OutlinedTextField(
+            when (state.role) {
+                SyncRole.SEND_ONLY -> OutlinedTextField(
                     value = state.sourcePath,
                     onValueChange = viewModel::setSourcePath,
                     label = { Text("本机发送源目录") },
                     minLines = 2,
                     modifier = Modifier.fillMaxWidth()
                 )
-            } else {
-                OutlinedTextField(
+                SyncRole.RECEIVE_ONLY -> OutlinedTextField(
                     value = state.destinationPath,
                     onValueChange = viewModel::setDestinationPath,
                     label = { Text("本机接收目录（不存在会自动创建）") },
+                    minLines = 2,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                SyncRole.BIDIRECTIONAL -> OutlinedTextField(
+                    value = state.sourcePath,
+                    onValueChange = viewModel::setBidirectionalPath,
+                    label = { Text("本机双向同步目录") },
+                    supportingText = { Text("同一目录同时用于发送和接收") },
                     minLines = 2,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -522,12 +594,11 @@ private fun ProfileRow(profile: PeerProfile, selected: Boolean, onClick: () -> U
                 )
             }
             Text(
-                (if (profile.role == SyncRole.SEND_ONLY) {
-                    "本机发送 → ${profile.name}接收"
-                } else {
-                    "${profile.name}发送 → 本机接收"
-                }) +
-                    " · 零删除",
+                when (profile.role) {
+                    SyncRole.SEND_ONLY -> "本机发送 → ${profile.name}接收"
+                    SyncRole.RECEIVE_ONLY -> "${profile.name}发送 → 本机接收"
+                    SyncRole.BIDIRECTIONAL -> "本机 ⇄ ${profile.name}"
+                } + " · ${profile.rangeMode.label} · 零删除",
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.primary
             )
@@ -815,6 +886,42 @@ private fun SectionCard(
             content()
         }
     }
+}
+
+private fun formatSyncTime(epochMillis: Long?): String {
+    if (epochMillis == null) return "请选择"
+    return SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(epochMillis)
+}
+
+private fun showDateTimePicker(
+    context: Context,
+    initialMillis: Long,
+    onPicked: (Long) -> Unit
+) {
+    val initial = Calendar.getInstance().apply { timeInMillis = initialMillis }
+    val dateDialog = DatePickerDialog(
+        context,
+        { _, year, month, day ->
+            TimePickerDialog(
+                context,
+                { _, hour, minute ->
+                    val selected = Calendar.getInstance().apply {
+                        set(year, month, day, hour, minute, 0)
+                        set(Calendar.MILLISECOND, 0)
+                    }
+                    onPicked(selected.timeInMillis.coerceAtMost(System.currentTimeMillis()))
+                },
+                initial.get(Calendar.HOUR_OF_DAY),
+                initial.get(Calendar.MINUTE),
+                true
+            ).show()
+        },
+        initial.get(Calendar.YEAR),
+        initial.get(Calendar.MONTH),
+        initial.get(Calendar.DAY_OF_MONTH)
+    )
+    dateDialog.datePicker.maxDate = System.currentTimeMillis()
+    dateDialog.show()
 }
 
 @Composable

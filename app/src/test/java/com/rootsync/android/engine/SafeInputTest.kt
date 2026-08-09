@@ -13,6 +13,7 @@ class SafeInputTest {
     fun keepsBothSidesOfDirectionComplementary() {
         assertEquals(SyncRole.RECEIVE_ONLY, SyncRole.SEND_ONLY.opposite())
         assertEquals(SyncRole.SEND_ONLY, SyncRole.RECEIVE_ONLY.opposite())
+        assertEquals(SyncRole.BIDIRECTIONAL, SyncRole.BIDIRECTIONAL.opposite())
     }
 
     @Test
@@ -43,6 +44,8 @@ class SafeInputTest {
             destination = "/storage/emulated/0/receive",
             passwordFile = "/data/user/0/app/password",
             backupRunId = "20260809-210000-000",
+            filesFrom = null,
+            bidirectional = false,
             dryRun = true
         )
         val push = RsyncCommandBuilder.push(
@@ -52,6 +55,8 @@ class SafeInputTest {
             source = "/storage/emulated/0/send",
             passwordFile = "/data/user/0/app/password",
             backupRunId = "20260809-210000-000",
+            filesFrom = null,
+            bidirectional = false,
             dryRun = false
         )
         assertTrue(pull.contains("/send/"))
@@ -69,6 +74,27 @@ class SafeInputTest {
         assertFalse(push.contains("--delete"))
         assertFalse(pull.contains("--remove-source-files"))
         assertFalse(push.contains("--remove-source-files"))
+    }
+
+    @Test
+    fun buildsTimeFilteredBidirectionalCommandWithoutDelete() {
+        val command = RsyncCommandBuilder.pull(
+            rsyncPath = "/data/app/librsync.so",
+            host = "192.168.1.20",
+            port = 8873,
+            destination = "/storage/emulated/0/sync",
+            passwordFile = "/data/user/0/app/password",
+            backupRunId = "20260809-210000-000",
+            filesFrom = "/data/user/0/app/remote.files",
+            bidirectional = true,
+            dryRun = false
+        )
+        assertTrue(command.contains("--files-from=/data/user/0/app/remote.files"))
+        assertTrue(command.contains("--from0"))
+        assertTrue(command.contains("--update"))
+        assertTrue(command.contains("--checksum"))
+        assertFalse(command.contains("--delete"))
+        assertFalse(command.contains("--remove-source-files"))
     }
 
     @Test

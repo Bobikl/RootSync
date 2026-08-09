@@ -13,12 +13,14 @@ import com.rootsync.android.domain.PairRequest
 import com.rootsync.android.domain.PeerProfile
 import com.rootsync.android.domain.StrategyUpdate
 import com.rootsync.android.domain.SyncPrepareRequest
+import com.rootsync.android.domain.SyncRangeMode
 import com.rootsync.android.domain.SyncRole
 import com.rootsync.android.domain.SyncUiState
 import com.rootsync.android.domain.TransferRecord
 import com.rootsync.android.domain.TransferStatus
 import com.rootsync.android.domain.TrustedPeerUpdate
 import com.rootsync.android.engine.RootSyncEngine
+import com.rootsync.android.engine.EngineResult
 import com.rootsync.android.engine.RsyncItem
 import com.rootsync.android.engine.SafeInput
 import com.rootsync.android.service.TransferForegroundService
@@ -124,6 +126,13 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         val fallbackRole = runCatching {
             SyncRole.valueOf(preferences.getString("role", SyncRole.RECEIVE_ONLY.name)!!)
         }.getOrDefault(SyncRole.RECEIVE_ONLY)
+        val fallbackRangeMode = runCatching {
+            SyncRangeMode.valueOf(preferences.getString("rangeMode", SyncRangeMode.ALL.name)!!)
+        }.getOrDefault(SyncRangeMode.ALL)
+        val fallbackSince = preferences.getLong("sinceEpochMillis", -1L).takeIf { it > 0L }
+        val resolvedRole = selected?.role ?: fallbackRole
+        val resolvedSource = selected?.sourcePath ?: storedSource
+        val resolvedDestination = selected?.destinationPath ?: storedDestination
         return SyncUiState(
             deviceName = deviceName,
             profileName = selected?.name ?: preferences.getString("profileName", "手动设备").orEmpty(),
@@ -134,13 +143,15 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 "serverPort",
                 SyncUiState.DEFAULT_RSYNC_PORT.toString()
             ).orEmpty(),
-            sourcePath = selected?.sourcePath ?: storedSource,
-            destinationPath = selected?.destinationPath ?: storedDestination,
+            sourcePath = resolvedSource,
+            destinationPath = if (resolvedRole == SyncRole.BIDIRECTIONAL) resolvedSource else resolvedDestination,
             serverSecret = preferences.getString("serverSecret", null)
                 ?: preferences.getString("secret", null)
                 ?: engine.generateSecret(),
             remoteSecret = selected?.secret ?: preferences.getString("remoteSecret", "").orEmpty(),
-            role = selected?.role ?: fallbackRole,
+            role = resolvedRole,
+            rangeMode = selected?.rangeMode ?: fallbackRangeMode,
+            sinceEpochMillis = selected?.sinceEpochMillis ?: fallbackSince,
             profiles = profiles,
             selectedProfileId = selected?.id,
             transferRecord = decodeTransferRecord(preferences.getString("transferRecord", null)),
@@ -186,8 +197,17 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     fun setServerPort(value: String) = updateConfig {
         copy(serverPortText = value.filter(Char::isDigit).take(5), previewReady = false)
     }
-    fun setSourcePath(value: String) = updateConfig { copy(sourcePath = value, previewReady = false) }
+    fun setSourcePath(value: String) = updateConfig {
+        copy(
+            sourcePath = value,
+            destinationPath = if (role == SyncRole.BIDIRECTIONAL) value else destinationPath,
+            previewReady = false
+        )
+    }
     fun setDestinationPath(value: String) = updateConfig { copy(destinationPath = value, previewReady = false) }
+    fun setBidirectionalPath(value: String) = updateConfig {
+        copy(sourcePath = value, destinationPath = value, previewReady = false)
+    }
     fun setRemoteSecret(value: String) = updateConfig {
         copy(remoteSecret = value.trim().take(128), previewReady = false)
     }
@@ -198,7 +218,29 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
     fun setRole(value: SyncRole) {
-        updateConfig { copy(role = value, previewReady = false) }
+        updateConfig {
+            copy(
+                role = value,
+                destinationPath = if (value == SyncRole.BIDIRECTIONAL) sourcePath else destinationPath,
+                previewReady = false
+            )
+        }
+        publishCurrentStrategy()
+    }
+    fun setRangeMode(value: SyncRangeMode) {
+        updateConfig {
+            copy(
+                rangeMode = value,
+                sinceEpochMillis = if (value == SyncRangeMode.SINCE) {
+                    sinceEpochMillis ?: System.currentTimeMillis() - DEFAULT_RANGE_MILLIS
+                } else sinceEpochMillis,
+                previewReady = false
+            )
+        }
+        publishCurrentStrategy()
+    }
+    fun setSinceEpochMillis(value: Long) {
+        updateConfig { copy(sinceEpochMillis = value.coerceAtLeast(1L), previewReady = false) }
         publishCurrentStrategy()
     }
 
@@ -216,6 +258,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 port = SafeInput.parsePort(portText) ?: profile.port,
                 secret = remoteSecret,
                 role = role,
+                rangeMode = rangeMode,
+                sinceEpochMillis = sinceEpochMillis,
                 sourcePath = sourcePath,
                 destinationPath = destinationPath
             )
@@ -242,6 +286,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     port = port,
                     secret = current.remoteSecret,
                     role = current.role,
+                    rangeMode = current.rangeMode,
+                    sinceEpochMillis = current.sinceEpochMillis,
                     sourcePath = current.sourcePath,
                     destinationPath = current.destinationPath
                 )
@@ -270,8 +316,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 portText = profile.port.toString(),
                 remoteSecret = profile.secret,
                 role = profile.role,
+                rangeMode = profile.rangeMode,
+                sinceEpochMillis = profile.sinceEpochMillis,
                 sourcePath = profile.sourcePath,
-                destinationPath = profile.destinationPath,
+                destinationPath = if (profile.role == SyncRole.BIDIRECTIONAL) {
+                    profile.sourcePath
+                } else profile.destinationPath,
                 previewReady = false,
                 lastResult = "已切换到 ${profile.name}"
             )
@@ -287,6 +337,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 remoteHost = "",
                 remoteSecret = "",
                 role = SyncRole.RECEIVE_ONLY,
+                rangeMode = SyncRangeMode.ALL,
+                sinceEpochMillis = null,
                 previewReady = false,
                 lastResult = null
             )
@@ -343,7 +395,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             _state.update { it.copy(lastResult = "正在恢复与 ${device.name} 的已保存连接") }
             return
         }
-        discovery.requestPair(device, current.role)
+        discovery.requestPair(
+            device = device,
+            role = current.role,
+            rangeMode = current.rangeMode,
+            sinceEpochMillis = current.sinceEpochMillis
+        )
         _state.update { it.copy(lastResult = "等待 ${device.name} 确认连接") }
     }
 
@@ -365,7 +422,9 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         host = host,
         port = port,
         secret = secret,
-        role = role.opposite()
+        role = role.opposite(),
+        rangeMode = rangeMode,
+        sinceEpochMillis = sinceEpochMillis
     )
 
     private fun upsertPairedDevice(device: PairAccepted) {
@@ -376,7 +435,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             host = device.host,
             port = device.port,
             secret = device.secret,
-            role = device.role
+            role = device.role,
+            rangeMode = device.rangeMode,
+            sinceEpochMillis = device.sinceEpochMillis,
+            destinationPath = if (device.role == SyncRole.BIDIRECTIONAL) {
+                existing.sourcePath
+            } else existing.destinationPath
         ) ?: PeerProfile(
             id = UUID.randomUUID().toString(),
             deviceId = device.deviceId,
@@ -385,8 +449,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             port = device.port,
             secret = device.secret,
             role = device.role,
+            rangeMode = device.rangeMode,
+            sinceEpochMillis = device.sinceEpochMillis,
             sourcePath = current.sourcePath,
-            destinationPath = current.destinationPath
+            destinationPath = if (device.role == SyncRole.BIDIRECTIONAL) {
+                current.sourcePath
+            } else current.destinationPath
         )
         _state.update {
             it.copy(
@@ -397,6 +465,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 portText = profile.port.toString(),
                 remoteSecret = profile.secret,
                 role = profile.role,
+                rangeMode = profile.rangeMode,
+                sinceEpochMillis = profile.sinceEpochMillis,
                 sourcePath = profile.sourcePath,
                 destinationPath = profile.destinationPath,
                 previewReady = false
@@ -434,7 +504,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         val current = _state.value
         val profile = current.profiles.firstOrNull { it.id == current.selectedProfileId } ?: return
         if (profile.deviceId.startsWith("manual:")) return
-        discovery.sendStrategy(profile.host, current.role)
+        discovery.sendStrategy(
+            host = profile.host,
+            role = current.role,
+            rangeMode = current.rangeMode,
+            sinceEpochMillis = current.sinceEpochMillis
+        )
     }
 
     private fun applyRemoteStrategy(update: StrategyUpdate) {
@@ -452,7 +527,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             name = update.name,
             host = update.host,
             secret = update.secret,
-            role = localRole
+            role = localRole,
+            rangeMode = update.rangeMode,
+            sinceEpochMillis = update.sinceEpochMillis,
+            destinationPath = if (localRole == SyncRole.BIDIRECTIONAL) {
+                existing.sourcePath
+            } else existing.destinationPath
         )
         _state.update { state ->
             val selected = state.selectedProfileId == existing.id
@@ -464,6 +544,11 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 remoteHost = if (selected) updatedProfile.host else state.remoteHost,
                 remoteSecret = if (selected) updatedProfile.secret else state.remoteSecret,
                 role = if (selected) localRole else state.role,
+                rangeMode = if (selected) updatedProfile.rangeMode else state.rangeMode,
+                sinceEpochMillis = if (selected) updatedProfile.sinceEpochMillis else state.sinceEpochMillis,
+                destinationPath = if (selected && localRole == SyncRole.BIDIRECTIONAL) {
+                    updatedProfile.sourcePath
+                } else state.destinationPath,
                 previewReady = if (selected) false else state.previewReady,
                 lastResult = "${update.name} 已设为${update.role.label}；本机自动切换为${localRole.label}"
             )
@@ -471,7 +556,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         saveConfig()
         appendLog(
             "LAN",
-            "零删除策略已同步：${update.name} ${update.role.label}，本机 ${localRole.label}"
+            "零删除策略已同步：${update.name} ${update.role.label} / ${update.rangeMode.label}，本机 ${localRole.label}"
         )
     }
 
@@ -498,7 +583,9 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 request.name,
                 request.host,
                 request.secret,
-                request.role
+                request.role,
+                request.rangeMode,
+                request.sinceEpochMillis
             )
         )
         val localRole = request.role.opposite()
@@ -518,7 +605,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 port = port,
                 secret = _state.value.serverSecret,
                 onLog = ::streamLog,
-                mode = localRole
+                mode = localRole,
+                rangeMode = request.rangeMode,
+                sinceEpochMillis = request.sinceEpochMillis,
+                untilEpochMillis = request.untilEpochMillis
             )
         } catch (error: Exception) {
             com.rootsync.android.engine.EngineResult(
@@ -551,6 +641,9 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             putString("serverSecret", value.serverSecret)
             putString("remoteSecret", value.remoteSecret)
             putString("role", value.role.name)
+            putString("rangeMode", value.rangeMode.name)
+            value.sinceEpochMillis?.let { putLong("sinceEpochMillis", it) }
+                ?: remove("sinceEpochMillis")
             putString("profiles", encodeProfiles(value.profiles))
             putString("selectedProfileId", value.selectedProfileId)
             value.transferRecord?.let { putString("transferRecord", encodeTransferRecord(it)) }
@@ -589,7 +682,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     current.destinationPath,
                     port,
                     current.serverSecret,
-                    ::streamLog
+                    ::streamLog,
+                    rangeMode = current.rangeMode,
+                    sinceEpochMillis = current.sinceEpochMillis,
+                    untilEpochMillis = System.currentTimeMillis()
                 )
                 _state.update {
                     it.copy(
@@ -633,6 +729,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 portText = (profile?.port ?: record.port).toString(),
                 remoteSecret = profile?.secret ?: record.secret,
                 role = record.role,
+                rangeMode = record.rangeMode,
+                sinceEpochMillis = record.sinceEpochMillis,
                 sourcePath = record.sourcePath,
                 destinationPath = record.destinationPath,
                 lastResult = "正在继续上次未完成传输"
@@ -646,12 +744,20 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         val current = _state.value
         val rsync = current.capabilities.rsyncPath
         val port = SafeInput.parsePort(current.portText)
-        val localPath = if (current.role == SyncRole.SEND_ONLY) current.sourcePath else current.destinationPath
+        val localPath = when (current.role) {
+            SyncRole.SEND_ONLY, SyncRole.BIDIRECTIONAL -> current.sourcePath
+            SyncRole.RECEIVE_ONLY -> current.destinationPath
+        }
         val validation = when {
             rsync == null -> "内置 rsync 不可执行"
             !SafeInput.isValidIpv4(current.remoteHost) -> "请输入有效的远端 IPv4 地址"
             port == null -> "端口必须位于 1024–65535"
             current.remoteSecret.length < SyncUiState.MIN_SECRET_LENGTH -> "请完成配对或输入远端密钥"
+            current.rangeMode == SyncRangeMode.SINCE && current.sinceEpochMillis == null ->
+                "请选择同步起始时间"
+            current.rangeMode == SyncRangeMode.SINCE &&
+                current.sinceEpochMillis != null &&
+                current.sinceEpochMillis > System.currentTimeMillis() -> "同步起始时间不能晚于当前时间"
             else -> SafeInput.validateStoragePath(localPath)
         }
         if (validation != null || rsync == null || port == null) {
@@ -660,14 +766,20 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        val action = if (current.role == SyncRole.SEND_ONLY) "只发送" else "只接收"
+        val action = current.role.label
         launchBusy(if (dryRun) "正在预览${action}差异" else "正在执行$action") {
             pauseRequested = false
             val now = System.currentTimeMillis()
+            val untilEpochMillis = now
             val activeRecord = if (dryRun) null else resumeRecord?.copy(
                 host = current.remoteHost,
                 port = port,
                 secret = current.remoteSecret,
+                role = current.role,
+                rangeMode = current.rangeMode,
+                sinceEpochMillis = current.sinceEpochMillis,
+                sourcePath = current.sourcePath,
+                destinationPath = current.destinationPath,
                 status = TransferStatus.RUNNING,
                 updatedAtMillis = now,
                 message = "正在继续传输"
@@ -680,6 +792,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 port = port,
                 secret = current.remoteSecret,
                 role = current.role,
+                rangeMode = current.rangeMode,
+                sinceEpochMillis = current.sinceEpochMillis,
                 sourcePath = current.sourcePath,
                 destinationPath = current.destinationPath,
                 status = TransferStatus.RUNNING,
@@ -690,11 +804,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     progress = if (dryRun) 0f else activeRecord?.progress ?: 0f,
                     estimatedCompletionTime = null,
                     isPreviewing = dryRun,
-                    transferPanelTitle = if (dryRun) "差异文件夹" else if (current.role == SyncRole.SEND_ONLY) {
-                        "正在上传的文件夹"
-                    } else {
-                        "正在接收的文件夹"
-                    },
+                    transferPanelTitle = transferPanelTitle(dryRun, current.role),
                     transferFolders = emptyList(),
                     currentTransferFolder = null,
                     transferItemCount = 0,
@@ -707,7 +817,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 persistTransferRecord()
                 updateTransferNotification(action, "正在准备远端服务", null, 0f)
             }
-            val endpoint = ensureRemoteServerReady(current, port)
+            val endpoint = ensureRemoteServerReady(current, port, untilEpochMillis)
             if (endpoint == null) {
                 if (!dryRun) markTransferPaused("远端暂时不可用，传输已自动暂停")
                 else _state.update { it.copy(isPreviewing = false) }
@@ -715,36 +825,92 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             }
             val transferStartedAt = System.currentTimeMillis()
             if (!dryRun) updateTransferNotification(action, "已连接，正在扫描文件", null, 0f)
-            val onProgress: (Float) -> Unit = { progress ->
+            val updateProgress: (Float) -> Unit = { progress ->
                 updateTransferProgress(progress, transferStartedAt, dryRun, action)
             }
-            val onItem: (RsyncItem) -> Unit = { item ->
-                updateTransferItem(item, dryRun, current.role)
-            }
-            val result = if (current.role == SyncRole.SEND_ONLY) {
-                engine.push(
+            val result = when (current.role) {
+                SyncRole.SEND_ONLY -> engine.push(
                     rsyncPath = rsync,
                     host = endpoint.host,
                     port = endpoint.port,
                     sourcePath = current.sourcePath,
                     secret = endpoint.secret,
+                    rangeMode = current.rangeMode,
+                    sinceEpochMillis = current.sinceEpochMillis,
+                    untilEpochMillis = untilEpochMillis,
+                    bidirectional = false,
                     dryRun = dryRun,
                     onLog = ::streamLog,
-                    onProgress = onProgress,
-                    onItem = onItem
+                    onProgress = updateProgress,
+                    onItem = { item -> updateTransferItem(item, dryRun, current.role) }
                 )
-            } else {
-                engine.pull(
+                SyncRole.RECEIVE_ONLY -> engine.pull(
                     rsyncPath = rsync,
                     host = endpoint.host,
                     port = endpoint.port,
                     destinationPath = current.destinationPath,
                     secret = endpoint.secret,
+                    rangeMode = current.rangeMode,
+                    sinceEpochMillis = current.sinceEpochMillis,
+                    untilEpochMillis = untilEpochMillis,
+                    bidirectional = false,
                     dryRun = dryRun,
                     onLog = ::streamLog,
-                    onProgress = onProgress,
-                    onItem = onItem
+                    onProgress = updateProgress,
+                    onItem = { item -> updateTransferItem(item, dryRun, current.role) }
                 )
+                SyncRole.BIDIRECTIONAL -> {
+                    appendLog("INFO", "双向同步第 1/2 阶段：接收远端较新文件")
+                    val pullResult = engine.pull(
+                        rsyncPath = rsync,
+                        host = endpoint.host,
+                        port = endpoint.port,
+                        destinationPath = current.destinationPath,
+                        secret = endpoint.secret,
+                        rangeMode = current.rangeMode,
+                        sinceEpochMillis = current.sinceEpochMillis,
+                        untilEpochMillis = untilEpochMillis,
+                        bidirectional = true,
+                        dryRun = dryRun,
+                        onLog = ::streamLog,
+                        onProgress = { progress -> updateProgress(progress * 0.5f) },
+                        onItem = { item ->
+                            updateTransferItem(item, dryRun, current.role, "接收")
+                        }
+                    )
+                    if (!pullResult.success || pauseRequested) {
+                        pullResult
+                    } else {
+                        appendLog("INFO", "双向同步第 2/2 阶段：发送本机较新文件")
+                        val pushResult = engine.push(
+                            rsyncPath = rsync,
+                            host = endpoint.host,
+                            port = endpoint.port,
+                            sourcePath = current.sourcePath,
+                            secret = endpoint.secret,
+                            rangeMode = current.rangeMode,
+                            sinceEpochMillis = current.sinceEpochMillis,
+                            untilEpochMillis = untilEpochMillis,
+                            bidirectional = true,
+                            dryRun = dryRun,
+                            onLog = ::streamLog,
+                            onProgress = { progress -> updateProgress(0.5f + progress * 0.5f) },
+                            onItem = { item ->
+                                updateTransferItem(item, dryRun, current.role, "发送")
+                            }
+                        )
+                        if (pushResult.success) {
+                            EngineResult(
+                                true,
+                                if (dryRun) {
+                                    "双向差异预览完成；全程零删除"
+                                } else {
+                                    "双向同步完成；较新版本优先，未删除任何用户数据"
+                                }
+                            )
+                        } else pushResult
+                    }
+                }
             }
             if (!dryRun && pauseRequested) {
                 markTransferPaused("用户已暂停；临时分片保留，可继续传输")
@@ -804,9 +970,19 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         persistTransferRecord()
     }
 
-    private fun updateTransferItem(item: RsyncItem, dryRun: Boolean, role: SyncRole) {
+    private fun updateTransferItem(
+        item: RsyncItem,
+        dryRun: Boolean,
+        role: SyncRole,
+        directionLabel: String? = null
+    ) {
         _state.update { state ->
-            val display = if (dryRun) "${item.changeLabel} · ${item.folder}" else item.folder
+            val prefix = directionLabel?.let { "$it · " }.orEmpty()
+            val display = if (dryRun) {
+                "$prefix${item.changeLabel} · ${item.folder}"
+            } else {
+                "$prefix${item.folder}"
+            }
             val alreadyShown = display in state.transferFolders
             val canAppend = !alreadyShown && state.transferFolders.size < MAX_VISIBLE_TRANSFER_FOLDERS
             state.copy(
@@ -814,13 +990,16 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 currentTransferFolder = item.folder,
                 transferItemCount = state.transferItemCount + 1,
                 transferFoldersTruncated = state.transferFoldersTruncated || (!alreadyShown && !canAppend),
-                transferPanelTitle = if (dryRun) "差异文件夹" else if (role == SyncRole.SEND_ONLY) {
-                    "正在上传的文件夹"
-                } else {
-                    "正在接收的文件夹"
-                }
+                transferPanelTitle = transferPanelTitle(dryRun, role)
             )
         }
+    }
+
+    private fun transferPanelTitle(dryRun: Boolean, role: SyncRole): String = when {
+        dryRun -> "差异文件夹"
+        role == SyncRole.SEND_ONLY -> "正在上传的文件夹"
+        role == SyncRole.RECEIVE_ONLY -> "正在接收的文件夹"
+        else -> "正在双向同步的文件夹"
     }
 
     private fun updateTransferProgress(
@@ -909,7 +1088,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun ensureRemoteServerReady(
         current: SyncUiState,
-        configuredPort: Int
+        configuredPort: Int,
+        untilEpochMillis: Long
     ): RemoteEndpoint? {
         val reachableBeforePrepare = engine.isServerReachable(current.remoteHost, configuredPort)
         val profile = current.profiles.firstOrNull { it.id == current.selectedProfileId }
@@ -932,7 +1112,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         _state.update { it.copy(phase = "等待 ${profile.name} 准备服务端") }
         val prepared = discovery.requestSyncPreparation(
             host = current.remoteHost,
-            role = current.role
+            role = current.role,
+            rangeMode = current.rangeMode,
+            sinceEpochMillis = current.sinceEpochMillis,
+            untilEpochMillis = untilEpochMillis
         )
         if (prepared == null) {
             if (reachableBeforePrepare) {
@@ -1042,6 +1225,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 put("port", profile.port)
                 put("secret", profile.secret)
                 put("role", profile.role.name)
+                put("rangeMode", profile.rangeMode.name)
+                put("sinceEpochMillis", profile.sinceEpochMillis)
                 put("sourcePath", profile.sourcePath)
                 put("destinationPath", profile.destinationPath)
             })
@@ -1057,6 +1242,13 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     val item = array.getJSONObject(index)
                     val role = runCatching { SyncRole.valueOf(item.getString("role")) }
                         .getOrDefault(SyncRole.RECEIVE_ONLY)
+                    val rangeMode = runCatching {
+                        SyncRangeMode.valueOf(item.optString("rangeMode", SyncRangeMode.ALL.name))
+                    }.getOrDefault(SyncRangeMode.ALL)
+                    val since = item.optLong("sinceEpochMillis", -1L).takeIf { it > 0L }
+                    val sourcePath = migrateBiliPath(
+                        item.optString("sourcePath", SyncUiState.DEFAULT_BILI_PATH)
+                    )
                     add(
                         PeerProfile(
                             id = item.getString("id"),
@@ -1066,10 +1258,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                             port = item.optInt("port", SyncUiState.DEFAULT_RSYNC_PORT),
                             secret = item.optString("secret"),
                             role = role,
-                            sourcePath = migrateBiliPath(
-                                item.optString("sourcePath", SyncUiState.DEFAULT_BILI_PATH)
-                            ),
-                            destinationPath = migrateBiliPath(
+                            rangeMode = rangeMode,
+                            sinceEpochMillis = since,
+                            sourcePath = sourcePath,
+                            destinationPath = if (role == SyncRole.BIDIRECTIONAL) {
+                                sourcePath
+                            } else migrateBiliPath(
                                 item.optString("destinationPath", SyncUiState.DEFAULT_BILI_PATH)
                             )
                         )
@@ -1088,6 +1282,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         put("port", record.port)
         put("secret", record.secret)
         put("role", record.role.name)
+        put("rangeMode", record.rangeMode.name)
+        put("sinceEpochMillis", record.sinceEpochMillis)
         put("sourcePath", record.sourcePath)
         put("destinationPath", record.destinationPath)
         put("status", record.status.name)
@@ -1111,6 +1307,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 secret = item.optString("secret"),
                 role = runCatching { SyncRole.valueOf(item.getString("role")) }
                     .getOrDefault(SyncRole.RECEIVE_ONLY),
+                rangeMode = runCatching {
+                    SyncRangeMode.valueOf(item.optString("rangeMode", SyncRangeMode.ALL.name))
+                }.getOrDefault(SyncRangeMode.ALL),
+                sinceEpochMillis = item.optLong("sinceEpochMillis", -1L).takeIf { it > 0L },
                 sourcePath = item.optString("sourcePath", SyncUiState.DEFAULT_BILI_PATH),
                 destinationPath = item.optString("destinationPath", SyncUiState.DEFAULT_BILI_PATH),
                 status = runCatching { TransferStatus.valueOf(item.getString("status")) }
@@ -1138,6 +1338,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
 
     private companion object {
         const val MAX_VISIBLE_TRANSFER_FOLDERS = 400
+        const val DEFAULT_RANGE_MILLIS = 24L * 60L * 60L * 1000L
     }
 
     private data class RemoteEndpoint(val host: String, val port: Int, val secret: String)

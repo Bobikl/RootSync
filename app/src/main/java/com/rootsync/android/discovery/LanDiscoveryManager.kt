@@ -14,6 +14,7 @@ import com.rootsync.android.domain.PairRequest
 import com.rootsync.android.domain.StrategyUpdate
 import com.rootsync.android.domain.SyncPrepareRequest
 import com.rootsync.android.domain.SyncPrepareResult
+import com.rootsync.android.domain.SyncRangeMode
 import com.rootsync.android.domain.SyncRole
 import com.rootsync.android.domain.TrustedPeerUpdate
 import kotlinx.coroutines.CompletableDeferred
@@ -142,14 +143,21 @@ class LanDiscoveryManager(
         }
     }
 
-    fun requestPair(device: DiscoveredDevice, role: SyncRole) {
+    fun requestPair(
+        device: DiscoveredDevice,
+        role: SyncRole,
+        rangeMode: SyncRangeMode,
+        sinceEpochMillis: Long?
+    ) {
         start()
         val requestId = UUID.randomUUID().toString()
-        outgoingPairRequests[requestId] = PairIntent(role)
+        outgoingPairRequests[requestId] = PairIntent(role, rangeMode, sinceEpochMillis)
         val message = baseMessage(TYPE_PAIR_REQUEST)
             .put("requestId", requestId)
             .put("secret", localSecret())
             .put("role", role.name)
+            .put("rangeMode", rangeMode.name)
+        sinceEpochMillis?.let { message.put("sinceEpochMillis", it) }
         scope.launch {
             send(message, InetAddress.getByName(device.host))
             onLog("已向 ${device.name} 发出配对请求")
@@ -181,11 +189,18 @@ class LanDiscoveryManager(
         }
     }
 
-    fun sendStrategy(host: String, role: SyncRole) {
+    fun sendStrategy(
+        host: String,
+        role: SyncRole,
+        rangeMode: SyncRangeMode,
+        sinceEpochMillis: Long?
+    ) {
         start()
         val message = baseMessage(TYPE_STRATEGY_UPDATE)
             .put("secret", localSecret())
             .put("role", role.name)
+            .put("rangeMode", rangeMode.name)
+        sinceEpochMillis?.let { message.put("sinceEpochMillis", it) }
         scope.launch {
             send(message, InetAddress.getByName(host))
             onLog("已发送零删除设备策略：${role.label}")
@@ -195,6 +210,9 @@ class LanDiscoveryManager(
     suspend fun requestSyncPreparation(
         host: String,
         role: SyncRole,
+        rangeMode: SyncRangeMode,
+        sinceEpochMillis: Long?,
+        untilEpochMillis: Long,
         timeoutMillis: Long = PREPARE_TIMEOUT_MS
     ): SyncPrepareResult? {
         start()
@@ -205,6 +223,9 @@ class LanDiscoveryManager(
             .put("requestId", requestId)
             .put("secret", localSecret())
             .put("role", role.name)
+            .put("rangeMode", rangeMode.name)
+            .put("untilEpochMillis", untilEpochMillis)
+        sinceEpochMillis?.let { message.put("sinceEpochMillis", it) }
         scope.launch {
             send(message, InetAddress.getByName(host))
             onLog("已请求远端自动准备 rsync 服务")
@@ -456,7 +477,11 @@ class LanDiscoveryManager(
                 val requestId = message.optString("requestId")
                 val secret = message.optString("secret")
                 val role = parseRole(message.optString("role"))
-                if (requestId.isNotBlank() && secret.length >= 6 && role != null) {
+                val rangeMode = parseRangeMode(message.optString("rangeMode"))
+                val since = parseSince(message, rangeMode)
+                if (requestId.isNotBlank() && secret.length >= 6 && role != null && rangeMode != null &&
+                    (rangeMode == SyncRangeMode.ALL || since != null)
+                ) {
                     _pairRequests.tryEmit(
                         PairRequest(
                             requestId,
@@ -465,7 +490,9 @@ class LanDiscoveryManager(
                             host,
                             remotePort,
                             secret,
-                            role
+                            role,
+                            rangeMode,
+                            since
                         )
                     )
                 }
@@ -483,7 +510,9 @@ class LanDiscoveryManager(
                             host,
                             remotePort,
                             secret,
-                            intent.role
+                            intent.role,
+                            intent.rangeMode,
+                            intent.sinceEpochMillis
                         )
                     )
                 }
@@ -521,14 +550,20 @@ class LanDiscoveryManager(
             TYPE_STRATEGY_UPDATE -> {
                 val secret = message.optString("secret")
                 val role = parseRole(message.optString("role"))
-                if (secret.length >= 6 && role != null) {
+                val rangeMode = parseRangeMode(message.optString("rangeMode"))
+                val since = parseSince(message, rangeMode)
+                if (secret.length >= 6 && role != null && rangeMode != null &&
+                    (rangeMode == SyncRangeMode.ALL || since != null)
+                ) {
                     _strategyUpdates.tryEmit(
                         StrategyUpdate(
                             remoteDeviceId,
                             remoteName,
                             host,
                             secret,
-                            role
+                            role,
+                            rangeMode,
+                            since
                         )
                     )
                 }
@@ -537,7 +572,12 @@ class LanDiscoveryManager(
                 val requestId = message.optString("requestId")
                 val secret = message.optString("secret")
                 val role = parseRole(message.optString("role"))
-                if (requestId.isNotBlank() && secret.length >= 6 && role != null) {
+                val rangeMode = parseRangeMode(message.optString("rangeMode"))
+                val since = parseSince(message, rangeMode)
+                val until = message.optLong("untilEpochMillis", -1L)
+                if (requestId.isNotBlank() && secret.length >= 6 && role != null && rangeMode != null &&
+                    (rangeMode == SyncRangeMode.ALL || since != null) && until > 0L
+                ) {
                     _syncPrepareRequests.tryEmit(
                         SyncPrepareRequest(
                             requestId,
@@ -545,7 +585,10 @@ class LanDiscoveryManager(
                             remoteName,
                             host,
                             secret,
-                            role
+                            role,
+                            rangeMode,
+                            since,
+                            until
                         )
                     )
                 }
@@ -573,6 +616,14 @@ class LanDiscoveryManager(
 
     private fun parseRole(value: String): SyncRole? =
         runCatching { SyncRole.valueOf(value) }.getOrNull()
+
+    private fun parseRangeMode(value: String): SyncRangeMode? =
+        runCatching { SyncRangeMode.valueOf(value) }.getOrNull()
+
+    private fun parseSince(message: JSONObject, mode: SyncRangeMode?): Long? =
+        if (mode == SyncRangeMode.SINCE) {
+            message.optLong("sinceEpochMillis", -1L).takeIf { it > 0L }
+        } else null
 
     private fun addOrUpdateDevice(
         deviceId: String,
@@ -651,7 +702,7 @@ class LanDiscoveryManager(
         const val SCAN_WINDOW_MS = 8_000L
         private const val NSD_SERVICE_TYPE = "_rootsync._tcp."
         private const val MAGIC = "ROOTSYNC_LAN"
-        private const val PROTOCOL_VERSION = 4
+        private const val PROTOCOL_VERSION = 5
         private const val UDP_SCAN_BURSTS = 3
         private const val UDP_SCAN_INTERVAL_MS = 700L
         private const val MAX_PACKET_SIZE = 4096
@@ -670,5 +721,9 @@ class LanDiscoveryManager(
         private const val TRUST_RECONNECT_COOLDOWN_MS = 10_000L
     }
 
-    private data class PairIntent(val role: SyncRole)
+    private data class PairIntent(
+        val role: SyncRole,
+        val rangeMode: SyncRangeMode,
+        val sinceEpochMillis: Long?
+    )
 }

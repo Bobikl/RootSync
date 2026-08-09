@@ -6,6 +6,7 @@ import android.net.NetworkCapabilities
 import com.rootsync.android.domain.CapabilityCheck
 import com.rootsync.android.domain.CheckState
 import com.rootsync.android.domain.DeviceCapabilities
+import com.rootsync.android.domain.SyncRangeMode
 import com.rootsync.android.domain.SyncRole
 import com.rootsync.android.root.RootShell
 import kotlinx.coroutines.Dispatchers
@@ -164,12 +165,18 @@ class RootSyncEngine(private val context: Context) {
         port: Int,
         secret: String,
         onLog: (String) -> Unit,
-        mode: SyncRole? = null
+        mode: SyncRole? = null,
+        rangeMode: SyncRangeMode = SyncRangeMode.ALL,
+        sinceEpochMillis: Long? = null,
+        untilEpochMillis: Long = System.currentTimeMillis()
     ): EngineResult = withContext(Dispatchers.IO) {
         SafeInput.validateStoragePath(sourcePath)?.let { return@withContext EngineResult(false, it) }
         SafeInput.validateStoragePath(destinationPath)?.let { return@withContext EngineResult(false, it) }
         if (secret.length < com.rootsync.android.domain.SyncUiState.MIN_SECRET_LENGTH) {
             return@withContext EngineResult(false, "配对密钥至少需要 6 位")
+        }
+        validateTimeRange(rangeMode, sinceEpochMillis, untilEpochMillis)?.let {
+            return@withContext EngineResult(false, it)
         }
 
         val servesSendModule = mode != SyncRole.RECEIVE_ONLY
@@ -206,6 +213,18 @@ class RootSyncEngine(private val context: Context) {
             )
             if (snapshotResult.exitCode != 0) {
                 return@withContext EngineResult(false, "目录时间快照失败", snapshotResult.exitCode)
+            }
+            if (rangeMode == SyncRangeMode.SINCE) {
+                val sourceFileList = File(metadataDir, "source.files")
+                onLog("正在生成指定时间范围的发送文件清单…")
+                val listResult = createTimeFileList(
+                    rootPath = sourcePath,
+                    output = sourceFileList,
+                    sinceEpochMillis = requireNotNull(sinceEpochMillis),
+                    untilEpochMillis = untilEpochMillis,
+                    onLog = onLog
+                )
+                if (!listResult.success) return@withContext listResult
             }
         }
 
@@ -271,6 +290,7 @@ class RootSyncEngine(private val context: Context) {
             when (mode) {
                 SyncRole.SEND_ONLY -> "正在为远端接收请求准备 send 模块…"
                 SyncRole.RECEIVE_ONLY -> "正在为远端发送请求准备 receive 模块…"
+                SyncRole.BIDIRECTIONAL -> "正在准备双向同步的 send 与 receive 模块…"
                 null -> "正在启动受限服务端（send 只读、receive 只写）…"
             }
         )
@@ -292,6 +312,7 @@ class RootSyncEngine(private val context: Context) {
                 when (mode) {
                     SyncRole.SEND_ONLY -> "服务端已启动：本机发送源已可供远端接收"
                     SyncRole.RECEIVE_ONLY -> "服务端已启动：本机接收目录已可供远端发送"
+                    SyncRole.BIDIRECTIONAL -> "服务端已启动：支持本次双向同步"
                     null -> "服务端已启动：支持只发送与只接收"
                 }
             )
@@ -323,6 +344,10 @@ class RootSyncEngine(private val context: Context) {
         port: Int,
         destinationPath: String,
         secret: String,
+        rangeMode: SyncRangeMode,
+        sinceEpochMillis: Long?,
+        untilEpochMillis: Long,
+        bidirectional: Boolean,
         dryRun: Boolean,
         onLog: (String) -> Unit,
         onProgress: (Float) -> Unit,
@@ -330,6 +355,9 @@ class RootSyncEngine(private val context: Context) {
     ): EngineResult = withContext(Dispatchers.IO) {
         if (!SafeInput.isValidIpv4(host)) return@withContext EngineResult(false, "请输入有效 IPv4 地址")
         SafeInput.validateStoragePath(destinationPath)?.let { return@withContext EngineResult(false, it) }
+        validateTimeRange(rangeMode, sinceEpochMillis, untilEpochMillis)?.let {
+            return@withContext EngineResult(false, it)
+        }
         val destinationReady = shell.execute(
             "mkdir -p ${SafeInput.shellQuote(destinationPath)} && test -w ${SafeInput.shellQuote(destinationPath)}"
         )
@@ -342,21 +370,44 @@ class RootSyncEngine(private val context: Context) {
             return@withContext EngineResult(false, "无法准备 ROOT 所有的客户端密钥文件")
         }
         val remoteSnapshot = File(runtimeDir, "remote.snapshot")
+        val remoteFileList = File(runtimeDir, "remote.files")
+        if (rangeMode == SyncRangeMode.SINCE) {
+            onLog("下载发送端指定时间范围文件清单…")
+            val listResult = downloadMetadata(
+                rsyncPath = rsyncPath,
+                host = host,
+                port = port,
+                passwordFile = password,
+                remoteName = "source.files",
+                destination = remoteFileList,
+                onLog = onLog
+            )
+            if (!listResult.success) {
+                return@withContext EngineResult(
+                    false,
+                    "无法获取指定时间范围文件清单",
+                    listResult.exitCode
+                )
+            }
+        }
         if (!dryRun) {
             onLog("下载发送端目录时间清单…")
-            val metadataCommand = listOf(
-                rsyncPath, "-rt", "--timeout=60", "--contimeout=15",
-                "--password-file=${password.absolutePath}",
-                "rsync://sync-user@$host:$port/meta/source.snapshot",
-                remoteSnapshot.absolutePath
-            ).joinToString(" ") { SafeInput.shellQuote(it) }
-            val metadataResult = shell.execute(metadataCommand, onLog)
-            if (metadataResult.exitCode != 0) {
-                return@withContext EngineResult(false, "无法获取目录时间清单", metadataResult.exitCode)
+            val snapshotResult = downloadMetadata(
+                rsyncPath = rsyncPath,
+                host = host,
+                port = port,
+                passwordFile = password,
+                remoteName = "source.snapshot",
+                destination = remoteSnapshot,
+                onLog = onLog
+            )
+            if (!snapshotResult.success) {
+                return@withContext EngineResult(false, "无法获取目录时间清单", snapshotResult.exitCode)
             }
         }
 
-        onLog(if (dryRun) "开始只接收差异预览…" else "开始只接收增量传输…")
+        val operation = if (bidirectional) "双向同步·接收阶段" else "只接收"
+        onLog(if (dryRun) "开始${operation}差异预览…" else "开始${operation}增量传输…")
         val command = RsyncCommandBuilder.pull(
             rsyncPath = rsyncPath,
             host = host,
@@ -364,6 +415,8 @@ class RootSyncEngine(private val context: Context) {
             destination = destinationPath,
             passwordFile = password.absolutePath,
             backupRunId = backupRunId(),
+            filesFrom = remoteFileList.absolutePath.takeIf { rangeMode == SyncRangeMode.SINCE },
+            bidirectional = bidirectional,
             dryRun = dryRun
         )
         val transfer = executeTransfer(command, onLog, onProgress, onItem)
@@ -394,7 +447,10 @@ class RootSyncEngine(private val context: Context) {
             EngineResult(false, "接收完成，但部分目录时间超过 2 秒误差", verify.exitCode)
         } else {
             onProgress(1f)
-            EngineResult(true, "只接收完成；未删除目标端数据，覆盖前版本已保存到 .rootsync-history")
+            EngineResult(
+                true,
+                "${if (bidirectional) "双向同步接收阶段" else "只接收"}完成；未删除目标端数据，覆盖前版本已保存到 .rootsync-history"
+            )
         }
     }
 
@@ -404,6 +460,10 @@ class RootSyncEngine(private val context: Context) {
         port: Int,
         sourcePath: String,
         secret: String,
+        rangeMode: SyncRangeMode,
+        sinceEpochMillis: Long?,
+        untilEpochMillis: Long,
+        bidirectional: Boolean,
         dryRun: Boolean,
         onLog: (String) -> Unit,
         onProgress: (Float) -> Unit,
@@ -411,6 +471,9 @@ class RootSyncEngine(private val context: Context) {
     ): EngineResult = withContext(Dispatchers.IO) {
         if (!SafeInput.isValidIpv4(host)) return@withContext EngineResult(false, "请输入有效 IPv4 地址")
         SafeInput.validateStoragePath(sourcePath)?.let { return@withContext EngineResult(false, it) }
+        validateTimeRange(rangeMode, sinceEpochMillis, untilEpochMillis)?.let {
+            return@withContext EngineResult(false, it)
+        }
         val sourceReady = shell.execute(
             "test -d ${SafeInput.shellQuote(sourcePath)} && test -r ${SafeInput.shellQuote(sourcePath)}"
         )
@@ -422,7 +485,20 @@ class RootSyncEngine(private val context: Context) {
         if (!writeRootOwnedSecret(password, secret)) {
             return@withContext EngineResult(false, "无法准备 ROOT 所有的客户端密钥文件")
         }
-        onLog(if (dryRun) "开始只发送差异预览…" else "开始只发送增量传输…")
+        val localFileList = File(runtimeDir, "local.files")
+        if (rangeMode == SyncRangeMode.SINCE) {
+            onLog("正在生成本机指定时间范围文件清单…")
+            val listResult = createTimeFileList(
+                rootPath = sourcePath,
+                output = localFileList,
+                sinceEpochMillis = requireNotNull(sinceEpochMillis),
+                untilEpochMillis = untilEpochMillis,
+                onLog = onLog
+            )
+            if (!listResult.success) return@withContext listResult
+        }
+        val operation = if (bidirectional) "双向同步·发送阶段" else "只发送"
+        onLog(if (dryRun) "开始${operation}差异预览…" else "开始${operation}增量传输…")
         val command = RsyncCommandBuilder.push(
             rsyncPath = rsyncPath,
             host = host,
@@ -430,6 +506,8 @@ class RootSyncEngine(private val context: Context) {
             source = sourcePath,
             passwordFile = password.absolutePath,
             backupRunId = backupRunId(),
+            filesFrom = localFileList.absolutePath.takeIf { rangeMode == SyncRangeMode.SINCE },
+            bidirectional = bidirectional,
             dryRun = dryRun
         )
         val transfer = executeTransfer(command, onLog, onProgress, onItem)
@@ -443,8 +521,65 @@ class RootSyncEngine(private val context: Context) {
         if (dryRun) EngineResult(true, previewSummary())
         else {
             onProgress(1f)
-            EngineResult(true, "只发送完成；未删除目标端数据，覆盖前版本已保存到 .rootsync-history")
+            EngineResult(
+                true,
+                "${if (bidirectional) "双向同步发送阶段" else "只发送"}完成；未删除目标端数据，覆盖前版本已保存到 .rootsync-history"
+            )
         }
+    }
+
+    private suspend fun createTimeFileList(
+        rootPath: String,
+        output: File,
+        sinceEpochMillis: Long,
+        untilEpochMillis: Long,
+        onLog: (String) -> Unit
+    ): EngineResult {
+        val result = shell.execute(
+            listOf(
+                syncMetaPath,
+                "filelist",
+                rootPath,
+                output.absolutePath,
+                sinceEpochMillis.toString(),
+                untilEpochMillis.toString()
+            ).joinToString(" ") { SafeInput.shellQuote(it) },
+            onLog
+        )
+        return if (result.exitCode == 0) EngineResult(true, "时间范围文件清单已生成")
+        else EngineResult(false, "生成时间范围文件清单失败", result.exitCode)
+    }
+
+    private suspend fun downloadMetadata(
+        rsyncPath: String,
+        host: String,
+        port: Int,
+        passwordFile: File,
+        remoteName: String,
+        destination: File,
+        onLog: (String) -> Unit
+    ): EngineResult {
+        val command = listOf(
+            rsyncPath, "-rt", "--timeout=60", "--contimeout=15",
+            "--password-file=${passwordFile.absolutePath}",
+            "rsync://sync-user@$host:$port/meta/$remoteName",
+            destination.absolutePath
+        ).joinToString(" ") { SafeInput.shellQuote(it) }
+        val result = shell.execute(command, onLog)
+        return if (result.exitCode == 0) EngineResult(true, "$remoteName 已下载")
+        else EngineResult(false, "下载 $remoteName 失败", result.exitCode)
+    }
+
+    private fun validateTimeRange(
+        rangeMode: SyncRangeMode,
+        sinceEpochMillis: Long?,
+        untilEpochMillis: Long
+    ): String? = when {
+        untilEpochMillis <= 0L -> "同步截止时间无效"
+        rangeMode == SyncRangeMode.SINCE && sinceEpochMillis == null -> "请选择同步起始时间"
+        rangeMode == SyncRangeMode.SINCE &&
+            sinceEpochMillis != null && sinceEpochMillis > untilEpochMillis -> "同步起始时间不能晚于当前时间"
+        else -> null
     }
 
     private suspend fun executeTransfer(

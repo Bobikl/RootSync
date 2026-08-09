@@ -84,6 +84,7 @@ bool collect_directories(
     while (dirent* item = readdir(directory)) {
         const std::string name(item->d_name);
         if (name == "." || name == "..") continue;
+        if (name == ".rootsync-history" || name == ".rsync-partial") continue;
         const std::string child = relative.empty() ? name : relative + "/" + name;
         struct stat child_info {};
         const std::string child_full = join_path(root, child);
@@ -104,6 +105,113 @@ bool collect_directories(
     }
     closedir(directory);
     return success;
+}
+
+bool collect_files_in_range(
+    const std::string& root,
+    const std::string& relative,
+    int64_t since_millis,
+    int64_t until_millis,
+    std::vector<std::string>* files
+) {
+    const std::string full = join_path(root, relative);
+    DIR* directory = opendir(full.c_str());
+    if (directory == nullptr) {
+        std::fprintf(stderr, "opendir failed: %s: %s\n", relative.c_str(), std::strerror(errno));
+        return false;
+    }
+    bool success = true;
+    errno = 0;
+    while (dirent* item = readdir(directory)) {
+        const std::string name(item->d_name);
+        if (name == "." || name == "..") continue;
+        if (name == ".rootsync-history" || name == ".rsync-partial") continue;
+        const std::string child = relative.empty() ? name : relative + "/" + name;
+        const std::string child_full = join_path(root, child);
+        struct stat info {};
+        if (lstat(child_full.c_str(), &info) != 0) {
+            std::fprintf(stderr, "lstat failed: %s: %s\n", child.c_str(), std::strerror(errno));
+            success = false;
+            break;
+        }
+        if (S_ISDIR(info.st_mode)) {
+            if (!collect_files_in_range(root, child, since_millis, until_millis, files)) {
+                success = false;
+                break;
+            }
+        } else if (S_ISREG(info.st_mode) || S_ISLNK(info.st_mode)) {
+            const int64_t modified_millis =
+                static_cast<int64_t>(info.st_mtim.tv_sec) * 1000LL + info.st_mtim.tv_nsec / 1000000L;
+            if (modified_millis >= since_millis && modified_millis <= until_millis) {
+                files->push_back(child);
+            }
+        }
+        errno = 0;
+    }
+    if (errno != 0) {
+        std::fprintf(stderr, "readdir failed: %s\n", std::strerror(errno));
+        success = false;
+    }
+    closedir(directory);
+    return success;
+}
+
+bool parse_nonnegative_millis(const char* value, int64_t* output) {
+    char* end = nullptr;
+    errno = 0;
+    const long long parsed = std::strtoll(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed < 0) return false;
+    *output = static_cast<int64_t>(parsed);
+    return true;
+}
+
+bool canonical_root(const char* input, std::string* output);
+
+int filelist(
+    const char* root_arg,
+    const char* output,
+    const char* since_arg,
+    const char* until_arg
+) {
+    std::string root;
+    if (!canonical_root(root_arg, &root)) return 2;
+    int64_t since_millis = 0;
+    int64_t until_millis = 0;
+    if (!parse_nonnegative_millis(since_arg, &since_millis) ||
+        !parse_nonnegative_millis(until_arg, &until_millis) ||
+        since_millis > until_millis) {
+        std::fprintf(stderr, "invalid time range\n");
+        return 3;
+    }
+    std::vector<std::string> files;
+    if (!collect_files_in_range(root, "", since_millis, until_millis, &files)) return 4;
+    std::sort(files.begin(), files.end());
+
+    const std::string temporary = std::string(output) + ".tmp";
+    FILE* file = std::fopen(temporary.c_str(), "wb");
+    if (file == nullptr) {
+        std::fprintf(stderr, "open file list failed: %s\n", std::strerror(errno));
+        return 5;
+    }
+    bool success = true;
+    for (const std::string& path : files) {
+        success = write_exact(file, path.data(), path.size()) && std::fputc('\0', file) != EOF;
+        if (!success) break;
+    }
+    if (std::fflush(file) != 0 || fsync(fileno(file)) != 0) success = false;
+    if (std::fclose(file) != 0) success = false;
+    if (!success) {
+        unlink(temporary.c_str());
+        std::fprintf(stderr, "write file list failed\n");
+        return 6;
+    }
+    if (rename(temporary.c_str(), output) != 0) {
+        std::fprintf(stderr, "rename file list failed: %s\n", std::strerror(errno));
+        unlink(temporary.c_str());
+        return 7;
+    }
+    std::printf("FILELIST_ITEMS=%zu\n", files.size());
+    return 0;
 }
 
 bool save_manifest(const std::string& output, const std::vector<Entry>& entries) {
@@ -305,19 +413,23 @@ void usage() {
         "syncmeta version\n"
         "syncmeta snapshot ROOT MANIFEST\n"
         "syncmeta restore ROOT MANIFEST\n"
-        "syncmeta verify ROOT MANIFEST TOLERANCE_NS\n");
+        "syncmeta verify ROOT MANIFEST TOLERANCE_NS\n"
+        "syncmeta filelist ROOT OUTPUT SINCE_EPOCH_MS UNTIL_EPOCH_MS\n");
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "version") == 0) {
-        std::puts("syncmeta 0.1 (arm64-v8a, manifest v1)");
+        std::puts("syncmeta 0.2 (arm64-v8a, manifest v1, time filelist)");
         return 0;
     }
     if (argc == 4 && std::strcmp(argv[1], "snapshot") == 0) return snapshot(argv[2], argv[3]);
     if (argc == 4 && std::strcmp(argv[1], "restore") == 0) return restore(argv[2], argv[3]);
     if (argc == 5 && std::strcmp(argv[1], "verify") == 0) return verify(argv[2], argv[3], argv[4]);
+    if (argc == 6 && std::strcmp(argv[1], "filelist") == 0) {
+        return filelist(argv[2], argv[3], argv[4], argv[5]);
+    }
     usage();
     return 1;
 }
