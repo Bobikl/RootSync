@@ -3,7 +3,7 @@
 面向已 ROOT Android 手机的局域网 rsync 同步工具，依据
 `Android_ROOT_rsync_开发大纲.md` 开发。当前版本为 arm64 技术验证 APK。
 
-## 当前版本（0.2.8）
+## 当前版本（0.2.9）
 
 - Kotlin、Jetpack Compose、Material 3；`compileSdk/targetSdk 36`，适配 Android 15/16；
 - APK 内置经上游签名验证的 **rsync 3.4.4 arm64**，无需额外安装 ROOT rsync 模块；
@@ -26,6 +26,7 @@
 - 修复自动准备双向 `send/receive` 模块后立即检查 PID 导致误报“rsync 未保持运行”的启动竞态；
 - 重启服务时等待旧 rsync daemon 完全退出并确认端口释放，必要时只强制结束经过配置路径校验的本应用旧进程；
 - 服务启动同时检查 PID 与监听端口；失败时自动读取最新 `rsyncd.log`，把 bind、权限、配置等具体错误显示到双方日志和结果框；
+- 修复 TCP 健康探测占用 rsync daemon 唯一连接槽、紧接着的预览或传输报 `max connections (1) reached` 的问题；本机改为读取内核监听表，远端准备成功后直接进入 rsync 协议；
 - 新增跨重启持久诊断日志，保留当前与上一段日志；可从日志页导出 UTF-8 文本或复制 ADB 读取命令；
 - 对端扫描/同步结束后保留 8 秒完成提示，不再从“正在扫描”状态直接闪退消失；
 - 传输进度同步显示在系统通知栏，前台 `dataSync` 服务配合 CPU/Wi-Fi 锁保持后台传输；
@@ -50,7 +51,7 @@
 
 APK 输出：`app/build/outputs/apk/debug/app-debug.apk`
 
-已构建版本：`dist/RootSync-v0.2.8-debug-arm64.apk`
+已构建版本：`dist/RootSync-v0.2.9-debug-arm64.apk`
 
 ## 两机使用
 
@@ -64,7 +65,7 @@ APK 输出：`app/build/outputs/apk/debug/app-debug.apk`
 自动发现和首次连接弹窗要求对方 RootSync 处于打开状态。完成配对并启动 rsync
 服务后，rsync daemon 可独立运行，另一台设备可按已保存的 IP 和策略连接。
 
-0.2.8 继续兼容局域网控制协议 v5；建议两端都升级，以获得一致的差异解析、完成提示和详细诊断日志。
+0.2.9 继续兼容局域网控制协议 v5；建议两端都升级，避免健康探测占用唯一 rsync 连接槽。
 
 ## 第三方源码与许可证
 

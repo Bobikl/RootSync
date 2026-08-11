@@ -297,11 +297,11 @@ class RootSyncEngine(private val context: Context) {
         if (!stopResult.success) {
             return@withContext EngineResult(false, "无法停止旧 rsync 服务：${stopResult.summary}")
         }
-        var portReleased = !isServerReachable(bindAddress, port, timeoutMillis = 150)
+        var portReleased = !isLocalPortListening(port)
         repeat(15) {
             if (!portReleased) {
                 delay(100)
-                portReleased = !isServerReachable(bindAddress, port, timeoutMillis = 150)
+                portReleased = !isLocalPortListening(port)
             }
         }
         if (!portReleased) {
@@ -351,7 +351,7 @@ class RootSyncEngine(private val context: Context) {
         if (check.exitCode == 0) {
             repeat(20) {
                 if (!listening) {
-                    listening = isServerReachable(bindAddress, port, timeoutMillis = 200)
+                    listening = isLocalPortListening(port)
                     if (!listening) delay(100)
                 }
             }
@@ -726,6 +726,15 @@ class RootSyncEngine(private val context: Context) {
             }.getOrDefault(false)
         }
 
+    private suspend fun isLocalPortListening(port: Int): Boolean {
+        if (port !in 1024..65535) return false
+        val hexPort = port.toString(16).uppercase().padStart(4, '0')
+        val command =
+            "awk '\$2 ~ /:$hexPort\$/ && \$4 == \"0A\" { found=1 } " +
+                "END { exit(found ? 0 : 1) }' /proc/net/tcp /proc/net/tcp6 2>/dev/null"
+        return shell.execute(command).exitCode == 0
+    }
+
     private suspend fun writeRootOwnedSecret(file: File, value: String): Boolean {
         val command =
             "umask 077; printf '%s\\n' ${SafeInput.shellQuote(value)} > " +
@@ -740,13 +749,15 @@ class RootSyncEngine(private val context: Context) {
             .map { it.trim() }
             .lastOrNull { it.isNotBlank() && !it.startsWith("rsync error:") }
             ?.take(120)
-        val summary = when (exitCode) {
-            5 -> "远端 rsync 服务拒绝连接或密钥不匹配"
-            10 -> "无法建立或维持远端 rsync Socket 连接"
-            12 -> "远端 rsync 协议数据流中断"
-            23 -> "部分文件传输失败"
-            30 -> "rsync 数据传输超时"
-            35 -> "等待远端 rsync 服务连接超时"
+        val summary = when {
+            output.contains("max connections", ignoreCase = true) ->
+                "远端 rsync 连接槽被占用"
+            exitCode == 5 -> "远端 rsync 服务拒绝连接或密钥不匹配"
+            exitCode == 10 -> "无法建立或维持远端 rsync Socket 连接"
+            exitCode == 12 -> "远端 rsync 协议数据流中断"
+            exitCode == 23 -> "部分文件传输失败"
+            exitCode == 30 -> "rsync 数据传输超时"
+            exitCode == 35 -> "等待远端 rsync 服务连接超时"
             else -> "rsync 返回错误 $exitCode"
         }
         return if (detail.isNullOrBlank()) "$summary（错误 $exitCode）" else "$summary：$detail"

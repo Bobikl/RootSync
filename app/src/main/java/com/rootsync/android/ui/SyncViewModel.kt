@@ -1228,18 +1228,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         untilEpochMillis: Long,
         isPreview: Boolean
     ): RemoteEndpoint? {
-        val reachableBeforePrepare = engine.isServerReachable(current.remoteHost, configuredPort)
         val profile = current.profiles.firstOrNull { it.id == current.selectedProfileId }
         if (profile == null || profile.deviceId.startsWith("manual:")) {
-            if (reachableBeforePrepare) {
-                appendLog("LAN", "远端 rsync 端口已就绪：${current.remoteHost}:$configuredPort")
-                return RemoteEndpoint(current.remoteHost, configuredPort, current.remoteSecret)
-            }
-            val message =
-                "无法连接远端 rsync 服务（错误 10）。请在远端服务页启动服务端，并核对 IP 与端口"
-            appendLog("ERROR", message)
-            _state.update { it.copy(lastResult = message, phase = "远端服务未启动") }
-            return null
+            appendLog("LAN", "手动设备直接尝试 rsync 连接，避免 TCP 探测占用唯一连接槽")
+            return RemoteEndpoint(current.remoteHost, configuredPort, current.remoteSecret)
         }
 
         appendLog(
@@ -1256,8 +1248,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             isPreview = isPreview
         )
         if (prepared == null) {
-            if (reachableBeforePrepare) {
+            val reachableFallback = engine.isServerReachable(current.remoteHost, configuredPort)
+            if (reachableFallback) {
                 appendLog("WARN", "${profile.name} 未响应控制消息，继续使用其后台 rsync 服务")
+                delay(RSYNC_PROBE_RELEASE_DELAY_MS)
                 return RemoteEndpoint(current.remoteHost, configuredPort, current.remoteSecret)
             }
             val message = "${profile.name} 未响应服务准备请求；请保持远端 RootSync 打开"
@@ -1288,13 +1282,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         saveConfig()
-        delay(300)
-        if (!engine.isServerReachable(prepared.host, preparedPort, timeoutMillis = 2_500)) {
-            val message = "${profile.name} 报告服务已启动，但端口 $preparedPort 仍无法连接"
-            appendLog("ERROR", message)
-            _state.update { it.copy(lastResult = message, phase = "远端端口不可达") }
-            return null
-        }
+        delay(150)
         appendLog("OK", "${profile.name} 已自动准备 rsync 服务")
         return RemoteEndpoint(prepared.host, preparedPort, preparedSecret)
     }
@@ -1536,6 +1524,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         const val DEFAULT_RANGE_MILLIS = 24L * 60L * 60L * 1000L
         const val REMOTE_ACTIVITY_TIMEOUT_MS = 15L * 60L * 1000L
         const val REMOTE_ACTIVITY_FINISHED_HOLD_MS = 8_000L
+        const val RSYNC_PROBE_RELEASE_DELAY_MS = 1_000L
     }
 
     private data class RemoteEndpoint(val host: String, val port: Int, val secret: String)
