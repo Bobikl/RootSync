@@ -144,7 +144,8 @@ data class RemoteSyncActivity(
     val deviceId: String,
     val name: String,
     val type: SyncActivityType,
-    val startedAtMillis: Long = System.currentTimeMillis()
+    val startedAtMillis: Long = System.currentTimeMillis(),
+    val finished: Boolean = false
 )
 
 data class LogEntry(

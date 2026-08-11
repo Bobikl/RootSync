@@ -121,6 +121,15 @@ class SafeInputTest {
     }
 
     @Test
+    fun parsesItemWhenRsyncPrefixesTheDiagnosticLine() {
+        val item = RsyncOutputParser.parseItem(
+            "rsync: info: ROOTSYNC_ITEM:>f.st......|season/episode/video.m4s"
+        )
+        assertEquals("season/episode/video.m4s", item?.relativePath)
+        assertEquals("season/episode", item?.folder)
+    }
+
+    @Test
     fun keepsOnlyCurrentRsyncDaemonLaunchAndSurfacesBindFailure() {
         val lines = RsyncServerLogParser.currentLaunchLines(
             listOf(

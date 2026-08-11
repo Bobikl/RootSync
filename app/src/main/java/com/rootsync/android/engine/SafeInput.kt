@@ -38,8 +38,9 @@ object RsyncOutputParser {
     const val ITEM_PREFIX = "ROOTSYNC_ITEM:"
 
     fun parseItem(line: String): RsyncItem? {
-        if (!line.startsWith(ITEM_PREFIX)) return null
-        val payload = line.removePrefix(ITEM_PREFIX)
+        val marker = line.indexOf(ITEM_PREFIX)
+        if (marker < 0) return null
+        val payload = line.substring(marker + ITEM_PREFIX.length)
         val separator = payload.indexOf('|')
         if (separator <= 0 || separator == payload.lastIndex) return null
         val itemized = payload.substring(0, separator).trim()

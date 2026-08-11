@@ -122,7 +122,11 @@ fun RootSyncApp(viewModel: SyncViewModel) {
                             Text("RootSync", fontWeight = FontWeight.SemiBold)
                             Text(
                                 state.remoteActivity?.let { activity ->
-                                    if (activity.type == SyncActivityType.PREVIEW) {
+                                    if (activity.finished && activity.type == SyncActivityType.PREVIEW) {
+                                        "${activity.name} 差异扫描已结束"
+                                    } else if (activity.finished) {
+                                        "${activity.name} 同步任务已结束"
+                                    } else if (activity.type == SyncActivityType.PREVIEW) {
                                         "${activity.name} 正在扫描差异文件夹"
                                     } else {
                                         "${activity.name} 正在与本机同步"
@@ -223,17 +227,29 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
 
         state.remoteActivity?.let { activity ->
             SectionCard(
-                title = if (activity.type == SyncActivityType.PREVIEW) {
+                title = if (activity.finished && activity.type == SyncActivityType.PREVIEW) {
+                    "${activity.name} 差异扫描已结束"
+                } else if (activity.finished) {
+                    "${activity.name} 同步任务已结束"
+                } else if (activity.type == SyncActivityType.PREVIEW) {
                     "${activity.name} 正在扫描差异文件夹"
                 } else {
                     "${activity.name} 正在与本机同步"
                 },
-                subtitle = "这是对方设备发起的任务，本机正在提供受限 rsync 服务。",
+                subtitle = if (activity.finished) {
+                    "完成状态会保留 8 秒，详细过程可在日志页查看。"
+                } else {
+                    "这是对方设备发起的任务，本机正在提供受限 rsync 服务。"
+                },
                 emphasized = true
             ) {
-                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                if (!activity.finished) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                 Text(
-                    if (activity.type == SyncActivityType.PREVIEW) {
+                    if (activity.finished && activity.type == SyncActivityType.PREVIEW) {
+                        "对方已结束目录比较，不再直接隐藏提示。"
+                    } else if (activity.finished) {
+                        "对方已结束本次同步任务。"
+                    } else if (activity.type == SyncActivityType.PREVIEW) {
                         "对方正在比较双方目录，扫描完成后此提示会自动消失。"
                     } else {
                         "对方正在按已保存策略传输文件；零删除保护保持开启。"
@@ -514,7 +530,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
 
         SectionCard(
             title = state.transferPanelTitle,
-            subtitle = "已识别 ${state.transferItemCount} 个差异/传输项目"
+            subtitle = "已识别 ${state.transferItemCount} 个差异/传输文件或目录"
         ) {
             Surface(
                 color = MaterialTheme.colorScheme.surfaceContainerHighest,
@@ -553,7 +569,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                         if (state.previewStatusText == null) {
                             Text(
                                 if (state.isBusy) "正在扫描文件夹，请稍候…"
-                                else "点击差异预览后，变化文件夹会显示在这里。",
+                                else "点击差异预览后，变化文件和目录会显示在这里。",
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
@@ -564,7 +580,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                     }
                     if (state.transferFoldersTruncated) {
                         Text(
-                            "项目较多，仅显示前 400 个文件夹。",
+                            "项目较多，仅显示前 400 个文件或目录。",
                             color = MaterialTheme.colorScheme.tertiary,
                             style = MaterialTheme.typography.labelMedium
                         )
@@ -771,17 +787,57 @@ private fun ServerPage(state: SyncUiState, viewModel: SyncViewModel, padding: Pa
 
 @Composable
 private fun LogsPage(state: SyncUiState, viewModel: SyncViewModel, padding: PaddingValues) {
+    val context = LocalContext.current
+    val exportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("text/plain")
+    ) { uri ->
+        uri?.let(viewModel::exportDiagnosticLog)
+    }
+    val exportFileName = remember {
+        val timestamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.getDefault())
+            .format(System.currentTimeMillis())
+        "RootSync-diagnostic-$timestamp.txt"
+    }
     Column(modifier = Modifier.fillMaxSize().padding(padding)) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Column {
-                Text("实时日志", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                Text("最多保留本次会话最近 400 行", style = MaterialTheme.typography.bodySmall)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("实时日志", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text("界面保留 400 行；详细日志跨重启持久保存", style = MaterialTheme.typography.bodySmall)
+                }
+                TextButton(onClick = viewModel::clearLogs) { Text("清空界面") }
             }
-            TextButton(onClick = viewModel::clearLogs) { Text("清空") }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = { exportLauncher.launch(exportFileName) },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("导出详细日志")
+                }
+                OutlinedButton(
+                    onClick = {
+                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        clipboard.setPrimaryClip(
+                            ClipData.newPlainText("RootSync ADB command", viewModel.diagnosticAdbCommand())
+                        )
+                    },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("复制 ADB 命令")
+                }
+            }
+            Text(
+                "持久日志：${viewModel.diagnosticLogPath()}（当前与上一段合计最多约 8 MB）",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
         HorizontalDivider()
         if (state.logs.isEmpty()) {

@@ -1,11 +1,14 @@
 package com.rootsync.android.ui
 
 import android.app.Application
+import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import androidx.core.content.edit
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.rootsync.android.BuildConfig
+import com.rootsync.android.diagnostics.DiagnosticLogger
 import com.rootsync.android.discovery.LanDiscoveryManager
 import com.rootsync.android.domain.LogEntry
 import com.rootsync.android.domain.PairAccepted
@@ -43,6 +46,7 @@ import java.util.UUID
 class SyncViewModel(application: Application) : AndroidViewModel(application) {
     private val engine = RootSyncEngine(application)
     private val preferences = application.getSharedPreferences("rootsync", 0)
+    private val diagnosticLogger = DiagnosticLogger(application)
     private val deviceId = preferences.getString("deviceId", null) ?: UUID.randomUUID().toString().also {
         preferences.edit { putString("deviceId", it) }
     }
@@ -64,6 +68,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     )
 
     init {
+        diagnosticLogger.append(
+            "SESSION",
+            "应用启动 version=${BuildConfig.VERSION_NAME}(${BuildConfig.VERSION_CODE}) " +
+                "android=${Build.VERSION.RELEASE}/${Build.VERSION.SDK_INT} model=${Build.MANUFACTURER} ${Build.MODEL}"
+        )
+        diagnosticLogger.append("STATE", diagnosticStateHeader())
         _state.value.transferRecord?.takeIf { it.status == TransferStatus.RUNNING }?.let { record ->
             _state.update {
                 it.copy(
@@ -567,6 +577,11 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private suspend fun handleSyncPrepareRequest(request: SyncPrepareRequest) {
+        appendLog(
+            "DIAG",
+            "收到服务准备请求 device=${request.name}/${request.deviceId} host=${request.host} " +
+                "role=${request.role.name} range=${request.rangeMode.name} preview=${request.isPreview}"
+        )
         val initial = _state.value
         val profile = initial.profiles.firstOrNull { it.deviceId == request.deviceId }
         val port = SafeInput.parsePort(initial.serverPortText) ?: SyncUiState.DEFAULT_RSYNC_PORT
@@ -655,7 +670,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 }
             )
         } else {
-            clearRemoteActivity(update.deviceId)
+            finishRemoteActivity(update.deviceId, update.type)
         }
     }
 
@@ -675,6 +690,30 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     private fun clearRemoteActivity(deviceId: String) {
         _state.update { state ->
             if (state.remoteActivity?.deviceId == deviceId) state.copy(remoteActivity = null) else state
+        }
+    }
+
+    private fun finishRemoteActivity(deviceId: String, type: SyncActivityType) {
+        val finishedAt = System.currentTimeMillis()
+        _state.update { state ->
+            val activity = state.remoteActivity
+            if (activity?.deviceId == deviceId && activity.type == type) {
+                state.copy(remoteActivity = activity.copy(finished = true, startedAtMillis = finishedAt))
+            } else state
+        }
+        appendLog(
+            "LAN",
+            if (type == SyncActivityType.PREVIEW) "对方差异扫描已结束" else "对方同步任务已结束"
+        )
+        viewModelScope.launch {
+            delay(REMOTE_ACTIVITY_FINISHED_HOLD_MS)
+            _state.update { state ->
+                if (state.remoteActivity?.startedAtMillis == finishedAt &&
+                    state.remoteActivity.finished
+                ) {
+                    state.copy(remoteActivity = null)
+                } else state
+            }
         }
     }
 
@@ -791,6 +830,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun runTransfer(dryRun: Boolean, resumeRecord: TransferRecord? = null) {
         val current = _state.value
+        appendLog(
+            "DIAG",
+            "开始任务 dryRun=$dryRun role=${current.role.name} range=${current.rangeMode.name} " +
+                "since=${current.sinceEpochMillis ?: "ALL"} host=${current.remoteHost}:${current.portText} " +
+                "source=${current.sourcePath} destination=${current.destinationPath} profile=${current.profileName}"
+        )
         val rsync = current.capabilities.rsyncPath
         val port = SafeInput.parsePort(current.portText)
         val localPath = when (current.role) {
@@ -814,7 +859,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             _state.update {
                 it.copy(
                     lastResult = validation,
-                    transferPanelTitle = if (dryRun) "差异文件夹" else it.transferPanelTitle,
+                    transferPanelTitle = if (dryRun) "差异文件与文件夹" else it.transferPanelTitle,
                     previewStatusText = if (dryRun) {
                         "无法开始预览：${validation ?: "配置无效"}"
                     } else it.previewStatusText,
@@ -1015,7 +1060,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     previewStatusText = if (dryRun) {
                         if (result.success) {
                             if (it.transferItemCount == 0) {
-                                "扫描完成，没有发现需要新增或更新的文件夹。"
+                                "扫描完成，没有发现需要新增或更新的文件或目录。"
                             } else {
                                 "扫描完成，发现 ${it.transferItemCount} 个差异项目。"
                             }
@@ -1070,15 +1115,15 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         _state.update { state ->
             val prefix = directionLabel?.let { "$it · " }.orEmpty()
             val display = if (dryRun) {
-                "$prefix${item.changeLabel} · ${item.folder}"
+                "$prefix${item.changeLabel} · ${item.relativePath}"
             } else {
-                "$prefix${item.folder}"
+                "$prefix${item.relativePath}"
             }
             val alreadyShown = display in state.transferFolders
             val canAppend = !alreadyShown && state.transferFolders.size < MAX_VISIBLE_TRANSFER_FOLDERS
             state.copy(
                 transferFolders = if (canAppend) state.transferFolders + display else state.transferFolders,
-                currentTransferFolder = item.folder,
+                currentTransferFolder = item.relativePath,
                 transferItemCount = state.transferItemCount + 1,
                 transferFoldersTruncated = state.transferFoldersTruncated || (!alreadyShown && !canAppend),
                 transferPanelTitle = transferPanelTitle(dryRun, role)
@@ -1087,10 +1132,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun transferPanelTitle(dryRun: Boolean, role: SyncRole): String = when {
-        dryRun -> "差异文件夹"
-        role == SyncRole.SEND_ONLY -> "正在上传的文件夹"
-        role == SyncRole.RECEIVE_ONLY -> "正在接收的文件夹"
-        else -> "正在双向同步的文件夹"
+        dryRun -> "差异文件与文件夹"
+        role == SyncRole.SEND_ONLY -> "正在上传的文件与目录"
+        role == SyncRole.RECEIVE_ONLY -> "正在接收的文件与目录"
+        else -> "正在双向同步的文件与目录"
     }
 
     private fun updateTransferProgress(
@@ -1269,7 +1314,29 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         appendLog("WARN", "用户取消了当前任务")
     }
 
-    fun clearLogs() = _state.update { it.copy(logs = emptyList()) }
+    fun clearLogs() {
+        _state.update { it.copy(logs = emptyList()) }
+        diagnosticLogger.append("INFO", "用户清空了界面日志；持久诊断日志继续保留")
+    }
+
+    fun exportDiagnosticLog(uri: Uri) {
+        viewModelScope.launch {
+            diagnosticLogger.append("EXPORT", "用户请求导出详细诊断日志")
+            val result = diagnosticLogger.export(uri, diagnosticStateHeader())
+            if (result.isSuccess) {
+                appendLog("OK", "详细诊断日志已导出")
+                _state.update { it.copy(lastResult = "详细诊断日志已导出") }
+            } else {
+                val message = result.exceptionOrNull()?.message ?: "未知错误"
+                appendLog("ERROR", "导出详细诊断日志失败：$message")
+                _state.update { it.copy(lastResult = "导出日志失败：$message") }
+            }
+        }
+    }
+
+    fun diagnosticAdbCommand(): String = diagnosticLogger.adbReadCommand()
+
+    fun diagnosticLogPath(): String = diagnosticLogger.pathDescription()
 
     private fun launchBusy(phase: String, block: suspend () -> Unit) {
         if (_state.value.isBusy) return
@@ -1302,12 +1369,45 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun appendLog(level: String, message: String) {
         if (message.isBlank()) return
+        diagnosticLogger.append(level, message)
         val entry = LogEntry(
             time = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss")),
             level = level,
             message = message
         )
         _state.update { it.copy(logs = (it.logs + entry).takeLast(400)) }
+    }
+
+    private fun diagnosticStateHeader(): String {
+        val current = _state.value
+        val capabilities = current.capabilities
+        return buildString {
+            appendLine("===== 导出时状态快照 =====")
+            appendLine("applicationId=${BuildConfig.APPLICATION_ID}")
+            appendLine("deviceName=${current.deviceName}")
+            appendLine("deviceId=$deviceId")
+            appendLine("android=${Build.VERSION.RELEASE} sdk=${Build.VERSION.SDK_INT}")
+            appendLine("manufacturer=${Build.MANUFACTURER} model=${Build.MODEL}")
+            appendLine("localIp=${current.localIp}")
+            appendLine("rootGranted=${capabilities.rootGranted}")
+            appendLine("rsyncPath=${capabilities.rsyncPath ?: "null"}")
+            appendLine("rsyncVersion=${capabilities.rsyncVersion ?: "null"}")
+            appendLine("syncMetaReady=${capabilities.syncMetaReady}")
+            appendLine("selectedProfile=${current.profileName}/${current.selectedProfileId ?: "manual"}")
+            appendLine("remote=${current.remoteHost}:${current.portText}")
+            appendLine("role=${current.role.name}")
+            appendLine("range=${current.rangeMode.name} since=${current.sinceEpochMillis ?: "ALL"}")
+            appendLine("sourcePath=${current.sourcePath}")
+            appendLine("destinationPath=${current.destinationPath}")
+            appendLine("serverPort=${current.serverPortText} serverRunning=${current.serverRunning}")
+            appendLine("phase=${current.phase}")
+            appendLine("isBusy=${current.isBusy} isPreviewing=${current.isPreviewing}")
+            appendLine("previewReady=${current.previewReady} items=${current.transferItemCount}")
+            appendLine("previewStatus=${current.previewStatusText ?: "null"}")
+            appendLine("lastResult=${current.lastResult ?: "null"}")
+            appendLine("transferStatus=${current.transferRecord?.status?.name ?: "none"}")
+            append("注意：配对密钥不会写入诊断日志。")
+        }
     }
 
     private fun encodeProfiles(profiles: List<PeerProfile>): String = JSONArray().apply {
@@ -1435,6 +1535,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         const val MAX_VISIBLE_TRANSFER_FOLDERS = 400
         const val DEFAULT_RANGE_MILLIS = 24L * 60L * 60L * 1000L
         const val REMOTE_ACTIVITY_TIMEOUT_MS = 15L * 60L * 1000L
+        const val REMOTE_ACTIVITY_FINISHED_HOLD_MS = 8_000L
     }
 
     private data class RemoteEndpoint(val host: String, val port: Int, val secret: String)

@@ -8,6 +8,7 @@ import com.rootsync.android.domain.CheckState
 import com.rootsync.android.domain.DeviceCapabilities
 import com.rootsync.android.domain.SyncRangeMode
 import com.rootsync.android.domain.SyncRole
+import com.rootsync.android.root.CommandResult
 import com.rootsync.android.root.RootShell
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -171,6 +172,10 @@ class RootSyncEngine(private val context: Context) {
         sinceEpochMillis: Long? = null,
         untilEpochMillis: Long = System.currentTimeMillis()
     ): EngineResult = withContext(Dispatchers.IO) {
+        onLog(
+            "DIAG_SERVER_PREPARE mode=${mode?.name ?: "MANUAL"} range=${rangeMode.name} " +
+                "port=$port source=$sourcePath destination=$destinationPath"
+        )
         SafeInput.validateStoragePath(sourcePath)?.let { return@withContext EngineResult(false, it) }
         SafeInput.validateStoragePath(destinationPath)?.let { return@withContext EngineResult(false, it) }
         if (secret.length < com.rootsync.android.domain.SyncUiState.MIN_SECRET_LENGTH) {
@@ -203,6 +208,7 @@ class RootSyncEngine(private val context: Context) {
         if (!SafeInput.isValidIpv4(bindAddress)) {
             return@withContext EngineResult(false, "未找到可绑定的 Wi-Fi IPv4 地址")
         }
+        onLog("DIAG_SERVER_BIND address=$bindAddress port=$port rsync=$rsyncPath")
 
         val snapshot = File(metadataDir, "source.snapshot")
         if (servesSendModule) {
@@ -287,6 +293,7 @@ class RootSyncEngine(private val context: Context) {
         )
 
         val stopResult = stopServer(onLog)
+        onLog("DIAG_SERVER_STOP success=${stopResult.success} exit=${stopResult.exitCode} summary=${stopResult.summary}")
         if (!stopResult.success) {
             return@withContext EngineResult(false, "无法停止旧 rsync 服务：${stopResult.summary}")
         }
@@ -323,6 +330,7 @@ class RootSyncEngine(private val context: Context) {
                 "--config=${SafeInput.shellQuote(config.absolutePath)}",
             onLog
         )
+        onLog("DIAG_SERVER_LAUNCH exit=${result.exitCode} outputLines=${result.output.size}")
         if (result.exitCode != 0) {
             val detail = serverFailureDetail(logFile, result.output, onLog)
             return@withContext EngineResult(
@@ -349,6 +357,7 @@ class RootSyncEngine(private val context: Context) {
             }
         }
         if (check.exitCode == 0 && listening) {
+            onLog("DIAG_SERVER_READY pidCheck=0 listening=true address=$bindAddress port=$port")
             EngineResult(
                 true,
                 when (mode) {
@@ -359,6 +368,10 @@ class RootSyncEngine(private val context: Context) {
                 }
             )
         } else {
+            onLog(
+                "DIAG_SERVER_NOT_READY pidCheck=${check.exitCode} listening=$listening " +
+                    "checkLines=${check.output.size}"
+            )
             val detail = serverFailureDetail(logFile, result.output + check.output, onLog)
             EngineResult(
                 false,
@@ -660,16 +673,31 @@ class RootSyncEngine(private val context: Context) {
         onLog: (String) -> Unit,
         onProgress: (Float) -> Unit,
         onItem: (RsyncItem) -> Unit
-    ) = shell.execute(
-        "umask 077; echo \$\$ > ${SafeInput.shellQuote(File(runtimeDir, "transfer.pid").absolutePath)}; " +
-            "exec $command"
-    ) { line ->
-        onLog(line)
-        RsyncOutputParser.parseItem(line)?.let(onItem)
-        Regex("(?:^|\\s)([0-9]{1,3})%(?:\\s|$)")
-            .find(line)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let {
-                onProgress(it.coerceIn(0, 100) / 100f)
+    ): CommandResult {
+        var parsedItemCount = 0
+        onLog("DIAG_TRANSFER_COMMAND $command")
+        val result = shell.execute(
+            "umask 077; echo \$\$ > ${SafeInput.shellQuote(File(runtimeDir, "transfer.pid").absolutePath)}; " +
+                "exec $command"
+        ) { line ->
+            onLog(line)
+            val item = RsyncOutputParser.parseItem(line)
+            if (item != null) {
+                parsedItemCount += 1
+                onItem(item)
+            } else if (line.contains(RsyncOutputParser.ITEM_PREFIX)) {
+                onLog("DIAG_PARSER_REJECTED $line")
             }
+            Regex("(?:^|\\s)([0-9]{1,3})%(?:\\s|$)")
+                .find(line)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let {
+                    onProgress(it.coerceIn(0, 100) / 100f)
+                }
+        }
+        onLog(
+            "DIAG_TRANSFER_FINISH exit=${result.exitCode} outputLines=${result.output.size} " +
+                "parsedItems=$parsedItemCount"
+        )
+        return result
     }
 
     suspend fun pauseTransfer(): EngineResult = withContext(Dispatchers.IO) {
