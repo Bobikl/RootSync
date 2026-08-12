@@ -152,6 +152,22 @@ class LanDiscoveryManager(
         }
     }
 
+    fun probePresence(hosts: Collection<String>) {
+        start()
+        val now = System.currentTimeMillis()
+        _devices.update { devices -> devices.filter { now - it.lastSeenMillis <= DEVICE_TTL_MS } }
+        scope.launch {
+            val message = baseMessage(TYPE_DISCOVER)
+            repeat(PRESENCE_PROBE_BURSTS) { index ->
+                hosts.distinct().forEach { host ->
+                    runCatching { InetAddress.getByName(host) }
+                        .onSuccess { address -> send(message, address) }
+                }
+                if (index < PRESENCE_PROBE_BURSTS - 1) delay(PRESENCE_PROBE_INTERVAL_MS)
+            }
+        }
+    }
+
     fun requestPair(
         device: DiscoveredDevice,
         role: SyncRole,
@@ -248,19 +264,39 @@ class LanDiscoveryManager(
         }
     }
 
-    suspend fun sendSyncActivity(host: String, type: SyncActivityType, active: Boolean) =
+    suspend fun sendSyncActivity(
+        host: String,
+        type: SyncActivityType,
+        active: Boolean,
+        taskId: String
+    ) =
         withContext(Dispatchers.IO) {
             start()
             val message = baseMessage(TYPE_SYNC_ACTIVITY)
                 .put("secret", localSecret())
                 .put("activity", type.name)
                 .put("active", active)
+                .put("taskId", taskId)
             val address = InetAddress.getByName(host)
             repeat(2) { index ->
                 send(message, address)
                 if (index == 0) delay(80)
             }
         }
+
+    fun sendSyncItem(host: String, type: SyncActivityType, taskId: String, itemPath: String) {
+        if (itemPath.isBlank()) return
+        start()
+        scope.launch {
+            val message = baseMessage(TYPE_SYNC_ACTIVITY)
+                .put("secret", localSecret())
+                .put("activity", type.name)
+                .put("active", true)
+                .put("taskId", taskId)
+                .put("itemPath", itemPath.take(1200))
+            send(message, InetAddress.getByName(host))
+        }
+    }
 
     fun answerSyncPreparation(
         request: SyncPrepareRequest,
@@ -633,7 +669,9 @@ class LanDiscoveryManager(
                             host = host,
                             secret = secret,
                             type = activity,
-                            active = message.optBoolean("active", false)
+                            active = message.optBoolean("active", false),
+                            taskId = message.optString("taskId"),
+                            itemPath = message.optString("itemPath").takeIf { it.isNotBlank() }
                         )
                     )
                 }
@@ -747,9 +785,11 @@ class LanDiscoveryManager(
         const val SCAN_WINDOW_MS = 8_000L
         private const val NSD_SERVICE_TYPE = "_rootsync._tcp."
         private const val MAGIC = "ROOTSYNC_LAN"
-        private const val PROTOCOL_VERSION = 5
+        private const val PROTOCOL_VERSION = 6
         private const val UDP_SCAN_BURSTS = 3
         private const val UDP_SCAN_INTERVAL_MS = 700L
+        private const val PRESENCE_PROBE_BURSTS = 2
+        private const val PRESENCE_PROBE_INTERVAL_MS = 180L
         private const val MAX_PACKET_SIZE = 4096
         private const val DEVICE_TTL_MS = 90_000L
         private const val TYPE_DISCOVER = "discover"

@@ -96,7 +96,18 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         discovery.start()
         viewModelScope.launch {
             discovery.devices.collect { devices ->
-                _state.update { it.copy(discoveredDevices = devices) }
+                _state.update {
+                    it.copy(
+                        discoveredDevices = devices,
+                        onlineDeviceIds = devices.mapTo(linkedSetOf()) { device -> device.deviceId }
+                    )
+                }
+            }
+        }
+        viewModelScope.launch {
+            while (true) {
+                refreshProfilePresence()
+                delay(PROFILE_PRESENCE_INTERVAL_MS)
             }
         }
         viewModelScope.launch {
@@ -598,12 +609,6 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        showRemoteActivity(
-            deviceId = request.deviceId,
-            name = request.name,
-            type = if (request.isPreview) SyncActivityType.PREVIEW else SyncActivityType.TRANSFER
-        )
-
         applyRemoteStrategy(
             StrategyUpdate(
                 request.deviceId,
@@ -659,8 +664,23 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun applySyncActivity(update: SyncActivityUpdate) {
         val profile = _state.value.profiles.firstOrNull { it.deviceId == update.deviceId } ?: return
+        if (update.active && update.itemPath != null) {
+            showRemoteActivity(
+                update.deviceId,
+                update.name.ifBlank { profile.name },
+                update.type,
+                update.taskId
+            )
+            updateRemoteTransferItem(update.type, update.itemPath)
+            return
+        }
         if (update.active) {
-            showRemoteActivity(update.deviceId, update.name.ifBlank { profile.name }, update.type)
+            showRemoteActivity(
+                update.deviceId,
+                update.name.ifBlank { profile.name },
+                update.type,
+                update.taskId
+            )
             appendLog(
                 "LAN",
                 if (update.type == SyncActivityType.PREVIEW) {
@@ -670,12 +690,21 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 }
             )
         } else {
-            finishRemoteActivity(update.deviceId, update.type)
+            finishRemoteActivity(update.deviceId, update.type, update.taskId)
         }
     }
 
-    private fun showRemoteActivity(deviceId: String, name: String, type: SyncActivityType) {
-        val activity = RemoteSyncActivity(deviceId = deviceId, name = name, type = type)
+    private fun showRemoteActivity(
+        deviceId: String,
+        name: String,
+        type: SyncActivityType,
+        taskId: String = ""
+    ) {
+        val current = _state.value.remoteActivity
+        if (current?.deviceId == deviceId && current.type == type && !current.finished &&
+            (taskId.isBlank() || current.taskId == taskId)
+        ) return
+        val activity = RemoteSyncActivity(deviceId = deviceId, name = name, type = type, taskId = taskId)
         _state.update { it.copy(remoteActivity = activity) }
         viewModelScope.launch {
             delay(REMOTE_ACTIVITY_TIMEOUT_MS)
@@ -693,14 +722,19 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun finishRemoteActivity(deviceId: String, type: SyncActivityType) {
+    private fun finishRemoteActivity(deviceId: String, type: SyncActivityType, taskId: String) {
         val finishedAt = System.currentTimeMillis()
+        var matched = false
         _state.update { state ->
             val activity = state.remoteActivity
-            if (activity?.deviceId == deviceId && activity.type == type) {
+            if (activity?.deviceId == deviceId && activity.type == type && !activity.finished &&
+                (taskId.isBlank() || activity.taskId == taskId)
+            ) {
+                matched = true
                 state.copy(remoteActivity = activity.copy(finished = true, startedAtMillis = finishedAt))
             } else state
         }
+        if (!matched) return
         appendLog(
             "LAN",
             if (type == SyncActivityType.PREVIEW) "对方差异扫描已结束" else "对方同步任务已结束"
@@ -714,6 +748,30 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     state.copy(remoteActivity = null)
                 } else state
             }
+        }
+    }
+
+    private fun updateRemoteTransferItem(type: SyncActivityType, itemPath: String) {
+        _state.update { state ->
+            val display = if (type == SyncActivityType.PREVIEW) {
+                "对方扫描 · $itemPath"
+            } else {
+                "对方正在传输 · $itemPath"
+            }
+            val canAppend = display !in state.transferFolders &&
+                state.transferFolders.size < MAX_VISIBLE_TRANSFER_FOLDERS
+            state.copy(
+                transferPanelTitle = if (type == SyncActivityType.PREVIEW) {
+                    "对方差异扫描文件与目录"
+                } else {
+                    "正在双向同步的文件与目录"
+                },
+                currentTransferFolder = itemPath,
+                transferFolders = if (canAppend) state.transferFolders + display else state.transferFolders,
+                transferItemCount = state.transferItemCount + 1,
+                transferFoldersTruncated = state.transferFoldersTruncated ||
+                    (display !in state.transferFolders && !canAppend)
+            )
         }
     }
 
@@ -944,7 +1002,16 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 updateTransferProgress(progress, transferStartedAt, dryRun, action)
             }
             val remoteActivityType = if (dryRun) SyncActivityType.PREVIEW else SyncActivityType.TRANSFER
-            discovery.sendSyncActivity(endpoint.host, remoteActivityType, active = true)
+            val remoteTaskId = UUID.randomUUID().toString()
+            discovery.sendSyncActivity(endpoint.host, remoteActivityType, active = true, taskId = remoteTaskId)
+            val sendRemoteItem: (RsyncItem) -> Unit = { item ->
+                discovery.sendSyncItem(
+                    endpoint.host,
+                    remoteActivityType,
+                    remoteTaskId,
+                    item.relativePath
+                )
+            }
             val result = try {
                 when (current.role) {
                 SyncRole.SEND_ONLY -> engine.push(
@@ -960,7 +1027,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     dryRun = dryRun,
                     onLog = ::streamLog,
                     onProgress = updateProgress,
-                    onItem = { item -> updateTransferItem(item, dryRun, current.role) }
+                    onItem = { item ->
+                        updateTransferItem(item, dryRun, current.role)
+                        sendRemoteItem(item)
+                    }
                 )
                 SyncRole.RECEIVE_ONLY -> engine.pull(
                     rsyncPath = rsync,
@@ -975,7 +1045,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     dryRun = dryRun,
                     onLog = ::streamLog,
                     onProgress = updateProgress,
-                    onItem = { item -> updateTransferItem(item, dryRun, current.role) }
+                    onItem = { item ->
+                        updateTransferItem(item, dryRun, current.role)
+                        sendRemoteItem(item)
+                    }
                 )
                     SyncRole.BIDIRECTIONAL -> {
                     appendLog("INFO", "双向同步第 1/2 阶段：接收远端较新文件")
@@ -994,6 +1067,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                         onProgress = { progress -> updateProgress(progress * 0.5f) },
                         onItem = { item ->
                             updateTransferItem(item, dryRun, current.role, "接收")
+                            sendRemoteItem(item)
                         }
                     )
                     if (!pullResult.success || pauseRequested) {
@@ -1015,6 +1089,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                             onProgress = { progress -> updateProgress(0.5f + progress * 0.5f) },
                             onItem = { item ->
                                 updateTransferItem(item, dryRun, current.role, "发送")
+                                sendRemoteItem(item)
                             }
                         )
                         if (pushResult.success) {
@@ -1031,7 +1106,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
             } finally {
-                discovery.sendSyncActivity(endpoint.host, remoteActivityType, active = false)
+                discovery.sendSyncActivity(
+                    endpoint.host,
+                    remoteActivityType,
+                    active = false,
+                    taskId = remoteTaskId
+                )
             }
             if (!dryRun && pauseRequested) {
                 markTransferPaused("用户已暂停；临时分片保留，可继续传输")
@@ -1305,6 +1385,22 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         appendLog("WARN", "用户取消了当前任务，正在结束底层 rsync 进程")
     }
 
+    private suspend fun refreshProfilePresence() {
+        val profiles = _state.value.profiles.filterNot { it.deviceId.startsWith("manual:") }
+        if (profiles.isEmpty()) {
+            _state.update { it.copy(onlineDeviceIds = emptySet()) }
+            return
+        }
+        discovery.probePresence(profiles.map { it.host })
+        delay(PROFILE_PRESENCE_RESPONSE_MS)
+        _state.update { state ->
+            val recentlyDiscovered = state.discoveredDevices
+                .filter { System.currentTimeMillis() - it.lastSeenMillis <= PROFILE_ONLINE_TTL_MS }
+                .mapTo(linkedSetOf()) { it.deviceId }
+            state.copy(onlineDeviceIds = recentlyDiscovered)
+        }
+    }
+
     fun clearLogs() {
         _state.update { it.copy(logs = emptyList()) }
         diagnosticLogger.append("INFO", "用户清空了界面日志；持久诊断日志继续保留")
@@ -1528,6 +1624,9 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         const val REMOTE_ACTIVITY_TIMEOUT_MS = 15L * 60L * 1000L
         const val REMOTE_ACTIVITY_FINISHED_HOLD_MS = 8_000L
         const val RSYNC_PROBE_RELEASE_DELAY_MS = 1_000L
+        const val PROFILE_PRESENCE_INTERVAL_MS = 15_000L
+        const val PROFILE_ONLINE_TTL_MS = 45_000L
+        const val PROFILE_PRESENCE_RESPONSE_MS = 800L
     }
 
     private data class RemoteEndpoint(val host: String, val port: Int, val secret: String)

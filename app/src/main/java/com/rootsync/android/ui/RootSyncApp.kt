@@ -270,6 +270,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                     ProfileRow(
                         profile = profile,
                         selected = profile.id == state.selectedProfileId,
+                        online = profile.deviceId in state.onlineDeviceIds,
                         onClick = { viewModel.selectProfile(profile.id) }
                     )
                 }
@@ -633,7 +634,12 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
 }
 
 @Composable
-private fun ProfileRow(profile: PeerProfile, selected: Boolean, onClick: () -> Unit) {
+private fun ProfileRow(
+    profile: PeerProfile,
+    selected: Boolean,
+    online: Boolean,
+    onClick: () -> Unit
+) {
     Surface(
         color = if (selected) MaterialTheme.colorScheme.primaryContainer
         else MaterialTheme.colorScheme.surfaceContainerHighest,
@@ -644,7 +650,23 @@ private fun ProfileRow(profile: PeerProfile, selected: Boolean, onClick: () -> U
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 11.dp),
             verticalArrangement = Arrangement.spacedBy(5.dp)
         ) {
-            Text(profile.name, fontWeight = FontWeight.SemiBold, maxLines = 1)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    profile.name,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    modifier = Modifier.weight(1f)
+                )
+                Surface(
+                    color = if (online) Color(0xFF2E7D32) else Color(0xFFC62828),
+                    shape = RoundedCornerShape(50),
+                    modifier = Modifier.size(11.dp)
+                ) {}
+            }
             Text(
                 "${profile.host}:${profile.port}",
                 style = MaterialTheme.typography.bodySmall,

@@ -137,13 +137,16 @@ data class SyncActivityUpdate(
     val host: String,
     val secret: String,
     val type: SyncActivityType,
-    val active: Boolean
+    val active: Boolean,
+    val taskId: String = "",
+    val itemPath: String? = null
 )
 
 data class RemoteSyncActivity(
     val deviceId: String,
     val name: String,
     val type: SyncActivityType,
+    val taskId: String = "",
     val startedAtMillis: Long = System.currentTimeMillis(),
     val finished: Boolean = false
 )
@@ -200,6 +203,7 @@ data class SyncUiState(
     val profiles: List<PeerProfile> = emptyList(),
     val selectedProfileId: String? = null,
     val discoveredDevices: List<DiscoveredDevice> = emptyList(),
+    val onlineDeviceIds: Set<String> = emptySet(),
     val isScanning: Boolean = false,
     val pendingPairRequest: PairRequest? = null,
     val serverRunning: Boolean = false,
