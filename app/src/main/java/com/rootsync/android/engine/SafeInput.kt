@@ -127,7 +127,7 @@ object RsyncCommandBuilder {
             "--password-file=$passwordFile"
         )
         filesFrom?.let { args += listOf("--files-from=$it", "--from0") }
-        if (bidirectional) args += listOf("--update", "--checksum")
+        if (bidirectional) args += "--update"
         if (dryRun) args += listOf("--dry-run", "--itemize-changes")
         args += "rsync://sync-user@$host:$port/send/"
         args += destination.trimEnd('/') + "/"
@@ -172,7 +172,7 @@ object RsyncCommandBuilder {
             "--password-file=$passwordFile"
         )
         filesFrom?.let { args += listOf("--files-from=$it", "--from0") }
-        if (bidirectional) args += listOf("--update", "--checksum")
+        if (bidirectional) args += "--update"
         if (dryRun) args += listOf("--dry-run", "--itemize-changes")
         args += source.trimEnd('/') + "/"
         args += "rsync://sync-user@$host:$port/receive/"

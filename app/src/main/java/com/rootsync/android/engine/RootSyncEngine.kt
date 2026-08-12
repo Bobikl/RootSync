@@ -769,7 +769,24 @@ class RootSyncEngine(private val context: Context) {
     private fun backupRunId(): String =
         LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSS"))
 
-    fun cancel() = shell.cancel()
+    suspend fun cancel(): EngineResult = withContext(Dispatchers.IO) {
+        val pidFile = File(runtimeDir, "transfer.pid")
+        val command =
+            "pid_file=${SafeInput.shellQuote(pidFile.absolutePath)}; " +
+                "if [ -s \"\$pid_file\" ]; then pid=\$(cat \"\$pid_file\"); " +
+                "case \"\$pid\" in *[!0-9]*|'') ;; *) " +
+                "if [ -r \"/proc/\$pid/cmdline\" ] && " +
+                "tr '\\000' ' ' < \"/proc/\$pid/cmdline\" | grep -Fq 'rsync'; then " +
+                "kill -INT \"\$pid\" 2>/dev/null || true; attempt=0; " +
+                "while kill -0 \"\$pid\" 2>/dev/null && [ \"\$attempt\" -lt 10 ]; do " +
+                "attempt=\$((attempt + 1)); sleep 0.1; done; " +
+                "if kill -0 \"\$pid\" 2>/dev/null; then kill -KILL \"\$pid\" 2>/dev/null || true; fi; " +
+                "fi ;; esac; fi; rm -f \"\$pid_file\""
+        val result = controlShell.execute(command)
+        shell.cancel()
+        if (result.exitCode == 0) EngineResult(true, "任务已取消，rsync 进程已结束")
+        else EngineResult(false, "任务取消请求已发送，但 rsync 进程清理失败", result.exitCode)
+    }
 
     fun generateSecret(): String {
         val bytes = ByteArray(18).also { SecureRandom().nextBytes(it) }

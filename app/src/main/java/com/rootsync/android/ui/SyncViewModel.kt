@@ -1288,7 +1288,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun cancel() {
-        engine.cancel()
+        viewModelScope.launch {
+            val result = engine.cancel()
+            appendLog(if (result.success) "INFO" else "ERROR", result.summary)
+        }
         _state.update { state ->
             state.copy(
                 isBusy = false,
@@ -1299,7 +1302,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 lastResult = "任务已取消"
             )
         }
-        appendLog("WARN", "用户取消了当前任务")
+        appendLog("WARN", "用户取消了当前任务，正在结束底层 rsync 进程")
     }
 
     fun clearLogs() {

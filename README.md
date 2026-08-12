@@ -3,12 +3,12 @@
 面向已 ROOT Android 手机的局域网 rsync 同步工具，依据
 `Android_ROOT_rsync_开发大纲.md` 开发。当前版本为 arm64 技术验证 APK。
 
-## 当前版本（0.2.9）
+## 当前版本（0.2.10）
 
 - Kotlin、Jetpack Compose、Material 3；`compileSdk/targetSdk 36`，适配 Android 15/16；
 - APK 内置经上游签名验证的 **rsync 3.4.4 arm64**，无需额外安装 ROOT rsync 模块；
 - 内置 arm64 `syncmeta`，快照并恢复目录 mtime；两个原生 ELF 均使用 16 KB LOAD 对齐；
-- 支持“只发送”“只接收”和“双向同步”，双向模式按较新修改时间收敛，并使用校验和确认差异；
+- 支持“只发送”“只接收”和“双向同步”，双向模式按较新修改时间收敛；
 - 三种方向均可选择“全部内容”或“指定时间至今”，时间范围通过 NUL 分隔的精确文件清单交给 rsync；
 - 多设备配置：每台设备分别保存地址、密钥、方向、同步范围、起始时间和本机目录；
 - Android NSD/mDNS 与 UDP 8874 双通道自动发现，点击设备后由对方确认连接；
@@ -27,6 +27,8 @@
 - 重启服务时等待旧 rsync daemon 完全退出并确认端口释放，必要时只强制结束经过配置路径校验的本应用旧进程；
 - 服务启动同时检查 PID 与监听端口；失败时自动读取最新 `rsyncd.log`，把 bind、权限、配置等具体错误显示到双方日志和结果框；
 - 修复 TCP 健康探测占用 rsync daemon 唯一连接槽、紧接着的预览或传输报 `max connections (1) reached` 的问题；本机改为读取内核监听表，远端准备成功后直接进入 rsync 协议；
+- 修复 300 GB、约 1.2 万文件目录在双向差异预览时因 `--checksum` 对双方全部文件逐个读取而长时间没有输出的问题；双向预览改用大小和修改时间快速筛选；
+- 修复取消预览只关闭 Java 端管道、ROOT rsync 子进程仍残留的问题；取消时校验 PID 后发送 INT，超时后强制结束，并清理 PID 文件；
 - 新增跨重启持久诊断日志，保留当前与上一段日志；可从日志页导出 UTF-8 文本或复制 ADB 读取命令；
 - 对端扫描/同步结束后保留 8 秒完成提示，不再从“正在扫描”状态直接闪退消失；
 - 传输进度同步显示在系统通知栏，前台 `dataSync` 服务配合 CPU/Wi-Fi 锁保持后台传输；
@@ -51,7 +53,7 @@
 
 APK 输出：`app/build/outputs/apk/debug/app-debug.apk`
 
-已构建版本：`dist/RootSync-v0.2.9-debug-arm64.apk`
+已构建版本：`dist/RootSync-v0.2.10-debug-arm64.apk`
 
 ## 两机使用
 
@@ -65,7 +67,7 @@ APK 输出：`app/build/outputs/apk/debug/app-debug.apk`
 自动发现和首次连接弹窗要求对方 RootSync 处于打开状态。完成配对并启动 rsync
 服务后，rsync daemon 可独立运行，另一台设备可按已保存的 IP 和策略连接。
 
-0.2.9 继续兼容局域网控制协议 v5；建议两端都升级，避免健康探测占用唯一 rsync 连接槽。
+0.2.10 继续兼容局域网控制协议 v5；建议两端都升级，改善大目录预览速度并确保取消后不残留进程。
 
 ## 第三方源码与许可证
 

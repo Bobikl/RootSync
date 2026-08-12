@@ -92,7 +92,7 @@ class SafeInputTest {
         assertTrue(command.contains("--files-from=/data/user/0/app/remote.files"))
         assertTrue(command.contains("--from0"))
         assertTrue(command.contains("--update"))
-        assertTrue(command.contains("--checksum"))
+        assertFalse(command.contains("--checksum"))
         assertFalse(command.contains("--delete"))
         assertFalse(command.contains("--remove-source-files"))
     }
