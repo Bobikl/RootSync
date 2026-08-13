@@ -74,6 +74,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 "android=${Build.VERSION.RELEASE}/${Build.VERSION.SDK_INT} model=${Build.MANUFACTURER} ${Build.MODEL}"
         )
         diagnosticLogger.append("STATE", diagnosticStateHeader())
+        viewModelScope.launch {
+            val cleanup = engine.cleanupStaleRuntimeProcesses(::streamLog)
+            appendLog(if (cleanup.success) "INFO" else "ERROR", cleanup.summary)
+        }
         _state.value.transferRecord?.takeIf { it.status == TransferStatus.RUNNING }?.let { record ->
             _state.update {
                 it.copy(
@@ -89,7 +93,6 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             }
             persistTransferRecord()
             TransferForegroundService.stop(application)
-            viewModelScope.launch { engine.pauseTransfer() }
         }
         // 新安装首次生成的密钥也立即落盘，避免进程在能力检查前退出后重新生成。
         saveConfig()

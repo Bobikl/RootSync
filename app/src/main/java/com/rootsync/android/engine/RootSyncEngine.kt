@@ -3,6 +3,7 @@ package com.rootsync.android.engine
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.os.Process
 import com.rootsync.android.domain.CapabilityCheck
 import com.rootsync.android.domain.CheckState
 import com.rootsync.android.domain.DeviceCapabilities
@@ -30,12 +31,25 @@ data class EngineResult(
 class RootSyncEngine(private val context: Context) {
     private val shell = RootShell()
     private val controlShell = RootShell()
+    private val watchdogShell = RootShell()
     private val runtimeDir = File(context.filesDir, "runtime").apply { mkdirs() }
     private val metadataDir = File(runtimeDir, "metadata").apply { mkdirs() }
     private val syncMetaPath: String
         get() = File(context.applicationInfo.nativeLibraryDir, "libsyncmeta.so").absolutePath
     private val bundledRsyncPath: String
         get() = File(context.applicationInfo.nativeLibraryDir, "librsync.so").absolutePath
+    private val appProcessId = Process.myPid()
+    private val appProcessName = context.packageName
+
+    suspend fun cleanupStaleRuntimeProcesses(onLog: (String) -> Unit): EngineResult =
+        withContext(Dispatchers.IO) {
+            val result = controlShell.execute(runtimeCleanupCommand(includeWatchdog = true), onLog)
+            if (result.exitCode == 0) {
+                EngineResult(true, "已清理上次异常退出遗留的 rsync 进程")
+            } else {
+                EngineResult(false, "遗留 rsync 进程清理失败", result.exitCode)
+            }
+        }
 
     suspend fun probe(sourcePath: String, destinationPath: String): DeviceCapabilities {
         val checks = mutableListOf<CapabilityCheck>()
@@ -357,6 +371,7 @@ class RootSyncEngine(private val context: Context) {
             }
         }
         if (check.exitCode == 0 && listening) {
+            ensureLifecycleWatchdog(rsyncPath, onLog)
             onLog("DIAG_SERVER_READY pidCheck=0 listening=true address=$bindAddress port=$port")
             EngineResult(
                 true,
@@ -675,6 +690,7 @@ class RootSyncEngine(private val context: Context) {
         onItem: (RsyncItem) -> Unit
     ): CommandResult {
         var parsedItemCount = 0
+        ensureLifecycleWatchdog(bundledRsyncPath, onLog)
         onLog("DIAG_TRANSFER_COMMAND $command")
         val result = shell.execute(
             "umask 077; echo \$\$ > ${SafeInput.shellQuote(File(runtimeDir, "transfer.pid").absolutePath)}; " +
@@ -698,6 +714,75 @@ class RootSyncEngine(private val context: Context) {
                 "parsedItems=$parsedItemCount"
         )
         return result
+    }
+
+    private suspend fun ensureLifecycleWatchdog(rsyncPath: String, onLog: (String) -> Unit) {
+        val watchdogPidFile = File(runtimeDir, "lifecycle-watchdog.pid")
+        val transferPidFile = File(runtimeDir, "transfer.pid")
+        val daemonPidFile = File(runtimeDir, "rsyncd.pid")
+        val configFile = File(runtimeDir, "rsyncd.conf")
+        val script = buildString {
+            append("echo \$\$ > ${SafeInput.shellQuote(watchdogPidFile.absolutePath)}; ")
+            append("while true; do ")
+            append("alive=0; if [ -r /proc/$appProcessId/cmdline ]; then ")
+            append("name=\$(tr '\\000' ' ' < /proc/$appProcessId/cmdline); ")
+            append("case \"\$name\" in ${SafeInput.shellQuote(appProcessName)}*) alive=1 ;; esac; fi; ")
+            append("if [ \"\$alive\" -eq 1 ]; then sleep 2; continue; fi; ")
+            append(runtimeCleanupCommand(includeWatchdog = false))
+            append("; exit 0; done")
+        }
+        val stopOld =
+            "watchdog_file=${SafeInput.shellQuote(watchdogPidFile.absolutePath)}; " +
+                "if [ -s \"\$watchdog_file\" ]; then old=\$(cat \"\$watchdog_file\"); " +
+                "case \"\$old\" in *[!0-9]*|'') ;; *) kill \"\$old\" 2>/dev/null || true ;; esac; fi; " +
+                "rm -f \"\$watchdog_file\""
+        watchdogShell.execute(stopOld)
+        val launch =
+            "umask 077; nohup sh -c ${SafeInput.shellQuote(script)} rootsync-watchdog " +
+                ">/dev/null 2>&1 &"
+        val result = watchdogShell.execute(launch)
+        onLog(
+            "DIAG_WATCHDOG launchExit=${result.exitCode} appPid=$appProcessId " +
+                "rsync=$rsyncPath transferPid=${transferPidFile.absolutePath} " +
+                "daemonPid=${daemonPidFile.absolutePath} config=${configFile.absolutePath}"
+        )
+    }
+
+    private fun runtimeCleanupCommand(includeWatchdog: Boolean): String {
+        val transferPidFile = File(runtimeDir, "transfer.pid")
+        val daemonPidFile = File(runtimeDir, "rsyncd.pid")
+        val configFile = File(runtimeDir, "rsyncd.conf")
+        val watchdogPidFile = File(runtimeDir, "lifecycle-watchdog.pid")
+        return buildString {
+            append("for pid_file in ")
+            append(SafeInput.shellQuote(transferPidFile.absolutePath)).append(' ')
+            append(SafeInput.shellQuote(daemonPidFile.absolutePath)).append("; do ")
+            append("if [ -s \"\$pid_file\" ]; then pid=\$(cat \"\$pid_file\"); ")
+            append("case \"\$pid\" in *[!0-9]*|'') ;; *) ")
+            append("if [ -r \"/proc/\$pid/cmdline\" ] && ")
+            append("tr '\\000' ' ' < \"/proc/\$pid/cmdline\" | grep -Fq 'rsync'; then ")
+            append("kill -INT \"\$pid\" 2>/dev/null || true; sleep 0.2; ")
+            append("kill -KILL \"\$pid\" 2>/dev/null || true; fi ;; esac; fi; ")
+            append("rm -f \"\$pid_file\"; done; ")
+            append("config=${SafeInput.shellQuote(configFile.absolutePath)}; ")
+            append("app_name=${SafeInput.shellQuote(appProcessName)}; self=\$\$; parent=\$PPID; ")
+            append("for cmdline in /proc/[0-9]*/cmdline; do ")
+            append("[ -r \"\$cmdline\" ] || continue; ")
+            append("pid=\${cmdline#/proc/}; pid=\${pid%/cmdline}; ")
+            append("[ \"\$pid\" = \"\$self\" ] && continue; [ \"\$pid\" = \"\$parent\" ] && continue; ")
+            append("cmd=\$(tr '\\000' ' ' < \"\$cmdline\"); ")
+            append("if printf '%s' \"\$cmd\" | grep -Fq \"\$config\" || ")
+            append("{ printf '%s' \"\$cmd\" | grep -Fq \"\$app_name\" && ")
+            append("printf '%s' \"\$cmd\" | grep -Fq 'librsync.so'; }; then ")
+            append("kill -INT \"\$pid\" 2>/dev/null || true; sleep 0.1; ")
+            append("kill -KILL \"\$pid\" 2>/dev/null || true; fi; done")
+            if (includeWatchdog) {
+                append("; watchdog_file=${SafeInput.shellQuote(watchdogPidFile.absolutePath)}; ")
+                append("if [ -s \"\$watchdog_file\" ]; then pid=\$(cat \"\$watchdog_file\"); ")
+                append("case \"\$pid\" in *[!0-9]*|'') ;; *) kill \"\$pid\" 2>/dev/null || true ;; esac; fi; ")
+                append("rm -f \"\$watchdog_file\"")
+            }
+        }
     }
 
     suspend fun pauseTransfer(): EngineResult = withContext(Dispatchers.IO) {
