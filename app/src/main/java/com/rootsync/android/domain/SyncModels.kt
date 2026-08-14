@@ -139,7 +139,9 @@ data class SyncActivityUpdate(
     val type: SyncActivityType,
     val active: Boolean,
     val taskId: String = "",
-    val itemPath: String? = null
+    val itemPath: String? = null,
+    val itemIndex: Int = 0,
+    val totalItems: Int = 0
 )
 
 data class RemoteSyncActivity(
@@ -210,6 +212,10 @@ data class SyncUiState(
     val phase: String = "等待检查",
     val progress: Float? = null,
     val estimatedCompletionTime: String? = null,
+    val totalSyncBytes: Long = 0L,
+    val uploadedBytes: Long = 0L,
+    val downloadedBytes: Long = 0L,
+    val transferSpeedBytesPerSecond: Long = 0L,
     val isPreviewing: Boolean = false,
     val transferPanelTitle: String = "差异与传输详情",
     val transferFolders: List<String> = emptyList(),

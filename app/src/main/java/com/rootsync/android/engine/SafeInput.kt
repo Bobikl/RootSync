@@ -31,7 +31,8 @@ data class RsyncItem(
     val itemizedChange: String,
     val relativePath: String,
     val folder: String,
-    val changeLabel: String
+    val changeLabel: String,
+    val sizeBytes: Long = 0L
 )
 
 object RsyncOutputParser {
@@ -45,7 +46,13 @@ object RsyncOutputParser {
         if (separator <= 0 || separator == payload.lastIndex) return null
         val itemized = payload.substring(0, separator).trim()
         if (itemized.startsWith("*deleting")) return null
-        val relativePath = payload.substring(separator + 1)
+        val pathAndSize = payload.substring(separator + 1)
+        val sizeSeparator = pathAndSize.lastIndexOf('|')
+        val parsedSize = if (sizeSeparator >= 0) {
+            pathAndSize.substring(sizeSeparator + 1).trim().toLongOrNull()
+        } else null
+        val pathPayload = if (parsedSize != null) pathAndSize.substring(0, sizeSeparator) else pathAndSize
+        val relativePath = pathPayload
             .substringBefore(" -> ")
             .removePrefix("./")
             .trim()
@@ -63,7 +70,20 @@ object RsyncOutputParser {
             isDirectory -> "目录更新"
             else -> "更新"
         }
-        return RsyncItem(itemized, relativePath, folder, changeLabel)
+        return RsyncItem(itemized, relativePath, folder, changeLabel, parsedSize?.coerceAtLeast(0L) ?: 0L)
+    }
+
+    fun parseTransferredBytes(line: String): Long? {
+        val match = Regex("^\\s*([0-9][0-9,.]*\\s*[KMGTPE]?)\\s+([0-9]{1,3})%(?:\\s|$)", RegexOption.IGNORE_CASE)
+            .find(line) ?: return null
+        val raw = match.groupValues[1].replace(",", "").replace(" ", "").uppercase()
+        val suffix = raw.lastOrNull()?.takeIf { it in "KMGTPE" }
+        val number = if (suffix == null) raw else raw.dropLast(1)
+        val value = number.toDoubleOrNull() ?: return null
+        val power = suffix?.let { "KMGTPE".indexOf(it) + 1 } ?: 0
+        var factor = 1.0
+        repeat(power) { factor *= 1024.0 }
+        return (value * factor).toLong().coerceAtLeast(0L)
     }
 }
 
@@ -112,7 +132,7 @@ object RsyncCommandBuilder {
             "-rlt",
             "--human-readable",
             "--info=progress2,stats2",
-            "--out-format=${RsyncOutputParser.ITEM_PREFIX}%i|%n%L",
+            "--out-format=${RsyncOutputParser.ITEM_PREFIX}%i|%n%L|%l",
             "--partial",
             "--partial-dir=.rsync-partial",
             "--delay-updates",
@@ -157,7 +177,7 @@ object RsyncCommandBuilder {
             "-rlt",
             "--human-readable",
             "--info=progress2,stats2",
-            "--out-format=${RsyncOutputParser.ITEM_PREFIX}%i|%n%L",
+            "--out-format=${RsyncOutputParser.ITEM_PREFIX}%i|%n%L|%l",
             "--partial",
             "--partial-dir=.rsync-partial",
             "--delay-updates",

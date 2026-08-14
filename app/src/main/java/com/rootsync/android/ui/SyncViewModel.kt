@@ -35,12 +35,13 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
-import java.time.LocalDateTime
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
+import java.util.ArrayDeque
 import java.util.UUID
 
 class SyncViewModel(application: Application) : AndroidViewModel(application) {
@@ -55,6 +56,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     val state: StateFlow<SyncUiState> = _state.asStateFlow()
     @Volatile private var pauseRequested = false
     @Volatile private var lastTransferPersistMillis = 0L
+    private val transferSpeedSamples = ArrayDeque<TransferSpeedSample>()
     private val discovery = LanDiscoveryManager(
         context = application,
         deviceId = deviceId,
@@ -667,6 +669,11 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun applySyncActivity(update: SyncActivityUpdate) {
         val profile = _state.value.profiles.firstOrNull { it.deviceId == update.deviceId } ?: return
+        val currentActivity = _state.value.remoteActivity
+        if (update.active && currentActivity?.deviceId == update.deviceId &&
+            currentActivity.type == update.type && currentActivity.taskId == update.taskId &&
+            currentActivity.finished
+        ) return
         if (update.active && update.itemPath != null) {
             showRemoteActivity(
                 update.deviceId,
@@ -674,7 +681,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 update.type,
                 update.taskId
             )
-            updateRemoteTransferItem(update.type, update.itemPath)
+            updateRemoteTransferItem(update.type, update.itemPath, update.itemIndex)
             return
         }
         if (update.active) {
@@ -693,7 +700,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 }
             )
         } else {
-            finishRemoteActivity(update.deviceId, update.type, update.taskId)
+            finishRemoteActivity(update.deviceId, update.type, update.taskId, update.totalItems)
         }
     }
 
@@ -708,7 +715,20 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             (taskId.isBlank() || current.taskId == taskId)
         ) return
         val activity = RemoteSyncActivity(deviceId = deviceId, name = name, type = type, taskId = taskId)
-        _state.update { it.copy(remoteActivity = activity) }
+        _state.update {
+            it.copy(
+                remoteActivity = activity,
+                transferPanelTitle = if (type == SyncActivityType.PREVIEW) {
+                    "对方差异扫描文件与目录"
+                } else {
+                    "正在双向同步的文件与目录"
+                },
+                transferFolders = emptyList(),
+                currentTransferFolder = null,
+                transferItemCount = 0,
+                transferFoldersTruncated = false
+            )
+        }
         viewModelScope.launch {
             delay(REMOTE_ACTIVITY_TIMEOUT_MS)
             _state.update { state ->
@@ -725,7 +745,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun finishRemoteActivity(deviceId: String, type: SyncActivityType, taskId: String) {
+    private fun finishRemoteActivity(
+        deviceId: String,
+        type: SyncActivityType,
+        taskId: String,
+        totalItems: Int
+    ) {
         val finishedAt = System.currentTimeMillis()
         var matched = false
         _state.update { state ->
@@ -734,7 +759,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 (taskId.isBlank() || activity.taskId == taskId)
             ) {
                 matched = true
-                state.copy(remoteActivity = activity.copy(finished = true, startedAtMillis = finishedAt))
+                state.copy(
+                    remoteActivity = activity.copy(finished = true, startedAtMillis = finishedAt),
+                    transferItemCount = maxOf(state.transferItemCount, totalItems)
+                )
             } else state
         }
         if (!matched) return
@@ -754,7 +782,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun updateRemoteTransferItem(type: SyncActivityType, itemPath: String) {
+    private fun updateRemoteTransferItem(type: SyncActivityType, itemPath: String, itemIndex: Int) {
         _state.update { state ->
             val display = if (type == SyncActivityType.PREVIEW) {
                 "对方扫描 · $itemPath"
@@ -771,7 +799,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 },
                 currentTransferFolder = itemPath,
                 transferFolders = if (canAppend) state.transferFolders + display else state.transferFolders,
-                transferItemCount = state.transferItemCount + 1,
+                transferItemCount = maxOf(state.transferItemCount, itemIndex),
                 transferFoldersTruncated = state.transferFoldersTruncated ||
                     (display !in state.transferFolders && !canAppend)
             )
@@ -966,7 +994,11 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             _state.update {
                 it.copy(
                     progress = if (dryRun) null else activeRecord?.progress ?: 0f,
-                    estimatedCompletionTime = null,
+                    estimatedCompletionTime = if (dryRun) null else "正在统计同步总量…",
+                    totalSyncBytes = 0L,
+                    uploadedBytes = 0L,
+                    downloadedBytes = 0L,
+                    transferSpeedBytesPerSecond = 0L,
                     isPreviewing = dryRun,
                     transferPanelTitle = transferPanelTitle(dryRun, current.role),
                     transferFolders = emptyList(),
@@ -994,7 +1026,6 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 return@launchBusy
             }
-            val transferStartedAt = System.currentTimeMillis()
             if (!dryRun) updateTransferNotification(action, "已连接，正在扫描文件", null, 0f)
             _state.update {
                 it.copy(
@@ -1002,21 +1033,57 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
             val updateProgress: (Float) -> Unit = { progress ->
-                updateTransferProgress(progress, transferStartedAt, dryRun, action)
+                updateTransferProgress(progress, dryRun, action)
             }
             val remoteActivityType = if (dryRun) SyncActivityType.PREVIEW else SyncActivityType.TRANSFER
             val remoteTaskId = UUID.randomUUID().toString()
             discovery.sendSyncActivity(endpoint.host, remoteActivityType, active = true, taskId = remoteTaskId)
+            var remoteItemCount = 0
+            var lastRemoteItemSentAtMillis = 0L
             val sendRemoteItem: (RsyncItem) -> Unit = { item ->
-                discovery.sendSyncItem(
-                    endpoint.host,
-                    remoteActivityType,
-                    remoteTaskId,
-                    item.relativePath
-                )
+                remoteItemCount += 1
+                val nowMillis = System.currentTimeMillis()
+                if (remoteItemCount == 1 || nowMillis - lastRemoteItemSentAtMillis >= REMOTE_ITEM_THROTTLE_MS) {
+                    lastRemoteItemSentAtMillis = nowMillis
+                    discovery.sendSyncItem(
+                        endpoint.host,
+                        remoteActivityType,
+                        remoteTaskId,
+                        item.relativePath,
+                        remoteItemCount
+                    )
+                }
             }
+            val planned = if (dryRun) {
+                PlannedTransfer()
+            } else {
+                _state.update { it.copy(phase = "正在统计需要同步的数据", estimatedCompletionTime = "正在统计同步总量…") }
+                measurePlannedTransfer(current, endpoint, rsync, untilEpochMillis)
+            }
+            if (!dryRun && planned.result.success) {
+                resetTransferSpeedTracking()
+                _state.update {
+                    it.copy(
+                        totalSyncBytes = planned.uploadBytes + planned.downloadBytes,
+                        estimatedCompletionTime = if (planned.uploadBytes + planned.downloadBytes > 0L) {
+                            "正在采集近 10 秒传输速度…"
+                        } else {
+                            "没有需要传输的数据"
+                        },
+                        phase = "正在执行$action"
+                    )
+                }
+            }
+            val etaJob = if (!dryRun && planned.result.success) {
+                viewModelScope.launch {
+                    while (isActive) {
+                        delay(ETA_UPDATE_INTERVAL_MS)
+                        refreshTransferEta(action)
+                    }
+                }
+            } else null
             val result = try {
-                when (current.role) {
+                if (!planned.result.success) planned.result else when (current.role) {
                 SyncRole.SEND_ONLY -> engine.push(
                     rsyncPath = rsync,
                     host = endpoint.host,
@@ -1033,6 +1100,9 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     onItem = { item ->
                         updateTransferItem(item, dryRun, current.role)
                         sendRemoteItem(item)
+                    },
+                    onTransferredBytes = { bytes ->
+                        if (!dryRun) updateTransferBytes(upload = true, bytes = bytes, action = action)
                     }
                 )
                 SyncRole.RECEIVE_ONLY -> engine.pull(
@@ -1051,6 +1121,9 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     onItem = { item ->
                         updateTransferItem(item, dryRun, current.role)
                         sendRemoteItem(item)
+                    },
+                    onTransferredBytes = { bytes ->
+                        if (!dryRun) updateTransferBytes(upload = false, bytes = bytes, action = action)
                     }
                 )
                     SyncRole.BIDIRECTIONAL -> {
@@ -1071,6 +1144,9 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                         onItem = { item ->
                             updateTransferItem(item, dryRun, current.role, "接收")
                             sendRemoteItem(item)
+                        },
+                        onTransferredBytes = { bytes ->
+                            if (!dryRun) updateTransferBytes(upload = false, bytes = bytes, action = action)
                         }
                     )
                     if (!pullResult.success || pauseRequested) {
@@ -1093,6 +1169,9 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                             onItem = { item ->
                                 updateTransferItem(item, dryRun, current.role, "发送")
                                 sendRemoteItem(item)
+                            },
+                            onTransferredBytes = { bytes ->
+                                if (!dryRun) updateTransferBytes(upload = true, bytes = bytes, action = action)
                             }
                         )
                         if (pushResult.success) {
@@ -1109,11 +1188,13 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
             } finally {
+                etaJob?.cancel()
                 discovery.sendSyncActivity(
                     endpoint.host,
                     remoteActivityType,
                     active = false,
-                    taskId = remoteTaskId
+                    taskId = remoteTaskId,
+                    totalItems = remoteItemCount
                 )
             }
             if (!dryRun && pauseRequested) {
@@ -1189,6 +1270,71 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         persistTransferRecord()
     }
 
+    private suspend fun measurePlannedTransfer(
+        current: SyncUiState,
+        endpoint: RemoteEndpoint,
+        rsyncPath: String,
+        untilEpochMillis: Long
+    ): PlannedTransfer {
+        var uploadBytes = 0L
+        var downloadBytes = 0L
+        val countUpload: (RsyncItem) -> Unit = { item ->
+            if (item.itemizedChange.getOrNull(1) != 'd') {
+                uploadBytes = safeAddBytes(uploadBytes, item.sizeBytes)
+            }
+        }
+        val countDownload: (RsyncItem) -> Unit = { item ->
+            if (item.itemizedChange.getOrNull(1) != 'd') {
+                downloadBytes = safeAddBytes(downloadBytes, item.sizeBytes)
+            }
+        }
+        appendLog("INFO", "预扫描差异以统计同步总数据大小…")
+        val pullResult = if (current.role != SyncRole.SEND_ONLY) {
+            engine.pull(
+                rsyncPath = rsyncPath,
+                host = endpoint.host,
+                port = endpoint.port,
+                destinationPath = current.destinationPath,
+                secret = endpoint.secret,
+                rangeMode = current.rangeMode,
+                sinceEpochMillis = current.sinceEpochMillis,
+                untilEpochMillis = untilEpochMillis,
+                bidirectional = current.role == SyncRole.BIDIRECTIONAL,
+                dryRun = true,
+                onLog = ::streamLog,
+                onProgress = {},
+                onItem = countDownload
+            )
+        } else EngineResult(true, "无需统计下载量")
+        if (!pullResult.success) return PlannedTransfer(result = pullResult)
+
+        val pushResult = if (current.role != SyncRole.RECEIVE_ONLY) {
+            engine.push(
+                rsyncPath = rsyncPath,
+                host = endpoint.host,
+                port = endpoint.port,
+                sourcePath = current.sourcePath,
+                secret = endpoint.secret,
+                rangeMode = current.rangeMode,
+                sinceEpochMillis = current.sinceEpochMillis,
+                untilEpochMillis = untilEpochMillis,
+                bidirectional = current.role == SyncRole.BIDIRECTIONAL,
+                dryRun = true,
+                onLog = ::streamLog,
+                onProgress = {},
+                onItem = countUpload
+            )
+        } else EngineResult(true, "无需统计上传量")
+        if (!pushResult.success) return PlannedTransfer(result = pushResult)
+        appendLog("INFO", "同步总量统计完成：上传 ${formatBytes(uploadBytes)}，下载 ${formatBytes(downloadBytes)}")
+        return PlannedTransfer(uploadBytes, downloadBytes)
+    }
+
+    private fun safeAddBytes(current: Long, increment: Long): Long {
+        val safeIncrement = increment.coerceAtLeast(0L)
+        return if (Long.MAX_VALUE - current < safeIncrement) Long.MAX_VALUE else current + safeIncrement
+    }
+
     private fun updateTransferItem(
         item: RsyncItem,
         dryRun: Boolean,
@@ -1223,19 +1369,20 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun updateTransferProgress(
         progress: Float,
-        startedAtMillis: Long,
         dryRun: Boolean,
         action: String
     ) {
         val normalized = progress.coerceIn(0f, 1f)
-        val eta = if (dryRun) null else estimateCompletion(startedAtMillis, normalized)
         _state.update { state ->
+            val byteProgress = if (!dryRun && state.totalSyncBytes > 0L) {
+                ((state.uploadedBytes + state.downloadedBytes).toDouble() / state.totalSyncBytes)
+                    .toFloat().coerceIn(0f, 1f)
+            } else normalized
             state.copy(
-                progress = normalized,
-                estimatedCompletionTime = eta,
+                progress = byteProgress,
                 transferRecord = state.transferRecord?.let { record ->
                     if (dryRun) record else record.copy(
-                        progress = normalized,
+                        progress = byteProgress,
                         updatedAtMillis = System.currentTimeMillis(),
                         message = state.currentTransferFolder?.let { "正在处理 $it" } ?: "正在传输"
                     )
@@ -1251,22 +1398,125 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 updateTransferNotification(
                     action,
                     state.currentTransferFolder?.let { "正在处理：$it" } ?: "正在传输文件",
-                    eta,
-                    normalized
+                    state.estimatedCompletionTime,
+                    state.progress
                 )
             }
         }
     }
 
-    private fun estimateCompletion(startedAtMillis: Long, progress: Float): String? {
-        if (progress < 0.01f || progress >= 1f) return if (progress >= 1f) "已完成" else null
-        val elapsedMillis = (System.currentTimeMillis() - startedAtMillis).coerceAtLeast(1_000L)
-        val remainingSeconds = ((elapsedMillis / 1000.0) * (1.0 - progress) / progress)
-            .toLong().coerceAtLeast(1L)
-        if (remainingSeconds > 30L * 24L * 60L * 60L) return null
-        val finish = LocalDateTime.now().plusSeconds(remainingSeconds)
-            .format(DateTimeFormatter.ofPattern("MM-dd HH:mm:ss"))
-        return "预计 $finish 完成（剩余 ${formatDuration(remainingSeconds)}）"
+    private fun resetTransferSpeedTracking() {
+        synchronized(transferSpeedSamples) {
+            transferSpeedSamples.clear()
+            val now = System.currentTimeMillis()
+            val state = _state.value
+            transferSpeedSamples.addLast(
+                TransferSpeedSample(now, safeAddBytes(state.uploadedBytes, state.downloadedBytes))
+            )
+        }
+    }
+
+    private fun updateTransferBytes(upload: Boolean, bytes: Long, action: String) {
+        val safeBytes = bytes.coerceAtLeast(0L)
+        _state.update { state ->
+            val uploaded = if (upload) maxOf(state.uploadedBytes, safeBytes) else state.uploadedBytes
+            val downloaded = if (upload) state.downloadedBytes else maxOf(state.downloadedBytes, safeBytes)
+            val done = safeAddBytes(uploaded, downloaded)
+            val progress = if (state.totalSyncBytes > 0L) {
+                (done.toDouble() / state.totalSyncBytes).toFloat().coerceIn(0f, 1f)
+            } else state.progress
+            state.copy(
+                uploadedBytes = uploaded,
+                downloadedBytes = downloaded,
+                progress = progress,
+                transferRecord = state.transferRecord?.let { record ->
+                    record.copy(
+                        progress = progress ?: record.progress,
+                        updatedAtMillis = System.currentTimeMillis(),
+                        message = state.currentTransferFolder?.let { "正在处理 $it" } ?: "正在传输"
+                    )
+                }
+            )
+        }
+
+        val now = System.currentTimeMillis()
+        val snapshot = _state.value
+        val done = safeAddBytes(snapshot.uploadedBytes, snapshot.downloadedBytes)
+        synchronized(transferSpeedSamples) {
+            transferSpeedSamples.addLast(TransferSpeedSample(now, done))
+            val cutoff = now - ETA_SAMPLE_WINDOW_MS
+            while (transferSpeedSamples.size > 2 && transferSpeedSamples.elementAt(1).timeMillis <= cutoff) {
+                transferSpeedSamples.removeFirst()
+            }
+        }
+        val notificationState = _state.value
+        val notificationNow = System.currentTimeMillis()
+        if (notificationNow - lastTransferPersistMillis >= 1_000L) {
+            lastTransferPersistMillis = notificationNow
+            persistTransferRecord()
+            updateTransferNotification(
+                action,
+                "已上传 ${formatBytes(notificationState.uploadedBytes)} · 已下载 ${formatBytes(notificationState.downloadedBytes)}",
+                notificationState.estimatedCompletionTime,
+                notificationState.progress
+            )
+        }
+    }
+
+    private fun refreshTransferEta(action: String) {
+        val now = System.currentTimeMillis()
+        val snapshot = _state.value
+        val done = safeAddBytes(snapshot.uploadedBytes, snapshot.downloadedBytes)
+        val speed: Long
+        synchronized(transferSpeedSamples) {
+            transferSpeedSamples.addLast(TransferSpeedSample(now, done))
+            val cutoff = now - ETA_SAMPLE_WINDOW_MS
+            while (transferSpeedSamples.size > 2 && transferSpeedSamples.elementAt(1).timeMillis <= cutoff) {
+                transferSpeedSamples.removeFirst()
+            }
+            val first = transferSpeedSamples.firstOrNull()
+            val last = transferSpeedSamples.lastOrNull()
+            val elapsedMillis = if (first != null && last != null) last.timeMillis - first.timeMillis else 0L
+            val deltaBytes = if (first != null && last != null) {
+                (last.totalBytes - first.totalBytes).coerceAtLeast(0L)
+            } else 0L
+            speed = if (elapsedMillis > 0L) {
+                (deltaBytes.toDouble() * 1_000.0 / elapsedMillis).toLong().coerceAtLeast(0L)
+            } else 0L
+        }
+        val remaining = (snapshot.totalSyncBytes - done).coerceAtLeast(0L)
+        val eta = when {
+            remaining == 0L -> "已完成"
+            speed <= 0L -> "近 10 秒无有效传输，暂无法估算剩余时间"
+            else -> {
+                val remainingSeconds = kotlin.math.ceil(remaining.toDouble() / speed.toDouble())
+                    .toLong().coerceAtLeast(1L)
+                "预计还需 ${formatDuration(remainingSeconds)}（近 10 秒 ${formatBytes(speed)}/s）"
+            }
+        }
+        _state.update {
+            it.copy(estimatedCompletionTime = eta, transferSpeedBytesPerSecond = speed)
+        }
+        val state = _state.value
+        updateTransferNotification(
+            action,
+            "已上传 ${formatBytes(state.uploadedBytes)} · 已下载 ${formatBytes(state.downloadedBytes)}",
+            eta,
+            state.progress
+        )
+    }
+
+    private fun formatBytes(bytes: Long): String {
+        val value = bytes.coerceAtLeast(0L).toDouble()
+        val units = arrayOf("B", "KB", "MB", "GB", "TB", "PB")
+        var scaled = value
+        var unitIndex = 0
+        while (scaled >= 1024.0 && unitIndex < units.lastIndex) {
+            scaled /= 1024.0
+            unitIndex += 1
+        }
+        return if (unitIndex == 0) "${scaled.toLong()} ${units[unitIndex]}"
+        else String.format(java.util.Locale.US, "%.2f %s", scaled, units[unitIndex])
     }
 
     private fun formatDuration(seconds: Long): String = when {
@@ -1630,7 +1880,16 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         const val PROFILE_PRESENCE_INTERVAL_MS = 15_000L
         const val PROFILE_ONLINE_TTL_MS = 45_000L
         const val PROFILE_PRESENCE_RESPONSE_MS = 800L
+        const val REMOTE_ITEM_THROTTLE_MS = 150L
+        const val ETA_SAMPLE_WINDOW_MS = 10_000L
+        const val ETA_UPDATE_INTERVAL_MS = 10_000L
     }
 
     private data class RemoteEndpoint(val host: String, val port: Int, val secret: String)
+    private data class PlannedTransfer(
+        val uploadBytes: Long = 0L,
+        val downloadBytes: Long = 0L,
+        val result: EngineResult = EngineResult(true, "同步总量统计完成")
+    )
+    private data class TransferSpeedSample(val timeMillis: Long, val totalBytes: Long)
 }

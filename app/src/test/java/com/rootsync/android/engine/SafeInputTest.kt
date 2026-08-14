@@ -123,10 +123,24 @@ class SafeInputTest {
     @Test
     fun parsesItemWhenRsyncPrefixesTheDiagnosticLine() {
         val item = RsyncOutputParser.parseItem(
-            "rsync: info: ROOTSYNC_ITEM:>f.st......|season/episode/video.m4s"
+            "rsync: info: ROOTSYNC_ITEM:>f.st......|season/episode/video.m4s|1048576"
         )
         assertEquals("season/episode/video.m4s", item?.relativePath)
         assertEquals("season/episode", item?.folder)
+        assertEquals(1_048_576L, item?.sizeBytes)
+    }
+
+    @Test
+    fun parsesHumanReadableTransferredBytes() {
+        assertEquals(
+            12_582_912L,
+            RsyncOutputParser.parseTransferredBytes("  12.00M  25%   4.00MB/s    0:00:03")
+        )
+        assertEquals(
+            1_024L,
+            RsyncOutputParser.parseTransferredBytes("1,024  50%   1.00kB/s    0:00:01")
+        )
+        assertNull(RsyncOutputParser.parseTransferredBytes("ROOTSYNC_ITEM:>f+++++++++|a|10"))
     }
 
     @Test

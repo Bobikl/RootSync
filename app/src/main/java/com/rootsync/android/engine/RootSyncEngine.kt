@@ -452,7 +452,8 @@ class RootSyncEngine(private val context: Context) {
         dryRun: Boolean,
         onLog: (String) -> Unit,
         onProgress: (Float) -> Unit,
-        onItem: (RsyncItem) -> Unit
+        onItem: (RsyncItem) -> Unit,
+        onTransferredBytes: (Long) -> Unit = {}
     ): EngineResult = withContext(Dispatchers.IO) {
         if (!SafeInput.isValidIpv4(host)) return@withContext EngineResult(false, "请输入有效 IPv4 地址")
         SafeInput.validateStoragePath(destinationPath)?.let { return@withContext EngineResult(false, it) }
@@ -520,7 +521,7 @@ class RootSyncEngine(private val context: Context) {
             bidirectional = bidirectional,
             dryRun = dryRun
         )
-        val transfer = executeTransfer(command, onLog, onProgress, onItem)
+        val transfer = executeTransfer(command, onLog, onProgress, onItem, onTransferredBytes)
         if (transfer.exitCode != 0) {
             return@withContext EngineResult(
                 false,
@@ -568,7 +569,8 @@ class RootSyncEngine(private val context: Context) {
         dryRun: Boolean,
         onLog: (String) -> Unit,
         onProgress: (Float) -> Unit,
-        onItem: (RsyncItem) -> Unit
+        onItem: (RsyncItem) -> Unit,
+        onTransferredBytes: (Long) -> Unit = {}
     ): EngineResult = withContext(Dispatchers.IO) {
         if (!SafeInput.isValidIpv4(host)) return@withContext EngineResult(false, "请输入有效 IPv4 地址")
         SafeInput.validateStoragePath(sourcePath)?.let { return@withContext EngineResult(false, it) }
@@ -611,7 +613,7 @@ class RootSyncEngine(private val context: Context) {
             bidirectional = bidirectional,
             dryRun = dryRun
         )
-        val transfer = executeTransfer(command, onLog, onProgress, onItem)
+        val transfer = executeTransfer(command, onLog, onProgress, onItem, onTransferredBytes)
         if (transfer.exitCode != 0) {
             return@withContext EngineResult(
                 false,
@@ -687,7 +689,8 @@ class RootSyncEngine(private val context: Context) {
         command: String,
         onLog: (String) -> Unit,
         onProgress: (Float) -> Unit,
-        onItem: (RsyncItem) -> Unit
+        onItem: (RsyncItem) -> Unit,
+        onTransferredBytes: (Long) -> Unit
     ): CommandResult {
         var parsedItemCount = 0
         ensureLifecycleWatchdog(bundledRsyncPath, onLog)
@@ -708,6 +711,7 @@ class RootSyncEngine(private val context: Context) {
                 .find(line)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let {
                     onProgress(it.coerceIn(0, 100) / 100f)
                 }
+            RsyncOutputParser.parseTransferredBytes(line)?.let(onTransferredBytes)
         }
         onLog(
             "DIAG_TRANSFER_FINISH exit=${result.exitCode} outputLines=${result.output.size} " +

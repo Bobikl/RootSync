@@ -62,6 +62,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -511,6 +512,26 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
         AnimatedVisibility(state.isBusy || state.progress != null) {
             SectionCard(title = state.phase) {
                 if (state.progress != null) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        TransferAmount(
+                            label = "同步总量",
+                            value = if (state.totalSyncBytes > 0L) formatDataSize(state.totalSyncBytes) else "计算中",
+                            modifier = Modifier.weight(1f)
+                        )
+                        TransferAmount(
+                            label = "已上传",
+                            value = formatDataSize(state.uploadedBytes),
+                            modifier = Modifier.weight(1f)
+                        )
+                        TransferAmount(
+                            label = "已下载",
+                            value = formatDataSize(state.downloadedBytes),
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
                     LinearProgressIndicator(
                         progress = { state.progress.coerceIn(0f, 1f) },
                         modifier = Modifier.fillMaxWidth()
@@ -631,6 +652,46 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
 
         Spacer(Modifier.height(8.dp))
     }
+}
+
+@Composable
+private fun TransferAmount(label: String, value: String, modifier: Modifier = Modifier) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceContainerHighest,
+        shape = RoundedCornerShape(12.dp),
+        modifier = modifier
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 10.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                label,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center
+            )
+            Text(
+                value,
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+                textAlign = TextAlign.Center,
+                maxLines = 1
+            )
+        }
+    }
+}
+
+private fun formatDataSize(bytes: Long): String {
+    val units = arrayOf("B", "KB", "MB", "GB", "TB", "PB")
+    var value = bytes.coerceAtLeast(0L).toDouble()
+    var index = 0
+    while (value >= 1024.0 && index < units.lastIndex) {
+        value /= 1024.0
+        index += 1
+    }
+    return if (index == 0) "${value.toLong()} ${units[index]}"
+    else String.format(Locale.US, "%.2f %s", value, units[index])
 }
 
 @Composable

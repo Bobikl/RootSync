@@ -268,7 +268,8 @@ class LanDiscoveryManager(
         host: String,
         type: SyncActivityType,
         active: Boolean,
-        taskId: String
+        taskId: String,
+        totalItems: Int = 0
     ) =
         withContext(Dispatchers.IO) {
             start()
@@ -277,6 +278,7 @@ class LanDiscoveryManager(
                 .put("activity", type.name)
                 .put("active", active)
                 .put("taskId", taskId)
+                .put("totalItems", totalItems.coerceAtLeast(0))
             val address = InetAddress.getByName(host)
             repeat(2) { index ->
                 send(message, address)
@@ -284,7 +286,13 @@ class LanDiscoveryManager(
             }
         }
 
-    fun sendSyncItem(host: String, type: SyncActivityType, taskId: String, itemPath: String) {
+    fun sendSyncItem(
+        host: String,
+        type: SyncActivityType,
+        taskId: String,
+        itemPath: String,
+        itemIndex: Int
+    ) {
         if (itemPath.isBlank()) return
         start()
         scope.launch {
@@ -294,6 +302,7 @@ class LanDiscoveryManager(
                 .put("active", true)
                 .put("taskId", taskId)
                 .put("itemPath", itemPath.take(1200))
+                .put("itemIndex", itemIndex.coerceAtLeast(0))
             send(message, InetAddress.getByName(host))
         }
     }
@@ -671,7 +680,9 @@ class LanDiscoveryManager(
                             type = activity,
                             active = message.optBoolean("active", false),
                             taskId = message.optString("taskId"),
-                            itemPath = message.optString("itemPath").takeIf { it.isNotBlank() }
+                            itemPath = message.optString("itemPath").takeIf { it.isNotBlank() },
+                            itemIndex = message.optInt("itemIndex", 0).coerceAtLeast(0),
+                            totalItems = message.optInt("totalItems", 0).coerceAtLeast(0)
                         )
                     )
                 }
