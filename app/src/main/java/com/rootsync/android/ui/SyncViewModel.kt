@@ -37,6 +37,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.LocalTime
@@ -61,6 +62,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     private var lastTransferItemUiMillis = 0L
     private var remoteSessionDeviceId: String? = null
     private var remoteSessionStartedAtMillis = 0L
+    private val operationMutex = Mutex()
     private val discovery = LanDiscoveryManager(
         context = application,
         deviceId = deviceId,
@@ -196,7 +198,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun refreshCapabilities() {
-        viewModelScope.launch {
+        launchBusy("正在请求 ROOT 并检查能力") {
             _state.update { it.copy(isChecking = true, phase = "正在请求 ROOT 并检查能力") }
             appendLog("INFO", "开始 ROOT、内置 rsync 与目录检查")
             val before = _state.value
@@ -613,7 +615,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         if (profile.secret != request.secret) {
             appendLog("LAN", "${request.name} 的密钥发生变化，按已保存设备 ID 自动恢复信任")
         }
-        if (initial.isBusy || remoteSessionDeviceId != null) {
+        if (initial.isBusy || operationMutex.isLocked || remoteSessionDeviceId != null) {
             discovery.answerSyncPreparation(request, false, "远端设备正在执行其他任务", port)
             return
         }
@@ -1726,7 +1728,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             appendLog("WARN", "正在为远端设备提供同步服务，请等待当前任务结束")
             return
         }
-        if (_state.value.isBusy) return
+        if (_state.value.isBusy || !operationMutex.tryLock()) return
         viewModelScope.launch {
             _state.update { it.copy(isBusy = true, phase = phase) }
             try {
@@ -1743,6 +1745,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 }
             } finally {
                 _state.update { it.copy(isBusy = false) }
+                operationMutex.unlock()
             }
         }
     }
