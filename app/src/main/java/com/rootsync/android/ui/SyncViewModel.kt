@@ -57,6 +57,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     @Volatile private var pauseRequested = false
     @Volatile private var lastTransferPersistMillis = 0L
     private val transferSpeedSamples = ArrayDeque<TransferSpeedSample>()
+    private var localTransferItemCount = 0
+    private var lastTransferItemUiMillis = 0L
     private val discovery = LanDiscoveryManager(
         context = application,
         deviceId = deviceId,
@@ -961,6 +963,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         val action = current.role.label
         launchBusy(if (dryRun) "正在预览${action}差异" else "正在执行$action") {
             pauseRequested = false
+            localTransferItemCount = 0
+            lastTransferItemUiMillis = 0L
             val now = System.currentTimeMillis()
             val untilEpochMillis = now
             val activeRecord = if (dryRun) null else resumeRecord?.copy(
@@ -1043,7 +1047,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             val sendRemoteItem: (RsyncItem) -> Unit = { item ->
                 remoteItemCount += 1
                 val nowMillis = System.currentTimeMillis()
-                if (remoteItemCount == 1 || nowMillis - lastRemoteItemSentAtMillis >= REMOTE_ITEM_THROTTLE_MS) {
+                val throttleMillis = if (dryRun) REMOTE_PREVIEW_ITEM_THROTTLE_MS else TRANSFER_ITEM_REFRESH_MS
+                if (remoteItemCount == 1 || nowMillis - lastRemoteItemSentAtMillis >= throttleMillis) {
                     lastRemoteItemSentAtMillis = nowMillis
                     discovery.sendSyncItem(
                         endpoint.host,
@@ -1213,6 +1218,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     },
                     estimatedCompletionTime = if (!dryRun && result.success) "已完成" else it.estimatedCompletionTime,
                     isPreviewing = false,
+                    transferItemCount = maxOf(it.transferItemCount, localTransferItemCount),
                     transferRecord = if (!dryRun && record != null) {
                         record.copy(
                             status = if (result.success) TransferStatus.COMPLETED else TransferStatus.PAUSED,
@@ -1341,6 +1347,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         role: SyncRole,
         directionLabel: String? = null
     ) {
+        localTransferItemCount += 1
+        val now = System.currentTimeMillis()
+        val shouldRefresh = dryRun || localTransferItemCount == 1 ||
+            now - lastTransferItemUiMillis >= TRANSFER_ITEM_REFRESH_MS
+        if (!shouldRefresh) return
+        lastTransferItemUiMillis = now
         _state.update { state ->
             val prefix = directionLabel?.let { "$it · " }.orEmpty()
             val display = if (dryRun) {
@@ -1353,7 +1365,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             state.copy(
                 transferFolders = if (canAppend) state.transferFolders + display else state.transferFolders,
                 currentTransferFolder = item.relativePath,
-                transferItemCount = state.transferItemCount + 1,
+                transferItemCount = localTransferItemCount,
                 transferFoldersTruncated = state.transferFoldersTruncated || (!alreadyShown && !canAppend),
                 transferPanelTitle = transferPanelTitle(dryRun, role)
             )
@@ -1370,38 +1382,14 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     private fun updateTransferProgress(
         progress: Float,
         dryRun: Boolean,
-        action: String
+        @Suppress("UNUSED_PARAMETER") action: String
     ) {
+        if (!dryRun) return
         val normalized = progress.coerceIn(0f, 1f)
         _state.update { state ->
-            val byteProgress = if (!dryRun && state.totalSyncBytes > 0L) {
-                ((state.uploadedBytes + state.downloadedBytes).toDouble() / state.totalSyncBytes)
-                    .toFloat().coerceIn(0f, 1f)
-            } else normalized
             state.copy(
-                progress = byteProgress,
-                transferRecord = state.transferRecord?.let { record ->
-                    if (dryRun) record else record.copy(
-                        progress = byteProgress,
-                        updatedAtMillis = System.currentTimeMillis(),
-                        message = state.currentTransferFolder?.let { "正在处理 $it" } ?: "正在传输"
-                    )
-                }
+                progress = normalized
             )
-        }
-        if (!dryRun) {
-            val now = System.currentTimeMillis()
-            if (now - lastTransferPersistMillis >= 1_000L || normalized >= 1f) {
-                lastTransferPersistMillis = now
-                persistTransferRecord()
-                val state = _state.value
-                updateTransferNotification(
-                    action,
-                    state.currentTransferFolder?.let { "正在处理：$it" } ?: "正在传输文件",
-                    state.estimatedCompletionTime,
-                    state.progress
-                )
-            }
         }
     }
 
@@ -1544,6 +1532,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 isPreviewing = false,
                 phase = "传输已暂停",
                 lastResult = message,
+                transferItemCount = maxOf(state.transferItemCount, localTransferItemCount),
                 transferRecord = state.transferRecord?.copy(
                     status = TransferStatus.PAUSED,
                     updatedAtMillis = System.currentTimeMillis(),
@@ -1880,7 +1869,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         const val PROFILE_PRESENCE_INTERVAL_MS = 15_000L
         const val PROFILE_ONLINE_TTL_MS = 45_000L
         const val PROFILE_PRESENCE_RESPONSE_MS = 800L
-        const val REMOTE_ITEM_THROTTLE_MS = 150L
+        const val REMOTE_PREVIEW_ITEM_THROTTLE_MS = 150L
+        const val TRANSFER_ITEM_REFRESH_MS = 3_000L
         const val ETA_SAMPLE_WINDOW_MS = 10_000L
         const val ETA_UPDATE_INTERVAL_MS = 10_000L
     }

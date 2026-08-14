@@ -1,6 +1,7 @@
 package com.rootsync.android.ui
 
 import android.Manifest
+import android.app.Activity
 import android.app.DatePickerDialog
 import android.app.TimePickerDialog
 import android.content.ClipData
@@ -8,6 +9,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
+import android.view.WindowManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
@@ -51,6 +53,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -87,6 +90,19 @@ fun RootSyncApp(viewModel: SyncViewModel) {
     RootSyncTheme {
         val state by viewModel.state.collectAsStateWithLifecycle()
         var page by remember { mutableIntStateOf(0) }
+        val activity = LocalContext.current as? Activity
+
+        DisposableEffect(activity, state.isBusy, state.isPreviewing) {
+            val keepScreenOn = state.isBusy && !state.isPreviewing
+            if (keepScreenOn) {
+                activity?.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            } else {
+                activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
+            onDispose {
+                activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
+        }
 
         state.pendingPairRequest?.let { request ->
             AlertDialog(
@@ -512,13 +528,20 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
         AnimatedVisibility(state.isBusy || state.progress != null) {
             SectionCard(title = state.phase) {
                 if (state.progress != null) {
+                    val trafficProgress = state.progress.coerceIn(0f, 1f)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         TransferAmount(
                             label = "同步总量",
-                            value = if (state.totalSyncBytes > 0L) formatDataSize(state.totalSyncBytes) else "计算中",
+                            value = if (state.totalSyncBytes > 0L) {
+                                formatDataSize(state.totalSyncBytes)
+                            } else if (state.isBusy) {
+                                "计算中"
+                            } else {
+                                "0 B"
+                            },
                             modifier = Modifier.weight(1f)
                         )
                         TransferAmount(
@@ -533,10 +556,13 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                         )
                     }
                     LinearProgressIndicator(
-                        progress = { state.progress.coerceIn(0f, 1f) },
+                        progress = { trafficProgress },
                         modifier = Modifier.fillMaxWidth()
                     )
-                    Text("${(state.progress * 100).toInt()}%", style = MaterialTheme.typography.labelLarge)
+                    Text(
+                        "${(trafficProgress * 100).toInt()}%",
+                        style = MaterialTheme.typography.labelLarge
+                    )
                     state.estimatedCompletionTime?.let {
                         Text(
                             it,
@@ -611,7 +637,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
             }
         }
 
-        state.transferRecord?.let { record ->
+        state.transferRecord?.takeIf { it.status != TransferStatus.RUNNING }?.let { record ->
             SectionCard(
                 title = "传输记录 · ${record.status.label}",
                 subtitle = "${record.peerName} · ${record.role.label}",
