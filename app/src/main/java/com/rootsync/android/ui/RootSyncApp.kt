@@ -1,7 +1,6 @@
 package com.rootsync.android.ui
 
 import android.Manifest
-import android.app.Activity
 import android.app.DatePickerDialog
 import android.app.TimePickerDialog
 import android.content.ClipData
@@ -10,6 +9,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.view.WindowManager
+import androidx.activity.compose.LocalActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
@@ -90,10 +90,15 @@ fun RootSyncApp(viewModel: SyncViewModel) {
     RootSyncTheme {
         val state by viewModel.state.collectAsStateWithLifecycle()
         var page by remember { mutableIntStateOf(0) }
-        val activity = LocalContext.current as? Activity
+        val activity = LocalActivity.current
 
-        DisposableEffect(activity, state.isBusy, state.isPreviewing) {
-            val keepScreenOn = state.isBusy && !state.isPreviewing
+        DisposableEffect(activity, state.isBusy, state.isPreviewing, state.remoteActivity) {
+            val localTransferRunning = state.isBusy && !state.isPreviewing &&
+                state.transferRecord?.status == TransferStatus.RUNNING
+            val remoteTransferRunning = state.remoteActivity?.let { remote ->
+                !remote.finished && remote.type == SyncActivityType.TRANSFER
+            } == true
+            val keepScreenOn = localTransferRunning || remoteTransferRunning
             if (keepScreenOn) {
                 activity?.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             } else {
