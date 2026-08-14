@@ -224,6 +224,7 @@ data class SyncUiState(
     val transferItemCount: Int = 0,
     val transferFoldersTruncated: Boolean = false,
     val transferRecord: TransferRecord? = null,
+    val transferRecords: List<TransferRecord> = emptyList(),
     val previewReady: Boolean = false,
     val previewStatusText: String? = null,
     val remoteActivity: RemoteSyncActivity? = null,

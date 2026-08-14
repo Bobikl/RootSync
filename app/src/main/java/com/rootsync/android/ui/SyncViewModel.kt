@@ -171,6 +171,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         val resolvedRole = selected?.role ?: fallbackRole
         val resolvedSource = selected?.sourcePath ?: storedSource
         val resolvedDestination = selected?.destinationPath ?: storedDestination
+        val legacyRecord = decodeTransferRecord(preferences.getString("transferRecord", null))
+        val storedRecords = decodeTransferRecords(preferences.getString("transferRecords", null))
+        val transferRecords = legacyRecord?.let { mergeTransferRecord(storedRecords, it) } ?: storedRecords
+        val selectedRecord = selected?.let { profile ->
+            transferRecords.filter { recordMatchesProfile(it, profile) }.maxByOrNull { it.updatedAtMillis }
+        } ?: legacyRecord
         return SyncUiState(
             deviceName = deviceName,
             profileName = selected?.name ?: preferences.getString("profileName", "手动设备").orEmpty(),
@@ -192,7 +198,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             sinceEpochMillis = selected?.sinceEpochMillis ?: fallbackSince,
             profiles = profiles,
             selectedProfileId = selected?.id,
-            transferRecord = decodeTransferRecord(preferences.getString("transferRecord", null)),
+            transferRecord = selectedRecord,
+            transferRecords = transferRecords,
             localIp = engine.localIpv4()
         )
     }
@@ -347,6 +354,9 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     fun selectProfile(id: String) {
         val profile = _state.value.profiles.firstOrNull { it.id == id } ?: return
         _state.update {
+            val profileRecord = it.transferRecords
+                .filter { record -> recordMatchesProfile(record, profile) }
+                .maxByOrNull { record -> record.updatedAtMillis }
             it.copy(
                 selectedProfileId = profile.id,
                 profileName = profile.name,
@@ -360,6 +370,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 destinationPath = if (profile.role == SyncRole.BIDIRECTIONAL) {
                     profile.sourcePath
                 } else profile.destinationPath,
+                transferRecord = profileRecord,
                 previewReady = false,
                 lastResult = "已切换到 ${profile.name}"
             )
@@ -377,6 +388,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 role = SyncRole.RECEIVE_ONLY,
                 rangeMode = SyncRangeMode.ALL,
                 sinceEpochMillis = null,
+                transferRecord = null,
                 previewReady = false,
                 lastResult = null
             )
@@ -399,6 +411,9 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 remoteSecret = "",
                 previewReady = false,
                 transferRecord = if (removesTransfer) null else it.transferRecord,
+                transferRecords = it.transferRecords.filterNot { record ->
+                    record.profileId == removed.id || record.deviceId == removed.deviceId
+                },
                 lastResult = "已删除 ${removed.name}"
             )
         }
@@ -495,6 +510,9 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             } else current.destinationPath
         )
         _state.update {
+            val profileRecord = it.transferRecords
+                .filter { record -> recordMatchesProfile(record, profile) }
+                .maxByOrNull { record -> record.updatedAtMillis }
             it.copy(
                 profiles = it.profiles.filterNot { item -> item.deviceId == device.deviceId } + profile,
                 selectedProfileId = profile.id,
@@ -507,6 +525,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 sinceEpochMillis = profile.sinceEpochMillis,
                 sourcePath = profile.sourcePath,
                 destinationPath = profile.destinationPath,
+                transferRecord = profileRecord,
                 previewReady = false
             )
         }
@@ -900,13 +919,20 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             putString("selectedProfileId", value.selectedProfileId)
             value.transferRecord?.let { putString("transferRecord", encodeTransferRecord(it)) }
                 ?: remove("transferRecord")
+            putString("transferRecords", encodeTransferRecords(value.transferRecords))
         }
     }
 
     private fun persistTransferRecord() {
+        val current = _state.value
+        val records = current.transferRecord?.let {
+            mergeTransferRecord(current.transferRecords, it)
+        } ?: current.transferRecords
+        _state.update { it.copy(transferRecords = records) }
         preferences.edit {
-            _state.value.transferRecord?.let { putString("transferRecord", encodeTransferRecord(it)) }
+            current.transferRecord?.let { putString("transferRecord", encodeTransferRecord(it)) }
                 ?: remove("transferRecord")
+            putString("transferRecords", encodeTransferRecords(records))
         }
     }
 
@@ -1050,6 +1076,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 sourcePath = current.sourcePath,
                 destinationPath = current.destinationPath,
                 status = TransferStatus.RUNNING,
+                progress = 0f,
                 updatedAtMillis = now,
                 message = "正在继续传输"
             ) ?: TransferRecord(
@@ -1070,7 +1097,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             )
             _state.update {
                 it.copy(
-                    progress = if (dryRun) null else activeRecord?.progress ?: 0f,
+                    progress = if (dryRun) null else 0f,
                     estimatedCompletionTime = if (dryRun) null else "正在统计同步总量…",
                     totalSyncBytes = 0L,
                     uploadedBytes = 0L,
@@ -1351,8 +1378,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     fun deleteTransferRecord() {
         if (_state.value.isBusy) return
         _state.update {
+            val removedId = it.transferRecord?.id
             it.copy(
                 transferRecord = null,
+                transferRecords = if (removedId == null) it.transferRecords else {
+                    it.transferRecords.filterNot { record -> record.id == removedId }
+                },
                 progress = null,
                 estimatedCompletionTime = null,
                 lastResult = "传输记录已删除；已下载的分片和用户文件未删除"
@@ -1907,6 +1938,37 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         put("message", record.message)
     }.toString()
 
+    private fun encodeTransferRecords(records: List<TransferRecord>): String = JSONArray().apply {
+        records.sortedByDescending { it.updatedAtMillis }.take(MAX_TRANSFER_RECORDS).forEach { record ->
+            put(JSONObject(encodeTransferRecord(record)))
+        }
+    }.toString()
+
+    private fun decodeTransferRecords(raw: String?): List<TransferRecord> {
+        if (raw.isNullOrBlank()) return emptyList()
+        return runCatching {
+            val array = JSONArray(raw)
+            buildList {
+                for (index in 0 until array.length()) {
+                    decodeTransferRecord(array.getJSONObject(index).toString())?.let(::add)
+                }
+            }
+        }.getOrElse { emptyList() }
+    }
+
+    private fun recordMatchesProfile(record: TransferRecord, profile: PeerProfile): Boolean =
+        record.profileId == profile.id ||
+            (!record.deviceId.isNullOrBlank() && record.deviceId == profile.deviceId)
+
+    private fun mergeTransferRecord(
+        records: List<TransferRecord>,
+        record: TransferRecord
+    ): List<TransferRecord> = (records.filterNot { existing ->
+        existing.id == record.id ||
+            (record.profileId != null && existing.profileId == record.profileId) ||
+            (record.deviceId != null && existing.deviceId == record.deviceId)
+    } + record).sortedByDescending { it.updatedAtMillis }.take(MAX_TRANSFER_RECORDS)
+
     private fun decodeTransferRecord(raw: String?): TransferRecord? {
         if (raw.isNullOrBlank()) return null
         return runCatching {
@@ -1965,6 +2027,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         const val TRANSFER_ITEM_REFRESH_MS = 3_000L
         const val ETA_SAMPLE_WINDOW_MS = 10_000L
         const val ETA_UPDATE_INTERVAL_MS = 10_000L
+        const val MAX_TRANSFER_RECORDS = 32
     }
 
     private data class RemoteEndpoint(val host: String, val port: Int, val secret: String)
