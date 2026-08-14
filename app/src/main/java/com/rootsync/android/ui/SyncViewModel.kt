@@ -59,6 +59,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     private val transferSpeedSamples = ArrayDeque<TransferSpeedSample>()
     private var localTransferItemCount = 0
     private var lastTransferItemUiMillis = 0L
+    private var remoteSessionDeviceId: String? = null
+    private var remoteSessionStartedAtMillis = 0L
     private val discovery = LanDiscoveryManager(
         context = application,
         deviceId = deviceId,
@@ -611,10 +613,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         if (profile.secret != request.secret) {
             appendLog("LAN", "${request.name} 的密钥发生变化，按已保存设备 ID 自动恢复信任")
         }
-        if (initial.isBusy) {
+        if (initial.isBusy || remoteSessionDeviceId != null) {
             discovery.answerSyncPreparation(request, false, "远端设备正在执行其他任务", port)
             return
         }
+        remoteSessionDeviceId = request.deviceId
+        remoteSessionStartedAtMillis = System.currentTimeMillis()
 
         applyRemoteStrategy(
             StrategyUpdate(
@@ -631,6 +635,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         val activeProfile = _state.value.profiles.first { it.deviceId == request.deviceId }
         val rsync = _state.value.capabilities.rsyncPath
         if (rsync == null) {
+            releaseRemoteSession(request.deviceId, "远端 ROOT/rsync 能力尚未就绪")
             discovery.answerSyncPreparation(request, false, "远端 ROOT/rsync 能力尚未就绪", port)
             return
         }
@@ -654,18 +659,18 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 false,
                 error.message ?: error::class.java.simpleName
             )
-        } finally {
-            _state.update { it.copy(isBusy = false) }
         }
         _state.update {
             it.copy(
                 serverRunning = result.success,
+                isBusy = result.success,
                 phase = result.summary,
                 lastResult = result.summary
             )
         }
         appendLog(if (result.success) "OK" else "ERROR", "${request.name}：${result.summary}")
         if (!result.success) clearRemoteActivity(request.deviceId)
+        else scheduleRemoteSessionStartTimeout(request.deviceId, remoteSessionStartedAtMillis)
         discovery.answerSyncPreparation(request, result.success, result.summary, port)
     }
 
@@ -684,6 +689,9 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 update.taskId
             )
             updateRemoteTransferItem(update.type, update.itemPath, update.itemIndex)
+            if (update.type == SyncActivityType.TRANSFER) {
+                updateIncomingTransferNotification(update.name.ifBlank { profile.name }, update.itemPath)
+            }
             return
         }
         if (update.active) {
@@ -701,6 +709,9 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     "${update.name} 正在执行同步"
                 }
             )
+            if (update.type == SyncActivityType.TRANSFER) {
+                updateIncomingTransferNotification(update.name.ifBlank { profile.name }, null)
+            }
         } else {
             finishRemoteActivity(update.deviceId, update.type, update.taskId, update.totalItems)
         }
@@ -717,9 +728,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             (taskId.isBlank() || current.taskId == taskId)
         ) return
         val activity = RemoteSyncActivity(deviceId = deviceId, name = name, type = type, taskId = taskId)
+        remoteSessionDeviceId = deviceId
+        remoteSessionStartedAtMillis = activity.startedAtMillis
         _state.update {
             it.copy(
                 remoteActivity = activity,
+                isBusy = true,
                 transferPanelTitle = if (type == SyncActivityType.PREVIEW) {
                     "对方差异扫描文件与目录"
                 } else {
@@ -733,17 +747,23 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         }
         viewModelScope.launch {
             delay(REMOTE_ACTIVITY_TIMEOUT_MS)
+            var expired = false
             _state.update { state ->
                 if (state.remoteActivity?.startedAtMillis == activity.startedAtMillis) {
-                    state.copy(remoteActivity = null)
+                    expired = true
+                    state.copy(remoteActivity = null, isBusy = false)
                 } else state
             }
+            if (expired) releaseRemoteSession(deviceId, "远端任务状态超时")
         }
     }
 
     private fun clearRemoteActivity(deviceId: String) {
+        releaseRemoteSession(deviceId, "远端任务已清理")
         _state.update { state ->
-            if (state.remoteActivity?.deviceId == deviceId) state.copy(remoteActivity = null) else state
+            if (state.remoteActivity?.deviceId == deviceId) {
+                state.copy(remoteActivity = null, isBusy = false)
+            } else state
         }
     }
 
@@ -763,11 +783,13 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 matched = true
                 state.copy(
                     remoteActivity = activity.copy(finished = true, startedAtMillis = finishedAt),
-                    transferItemCount = maxOf(state.transferItemCount, totalItems)
+                    transferItemCount = maxOf(state.transferItemCount, totalItems),
+                    isBusy = false
                 )
             } else state
         }
         if (!matched) return
+        releaseRemoteSession(deviceId, "远端任务已结束")
         appendLog(
             "LAN",
             if (type == SyncActivityType.PREVIEW) "对方差异扫描已结束" else "对方同步任务已结束"
@@ -805,6 +827,38 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 transferFoldersTruncated = state.transferFoldersTruncated ||
                     (display !in state.transferFolders && !canAppend)
             )
+        }
+    }
+
+    private fun updateIncomingTransferNotification(peerName: String, itemPath: String?) {
+        TransferForegroundService.update(
+            context = getApplication(),
+            title = "RootSync 正在接收 $peerName 的同步",
+            detail = itemPath?.let { "正在接收：$it" } ?: "远端设备正在传输文件",
+            eta = null,
+            progress = null,
+            incoming = true
+        )
+    }
+
+    private fun releaseRemoteSession(deviceId: String, reason: String) {
+        if (remoteSessionDeviceId != deviceId) return
+        remoteSessionDeviceId = null
+        remoteSessionStartedAtMillis = 0L
+        TransferForegroundService.stop(getApplication())
+        appendLog("LAN", reason)
+    }
+
+    private fun scheduleRemoteSessionStartTimeout(deviceId: String, startedAtMillis: Long) {
+        viewModelScope.launch {
+            delay(REMOTE_SESSION_START_TIMEOUT_MS)
+            if (remoteSessionDeviceId == deviceId &&
+                remoteSessionStartedAtMillis == startedAtMillis &&
+                _state.value.remoteActivity?.deviceId != deviceId
+            ) {
+                releaseRemoteSession(deviceId, "远端未在限定时间内开始任务，已释放服务会话")
+                _state.update { it.copy(isBusy = false, phase = "远端任务未开始") }
+            }
         }
     }
 
@@ -1668,6 +1722,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     fun diagnosticLogPath(): String = diagnosticLogger.pathDescription()
 
     private fun launchBusy(phase: String, block: suspend () -> Unit) {
+        if (remoteSessionDeviceId != null) {
+            appendLog("WARN", "正在为远端设备提供同步服务，请等待当前任务结束")
+            return
+        }
         if (_state.value.isBusy) return
         viewModelScope.launch {
             _state.update { it.copy(isBusy = true, phase = phase) }
@@ -1865,6 +1923,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         const val DEFAULT_RANGE_MILLIS = 24L * 60L * 60L * 1000L
         const val REMOTE_ACTIVITY_TIMEOUT_MS = 15L * 60L * 1000L
         const val REMOTE_ACTIVITY_FINISHED_HOLD_MS = 8_000L
+        const val REMOTE_SESSION_START_TIMEOUT_MS = 2L * 60L * 1000L
         const val RSYNC_PROBE_RELEASE_DELAY_MS = 1_000L
         const val PROFILE_PRESENCE_INTERVAL_MS = 15_000L
         const val PROFILE_ONLINE_TTL_MS = 45_000L

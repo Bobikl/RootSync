@@ -29,6 +29,7 @@ class TransferForegroundService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
+    private var incomingTransfer = false
 
     override fun onCreate() {
         super.onCreate()
@@ -43,6 +44,7 @@ class TransferForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        incomingTransfer = intent?.getBooleanExtra(EXTRA_INCOMING, false) ?: incomingTransfer
         val notification = buildNotification(
             title = intent?.getStringExtra(EXTRA_TITLE) ?: "RootSync 正在传输",
             detail = intent?.getStringExtra(EXTRA_DETAIL) ?: "正在保持后台网络传输",
@@ -73,7 +75,9 @@ class TransferForegroundService : Service() {
 
     override fun onTimeout(startId: Int, fgsType: Int) {
         serviceScope.launch {
-            markTransferPaused("系统后台传输时限到达，已自动暂停，可重新打开后继续")
+            if (!incomingTransfer) {
+                markTransferPaused("系统后台传输时限到达，已自动暂停，可重新打开后继续")
+            }
             withTimeoutOrNull(2_000L) {
                 RootSyncEngine(applicationContext).pauseTransfer()
             }
@@ -83,7 +87,9 @@ class TransferForegroundService : Service() {
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         serviceScope.launch {
-            markTransferPaused("应用任务已被移除，底层 rsync 已终止，可重新打开后继续")
+            if (!incomingTransfer) {
+                markTransferPaused("应用任务已被移除，底层 rsync 已终止，可重新打开后继续")
+            }
             withTimeoutOrNull(4_000L) {
                 RootSyncEngine(applicationContext).cleanupStaleRuntimeProcesses {}
             }
@@ -158,6 +164,7 @@ class TransferForegroundService : Service() {
         private const val EXTRA_DETAIL = "detail"
         private const val EXTRA_ETA = "eta"
         private const val EXTRA_PROGRESS = "progress"
+        private const val EXTRA_INCOMING = "incoming"
         private const val MAX_WAKE_LOCK_MILLIS = 6L * 60L * 60L * 1_000L
 
         fun update(
@@ -165,7 +172,8 @@ class TransferForegroundService : Service() {
             title: String,
             detail: String,
             eta: String?,
-            progress: Float?
+            progress: Float?,
+            incoming: Boolean = false
         ) {
             val intent = Intent(context, TransferForegroundService::class.java)
                 .setAction(ACTION_UPDATE)
@@ -173,6 +181,7 @@ class TransferForegroundService : Service() {
                 .putExtra(EXTRA_DETAIL, detail)
                 .putExtra(EXTRA_ETA, eta)
                 .putExtra(EXTRA_PROGRESS, progress?.times(100)?.toInt() ?: -1)
+                .putExtra(EXTRA_INCOMING, incoming)
             ContextCompat.startForegroundService(context, intent)
         }
 
