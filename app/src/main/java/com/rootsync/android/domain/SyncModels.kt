@@ -150,6 +150,7 @@ data class RemoteSyncActivity(
     val type: SyncActivityType,
     val taskId: String = "",
     val startedAtMillis: Long = System.currentTimeMillis(),
+    val lastSeenAtMillis: Long = System.currentTimeMillis(),
     val finished: Boolean = false
 )
 

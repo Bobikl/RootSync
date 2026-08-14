@@ -728,7 +728,14 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         val current = _state.value.remoteActivity
         if (current?.deviceId == deviceId && current.type == type && !current.finished &&
             (taskId.isBlank() || current.taskId == taskId)
-        ) return
+        ) {
+            _state.update { state ->
+                if (state.remoteActivity?.startedAtMillis == current.startedAtMillis) {
+                    state.copy(remoteActivity = current.copy(lastSeenAtMillis = System.currentTimeMillis()))
+                } else state
+            }
+            return
+        }
         val activity = RemoteSyncActivity(deviceId = deviceId, name = name, type = type, taskId = taskId)
         remoteSessionDeviceId = deviceId
         remoteSessionStartedAtMillis = activity.startedAtMillis
@@ -748,15 +755,25 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         viewModelScope.launch {
-            delay(REMOTE_ACTIVITY_TIMEOUT_MS)
-            var expired = false
-            _state.update { state ->
-                if (state.remoteActivity?.startedAtMillis == activity.startedAtMillis) {
-                    expired = true
-                    state.copy(remoteActivity = null, isBusy = false)
-                } else state
+            while (true) {
+                val currentActivity = _state.value.remoteActivity
+                if (currentActivity?.startedAtMillis != activity.startedAtMillis || currentActivity.finished) return@launch
+                val idleMillis = System.currentTimeMillis() - currentActivity.lastSeenAtMillis
+                val remaining = REMOTE_ACTIVITY_TIMEOUT_MS - idleMillis
+                if (remaining > 0L) {
+                    delay(remaining)
+                    continue
+                }
+                var expired = false
+                _state.update { state ->
+                    if (state.remoteActivity?.startedAtMillis == activity.startedAtMillis) {
+                        expired = true
+                        state.copy(remoteActivity = null, isBusy = false)
+                    } else state
+                }
+                if (expired) releaseRemoteSession(deviceId, "远端任务长时间无心跳，已释放会话")
+                return@launch
             }
-            if (expired) releaseRemoteSession(deviceId, "远端任务状态超时")
         }
     }
 
@@ -1143,6 +1160,17 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
             } else null
+            val remoteHeartbeatJob = viewModelScope.launch {
+                while (isActive) {
+                    delay(REMOTE_ACTIVITY_HEARTBEAT_MS)
+                    discovery.sendSyncActivity(
+                        endpoint.host,
+                        remoteActivityType,
+                        active = true,
+                        taskId = remoteTaskId
+                    )
+                }
+            }
             val result = try {
                 if (!planned.result.success) planned.result else when (current.role) {
                 SyncRole.SEND_ONLY -> engine.push(
@@ -1250,6 +1278,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 }
             } finally {
                 etaJob?.cancel()
+                remoteHeartbeatJob.cancel()
                 discovery.sendSyncActivity(
                     endpoint.host,
                     remoteActivityType,
@@ -1925,6 +1954,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         const val MAX_VISIBLE_TRANSFER_FOLDERS = 400
         const val DEFAULT_RANGE_MILLIS = 24L * 60L * 60L * 1000L
         const val REMOTE_ACTIVITY_TIMEOUT_MS = 15L * 60L * 1000L
+        const val REMOTE_ACTIVITY_HEARTBEAT_MS = 30_000L
         const val REMOTE_ACTIVITY_FINISHED_HOLD_MS = 8_000L
         const val REMOTE_SESSION_START_TIMEOUT_MS = 2L * 60L * 1000L
         const val RSYNC_PROBE_RELEASE_DELAY_MS = 1_000L
