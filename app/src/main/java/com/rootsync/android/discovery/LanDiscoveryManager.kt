@@ -71,6 +71,9 @@ class LanDiscoveryManager(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val outgoingPairRequests = ConcurrentHashMap<String, PairIntent>()
     private val trustedReconnectRequests = ConcurrentHashMap<String, String>()
+    private val requestCreatedTimes = ConcurrentHashMap<String, Long>()
+    private val seenIncomingRequests = ConcurrentHashMap<String, Long>()
+    private val cachedResponses = ConcurrentHashMap<String, CachedResponse>()
     private val trustedReconnectTimes = ConcurrentHashMap<String, Long>()
     private val prepareWaiters = ConcurrentHashMap<String, CompletableDeferred<SyncPrepareResult>>()
     private val resolveQueue = ConcurrentLinkedQueue<NsdServiceInfo>()
@@ -129,6 +132,7 @@ class LanDiscoveryManager(
 
     fun scan() {
         start()
+        cleanupExpiredRequests()
         _devices.update { devices ->
             val cutoff = System.currentTimeMillis() - DEVICE_TTL_MS
             devices.filter { it.lastSeenMillis >= cutoff }
@@ -154,6 +158,7 @@ class LanDiscoveryManager(
 
     fun probePresence(hosts: Collection<String>) {
         start()
+        cleanupExpiredRequests()
         val now = System.currentTimeMillis()
         _devices.update { devices -> devices.filter { now - it.lastSeenMillis <= DEVICE_TTL_MS } }
         scope.launch {
@@ -177,6 +182,7 @@ class LanDiscoveryManager(
         start()
         val requestId = UUID.randomUUID().toString()
         outgoingPairRequests[requestId] = PairIntent(role, rangeMode, sinceEpochMillis)
+        requestCreatedTimes[requestId] = System.currentTimeMillis()
         val message = baseMessage(TYPE_PAIR_REQUEST)
             .put("requestId", requestId)
             .put("secret", localSecret())
@@ -184,7 +190,7 @@ class LanDiscoveryManager(
             .put("rangeMode", rangeMode.name)
         sinceEpochMillis?.let { message.put("sinceEpochMillis", it) }
         scope.launch {
-            send(message, InetAddress.getByName(device.host))
+            sendRepeated(message, InetAddress.getByName(device.host), 3, 250L)
             onLog("已向 ${device.name} 发出配对请求")
         }
     }
@@ -194,11 +200,12 @@ class LanDiscoveryManager(
         start()
         val requestId = UUID.randomUUID().toString()
         trustedReconnectRequests[requestId] = device.deviceId
+        requestCreatedTimes[requestId] = System.currentTimeMillis()
         val message = baseMessage(TYPE_TRUSTED_HELLO)
             .put("requestId", requestId)
             .put("secret", localSecret())
         scope.launch {
-            send(message, InetAddress.getByName(device.host))
+            sendRepeated(message, InetAddress.getByName(device.host), 2, 200L)
             onLog("正在恢复与 ${device.name} 的已信任连接")
         }
     }
@@ -208,6 +215,7 @@ class LanDiscoveryManager(
         val type = if (allow) TYPE_PAIR_ACCEPT else TYPE_PAIR_DENY
         val message = baseMessage(type).put("requestId", request.requestId)
         if (allow) message.put("secret", localSecret())
+        cachedResponses[request.requestId] = CachedResponse(message.toString(), System.currentTimeMillis())
         scope.launch {
             send(message, InetAddress.getByName(request.host))
             onLog(if (allow) "已允许 ${request.name} 连接" else "已拒绝 ${request.name} 连接")
@@ -227,7 +235,7 @@ class LanDiscoveryManager(
             .put("rangeMode", rangeMode.name)
         sinceEpochMillis?.let { message.put("sinceEpochMillis", it) }
         scope.launch {
-            send(message, InetAddress.getByName(host))
+            sendRepeated(message, InetAddress.getByName(host), 2, 180L)
             onLog("已发送零删除设备策略：${role.label}")
         }
     }
@@ -253,13 +261,14 @@ class LanDiscoveryManager(
             .put("untilEpochMillis", untilEpochMillis)
             .put("isPreview", isPreview)
         sinceEpochMillis?.let { message.put("sinceEpochMillis", it) }
-        scope.launch {
-            send(message, InetAddress.getByName(host))
+        val retryJob = scope.launch {
+            sendRepeated(message, InetAddress.getByName(host), 3, 8_000L)
             onLog("已请求远端自动准备 rsync 服务")
         }
         return try {
             withTimeoutOrNull(timeoutMillis) { waiter.await() }
         } finally {
+            retryJob.cancel()
             prepareWaiters.remove(requestId, waiter)
         }
     }
@@ -320,6 +329,7 @@ class LanDiscoveryManager(
             .put("message", messageText.take(240))
             .put("port", port)
         if (ready) message.put("secret", localSecret())
+        cachedResponses[request.requestId] = CachedResponse(message.toString(), System.currentTimeMillis())
         scope.launch { send(message, InetAddress.getByName(request.host)) }
     }
 
@@ -545,6 +555,12 @@ class LanDiscoveryManager(
             TYPE_ANNOUNCE -> addOrUpdateDevice(remoteDeviceId, remoteName, host, remotePort)
             TYPE_PAIR_REQUEST -> {
                 val requestId = message.optString("requestId")
+                if (requestId.isBlank()) return
+                cachedResponses[requestId]?.let { cached ->
+                    scope.launch { send(JSONObject(cached.payload), sender) }
+                    return
+                }
+                if (seenIncomingRequests.putIfAbsent(requestId, System.currentTimeMillis()) != null) return
                 val secret = message.optString("secret")
                 val role = parseRole(message.optString("role"))
                 val rangeMode = parseRangeMode(message.optString("rangeMode"))
@@ -571,6 +587,7 @@ class LanDiscoveryManager(
                 val requestId = message.optString("requestId")
                 val secret = message.optString("secret")
                 val intent = outgoingPairRequests.remove(requestId)
+                requestCreatedTimes.remove(requestId)
                 if (intent != null && secret.length >= 6) {
                     addOrUpdateDevice(remoteDeviceId, remoteName, host, remotePort)
                     _pairAccepted.tryEmit(
@@ -589,6 +606,7 @@ class LanDiscoveryManager(
             }
             TYPE_PAIR_DENY -> {
                 val requestId = message.optString("requestId")
+                requestCreatedTimes.remove(requestId)
                 if (outgoingPairRequests.remove(requestId) != null) onLog("$remoteName 拒绝了配对请求")
             }
             TYPE_TRUSTED_HELLO -> {
@@ -608,6 +626,7 @@ class LanDiscoveryManager(
             TYPE_TRUSTED_ACK -> {
                 val requestId = message.optString("requestId")
                 val expectedDeviceId = trustedReconnectRequests.remove(requestId)
+                requestCreatedTimes.remove(requestId)
                 val secret = message.optString("secret")
                 if (expectedDeviceId == remoteDeviceId && secret.length >= 6) {
                     addOrUpdateDevice(remoteDeviceId, remoteName, host, remotePort, refreshTrust = false)
@@ -640,6 +659,12 @@ class LanDiscoveryManager(
             }
             TYPE_SYNC_PREPARE -> {
                 val requestId = message.optString("requestId")
+                if (requestId.isBlank()) return
+                cachedResponses[requestId]?.let { cached ->
+                    scope.launch { send(JSONObject(cached.payload), sender) }
+                    return
+                }
+                if (seenIncomingRequests.putIfAbsent(requestId, System.currentTimeMillis()) != null) return
                 val secret = message.optString("secret")
                 val role = parseRole(message.optString("role"))
                 val rangeMode = parseRangeMode(message.optString("rangeMode"))
@@ -760,6 +785,30 @@ class LanDiscoveryManager(
         }
     }
 
+    private suspend fun sendRepeated(
+        message: JSONObject,
+        address: InetAddress,
+        attempts: Int,
+        intervalMillis: Long
+    ) {
+        repeat(attempts.coerceAtLeast(1)) { index ->
+            send(message, address)
+            if (index < attempts - 1) delay(intervalMillis)
+        }
+    }
+
+    private fun cleanupExpiredRequests() {
+        val cutoff = System.currentTimeMillis() - REQUEST_TTL_MS
+        requestCreatedTimes.entries.removeIf { entry ->
+            if (entry.value >= cutoff) return@removeIf false
+            outgoingPairRequests.remove(entry.key)
+            trustedReconnectRequests.remove(entry.key)
+            true
+        }
+        seenIncomingRequests.entries.removeIf { it.value < cutoff }
+        cachedResponses.entries.removeIf { it.value.createdAtMillis < cutoff }
+    }
+
     private fun wifiNetwork(): Network? {
         val active = connectivity.activeNetwork
         if (active != null && connectivity.getNetworkCapabilities(active)
@@ -816,6 +865,7 @@ class LanDiscoveryManager(
         private const val TYPE_SYNC_ACTIVITY = "sync_activity"
         private const val PREPARE_TIMEOUT_MS = 30_000L
         private const val TRUST_RECONNECT_COOLDOWN_MS = 10_000L
+        private const val REQUEST_TTL_MS = 2L * 60L * 1000L
     }
 
     private data class PairIntent(
@@ -823,4 +873,6 @@ class LanDiscoveryManager(
         val rangeMode: SyncRangeMode,
         val sinceEpochMillis: Long?
     )
+
+    private data class CachedResponse(val payload: String, val createdAtMillis: Long)
 }
