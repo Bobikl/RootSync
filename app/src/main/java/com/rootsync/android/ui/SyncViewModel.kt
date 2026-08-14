@@ -63,6 +63,9 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     private var pendingUploadedBytes = 0L
     private var pendingDownloadedBytes = 0L
     private var lastTransferBytesUiMillis = 0L
+    private var previewUploadBytes = 0L
+    private var previewDownloadBytes = 0L
+    private var lastPreviewPlan: PreviewPlanCache? = null
     private var remoteSessionDeviceId: String? = null
     private var remoteSessionStartedAtMillis = 0L
     private val operationMutex = Mutex()
@@ -1070,6 +1073,11 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             pendingUploadedBytes = 0L
             pendingDownloadedBytes = 0L
             lastTransferBytesUiMillis = 0L
+            if (dryRun) {
+                previewUploadBytes = 0L
+                previewDownloadBytes = 0L
+                lastPreviewPlan = null
+            }
             val now = System.currentTimeMillis()
             val untilEpochMillis = now
             val activeRecord = if (dryRun) null else resumeRecord?.copy(
@@ -1169,7 +1177,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 PlannedTransfer()
             } else {
                 _state.update { it.copy(phase = "正在统计需要同步的数据", estimatedCompletionTime = "正在统计同步总量…") }
-                measurePlannedTransfer(current, endpoint, rsync, untilEpochMillis)
+                recentPreviewPlan(current, endpoint) ?: measurePlannedTransfer(
+                    current,
+                    endpoint,
+                    rsync,
+                    untilEpochMillis
+                )
             }
             if (!dryRun && planned.result.success) {
                 resetTransferSpeedTracking()
@@ -1326,6 +1339,14 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 pauseRequested = false
                 return@launchBusy
             }
+            if (dryRun && result.success) {
+                lastPreviewPlan = PreviewPlanCache(
+                    signature = previewPlanSignature(current, endpoint),
+                    createdAtMillis = System.currentTimeMillis(),
+                    uploadBytes = previewUploadBytes,
+                    downloadBytes = previewDownloadBytes
+                )
+            }
             _state.update {
                 val record = it.transferRecord
                 it.copy(
@@ -1459,6 +1480,33 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         return PlannedTransfer(uploadBytes, downloadBytes)
     }
 
+    private fun recentPreviewPlan(current: SyncUiState, endpoint: RemoteEndpoint): PlannedTransfer? {
+        val cached = lastPreviewPlan ?: return null
+        if (System.currentTimeMillis() - cached.createdAtMillis > PREVIEW_PLAN_CACHE_TTL_MS ||
+            cached.signature != previewPlanSignature(current, endpoint)
+        ) {
+            return null
+        }
+        appendLog(
+            "INFO",
+            "复用刚完成的差异预览统计：上传 ${formatBytes(cached.uploadBytes)}，" +
+                "下载 ${formatBytes(cached.downloadBytes)}；正式 rsync 仍会重新核对文件"
+        )
+        return PlannedTransfer(cached.uploadBytes, cached.downloadBytes)
+    }
+
+    private fun previewPlanSignature(current: SyncUiState, endpoint: RemoteEndpoint): String = listOf(
+        current.selectedProfileId.orEmpty(),
+        current.role.name,
+        current.rangeMode.name,
+        current.sinceEpochMillis?.toString().orEmpty(),
+        current.sourcePath,
+        current.destinationPath,
+        endpoint.host,
+        endpoint.port.toString(),
+        endpoint.secret
+    ).joinToString("\u0000")
+
     private fun safeAddBytes(current: Long, increment: Long): Long {
         val safeIncrement = increment.coerceAtLeast(0L)
         return if (Long.MAX_VALUE - current < safeIncrement) Long.MAX_VALUE else current + safeIncrement
@@ -1471,6 +1519,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         directionLabel: String? = null
     ) {
         localTransferItemCount += 1
+        if (dryRun && item.itemizedChange.getOrNull(1) != 'd') {
+            val isUpload = role == SyncRole.SEND_ONLY ||
+                (role == SyncRole.BIDIRECTIONAL && directionLabel == "发送")
+            if (isUpload) previewUploadBytes = safeAddBytes(previewUploadBytes, item.sizeBytes)
+            else previewDownloadBytes = safeAddBytes(previewDownloadBytes, item.sizeBytes)
+        }
         val now = System.currentTimeMillis()
         val shouldRefresh = dryRun || localTransferItemCount == 1 ||
             now - lastTransferItemUiMillis >= TRANSFER_ITEM_REFRESH_MS
@@ -2046,6 +2100,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         const val TRANSFER_BYTES_UI_INTERVAL_MS = 250L
         const val ETA_SAMPLE_WINDOW_MS = 10_000L
         const val ETA_UPDATE_INTERVAL_MS = 10_000L
+        const val PREVIEW_PLAN_CACHE_TTL_MS = 30_000L
         const val MAX_TRANSFER_RECORDS = 32
     }
 
@@ -2056,4 +2111,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         val result: EngineResult = EngineResult(true, "同步总量统计完成")
     )
     private data class TransferSpeedSample(val timeMillis: Long, val totalBytes: Long)
+    private data class PreviewPlanCache(
+        val signature: String,
+        val createdAtMillis: Long,
+        val uploadBytes: Long,
+        val downloadBytes: Long
+    )
 }
