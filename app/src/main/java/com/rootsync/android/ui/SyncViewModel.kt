@@ -42,6 +42,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
+import java.security.MessageDigest
 import java.util.ArrayDeque
 import java.util.UUID
 
@@ -54,6 +55,11 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     }
     private val deviceName = resolveDeviceName(application)
     private val _state = MutableStateFlow(loadState())
+    private val controlToken = preferences.getString("controlToken", null)
+        ?.takeIf { it.length >= MIN_CONTROL_TOKEN_LENGTH }
+        ?: legacyControlToken(_state.value.serverSecret).also { token ->
+            preferences.edit { putString("controlToken", token) }
+        }
     val state: StateFlow<SyncUiState> = _state.asStateFlow()
     @Volatile private var pauseRequested = false
     @Volatile private var lastTransferPersistMillis = 0L
@@ -75,8 +81,11 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         deviceName = deviceName,
         localPort = { SafeInput.parsePort(_state.value.serverPortText) ?: SyncUiState.DEFAULT_RSYNC_PORT },
         localSecret = { _state.value.serverSecret },
-        isTrustedDevice = { remoteId ->
-            _state.value.profiles.any { it.deviceId == remoteId && !it.deviceId.startsWith("manual:") }
+        localControlToken = { controlToken },
+        trustedControlToken = { remoteId ->
+            _state.value.profiles.firstOrNull {
+                it.deviceId == remoteId && !it.deviceId.startsWith("manual:")
+            }?.controlToken?.takeIf { it.length >= MIN_CONTROL_TOKEN_LENGTH }
         },
         onLog = { message -> appendLog("LAN", message) }
     )
@@ -481,6 +490,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         host = host,
         port = port,
         secret = secret,
+        controlToken = controlToken,
         role = role.opposite(),
         rangeMode = rangeMode,
         sinceEpochMillis = sinceEpochMillis
@@ -494,6 +504,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             host = device.host,
             port = device.port,
             secret = device.secret,
+            controlToken = device.controlToken,
             role = device.role,
             rangeMode = device.rangeMode,
             sinceEpochMillis = device.sinceEpochMillis,
@@ -507,6 +518,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             host = device.host,
             port = device.port,
             secret = device.secret,
+            controlToken = device.controlToken,
             role = device.role,
             rangeMode = device.rangeMode,
             sinceEpochMillis = device.sinceEpochMillis,
@@ -1941,6 +1953,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 put("host", profile.host)
                 put("port", profile.port)
                 put("secret", profile.secret)
+                put("controlToken", profile.controlToken)
                 put("role", profile.role.name)
                 put("rangeMode", profile.rangeMode.name)
                 put("sinceEpochMillis", profile.sinceEpochMillis)
@@ -1966,6 +1979,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     val sourcePath = migrateBiliPath(
                         item.optString("sourcePath", SyncUiState.DEFAULT_BILI_PATH)
                     )
+                    val secret = item.optString("secret")
                     add(
                         PeerProfile(
                             id = item.getString("id"),
@@ -1973,7 +1987,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                             name = item.optString("name", item.getString("host")),
                             host = item.getString("host"),
                             port = item.optInt("port", SyncUiState.DEFAULT_RSYNC_PORT),
-                            secret = item.optString("secret"),
+                            secret = secret,
+                            controlToken = item.optString("controlToken")
+                                .takeIf { it.length >= MIN_CONTROL_TOKEN_LENGTH }
+                                ?: legacyControlToken(secret),
                             role = role,
                             rangeMode = rangeMode,
                             sinceEpochMillis = since,
@@ -2074,6 +2091,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     private fun migrateBiliPath(path: String): String =
         if (path == SyncUiState.LEGACY_BILI_PATH) SyncUiState.DEFAULT_BILI_PATH else path
 
+    private fun legacyControlToken(secret: String): String = buildString(64) {
+        MessageDigest.getInstance("SHA-256")
+            .digest(secret.toByteArray(Charsets.UTF_8))
+            .forEach { byte -> append((byte.toInt() and 0xff).toString(16).padStart(2, '0')) }
+    }
+
     private fun resolveDeviceName(application: Application): String {
         val globalName = runCatching {
             Settings.Global.getString(application.contentResolver, Settings.Global.DEVICE_NAME)
@@ -2101,6 +2124,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         const val ETA_SAMPLE_WINDOW_MS = 10_000L
         const val ETA_UPDATE_INTERVAL_MS = 10_000L
         const val PREVIEW_PLAN_CACHE_TTL_MS = 30_000L
+        const val MIN_CONTROL_TOKEN_LENGTH = 32
         const val MAX_TRANSFER_RECORDS = 32
     }
 

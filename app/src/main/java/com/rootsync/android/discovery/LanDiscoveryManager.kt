@@ -61,7 +61,8 @@ class LanDiscoveryManager(
     private val deviceName: String,
     private val localPort: () -> Int,
     private val localSecret: () -> String,
-    private val isTrustedDevice: (String) -> Boolean,
+    private val localControlToken: () -> String,
+    private val trustedControlToken: (String) -> String?,
     private val onLog: (String) -> Unit
 ) {
     private val appContext = context.applicationContext
@@ -186,6 +187,7 @@ class LanDiscoveryManager(
         val message = baseMessage(TYPE_PAIR_REQUEST)
             .put("requestId", requestId)
             .put("secret", localSecret())
+            .put("controlToken", localControlToken())
             .put("role", role.name)
             .put("rangeMode", rangeMode.name)
         sinceEpochMillis?.let { message.put("sinceEpochMillis", it) }
@@ -196,7 +198,7 @@ class LanDiscoveryManager(
     }
 
     fun reconnectTrusted(device: DiscoveredDevice) {
-        if (!isTrustedDevice(device.deviceId)) return
+        if (trustedControlToken(device.deviceId) == null) return
         start()
         val requestId = UUID.randomUUID().toString()
         trustedReconnectRequests[requestId] = device.deviceId
@@ -204,6 +206,7 @@ class LanDiscoveryManager(
         val message = baseMessage(TYPE_TRUSTED_HELLO)
             .put("requestId", requestId)
             .put("secret", localSecret())
+            .put("controlToken", localControlToken())
         scope.launch {
             sendRepeated(message, InetAddress.getByName(device.host), 2, 200L)
             onLog("正在恢复与 ${device.name} 的已信任连接")
@@ -214,7 +217,10 @@ class LanDiscoveryManager(
         start()
         val type = if (allow) TYPE_PAIR_ACCEPT else TYPE_PAIR_DENY
         val message = baseMessage(type).put("requestId", request.requestId)
-        if (allow) message.put("secret", localSecret())
+        if (allow) {
+            message.put("secret", localSecret())
+            message.put("controlToken", localControlToken())
+        }
         cachedResponses[request.requestId] = CachedResponse(message.toString(), System.currentTimeMillis())
         scope.launch {
             send(message, InetAddress.getByName(request.host))
@@ -231,6 +237,7 @@ class LanDiscoveryManager(
         start()
         val message = baseMessage(TYPE_STRATEGY_UPDATE)
             .put("secret", localSecret())
+            .put("controlToken", localControlToken())
             .put("role", role.name)
             .put("rangeMode", rangeMode.name)
         sinceEpochMillis?.let { message.put("sinceEpochMillis", it) }
@@ -256,6 +263,7 @@ class LanDiscoveryManager(
         val message = baseMessage(TYPE_SYNC_PREPARE)
             .put("requestId", requestId)
             .put("secret", localSecret())
+            .put("controlToken", localControlToken())
             .put("role", role.name)
             .put("rangeMode", rangeMode.name)
             .put("untilEpochMillis", untilEpochMillis)
@@ -284,6 +292,7 @@ class LanDiscoveryManager(
             start()
             val message = baseMessage(TYPE_SYNC_ACTIVITY)
                 .put("secret", localSecret())
+                .put("controlToken", localControlToken())
                 .put("activity", type.name)
                 .put("active", active)
                 .put("taskId", taskId)
@@ -307,6 +316,7 @@ class LanDiscoveryManager(
         scope.launch {
             val message = baseMessage(TYPE_SYNC_ACTIVITY)
                 .put("secret", localSecret())
+                .put("controlToken", localControlToken())
                 .put("activity", type.name)
                 .put("active", true)
                 .put("taskId", taskId)
@@ -325,6 +335,7 @@ class LanDiscoveryManager(
         start()
         val message = baseMessage(TYPE_SYNC_READY)
             .put("requestId", request.requestId)
+            .put("controlToken", localControlToken())
             .put("ready", ready)
             .put("message", messageText.take(240))
             .put("port", port)
@@ -562,10 +573,12 @@ class LanDiscoveryManager(
                 }
                 if (seenIncomingRequests.putIfAbsent(requestId, System.currentTimeMillis()) != null) return
                 val secret = message.optString("secret")
+                val controlToken = message.optString("controlToken")
                 val role = parseRole(message.optString("role"))
                 val rangeMode = parseRangeMode(message.optString("rangeMode"))
                 val since = parseSince(message, rangeMode)
-                if (requestId.isNotBlank() && secret.length >= 6 && role != null && rangeMode != null &&
+                if (secret.length >= 6 && controlToken.length >= MIN_CONTROL_TOKEN_LENGTH &&
+                    role != null && rangeMode != null &&
                     (rangeMode == SyncRangeMode.ALL || since != null)
                 ) {
                     _pairRequests.tryEmit(
@@ -576,6 +589,7 @@ class LanDiscoveryManager(
                             host,
                             remotePort,
                             secret,
+                            controlToken,
                             role,
                             rangeMode,
                             since
@@ -586,9 +600,10 @@ class LanDiscoveryManager(
             TYPE_PAIR_ACCEPT -> {
                 val requestId = message.optString("requestId")
                 val secret = message.optString("secret")
+                val controlToken = message.optString("controlToken")
                 val intent = outgoingPairRequests.remove(requestId)
                 requestCreatedTimes.remove(requestId)
-                if (intent != null && secret.length >= 6) {
+                if (intent != null && secret.length >= 6 && controlToken.length >= MIN_CONTROL_TOKEN_LENGTH) {
                     addOrUpdateDevice(remoteDeviceId, remoteName, host, remotePort)
                     _pairAccepted.tryEmit(
                         PairAccepted(
@@ -597,6 +612,7 @@ class LanDiscoveryManager(
                             host,
                             remotePort,
                             secret,
+                            controlToken,
                             intent.role,
                             intent.rangeMode,
                             intent.sinceEpochMillis
@@ -612,7 +628,10 @@ class LanDiscoveryManager(
             TYPE_TRUSTED_HELLO -> {
                 val requestId = message.optString("requestId")
                 val secret = message.optString("secret")
-                if (requestId.isNotBlank() && secret.length >= 6 && isTrustedDevice(remoteDeviceId)) {
+                val controlToken = message.optString("controlToken")
+                if (requestId.isNotBlank() && secret.length >= 6 &&
+                    isValidTrustedControl(remoteDeviceId, controlToken)
+                ) {
                     addOrUpdateDevice(remoteDeviceId, remoteName, host, remotePort, refreshTrust = false)
                     _trustedPeerUpdates.tryEmit(
                         TrustedPeerUpdate(remoteDeviceId, remoteName, host, remotePort, secret)
@@ -620,6 +639,7 @@ class LanDiscoveryManager(
                     val reply = baseMessage(TYPE_TRUSTED_ACK)
                         .put("requestId", requestId)
                         .put("secret", localSecret())
+                        .put("controlToken", localControlToken())
                     scope.launch { send(reply, sender) }
                 }
             }
@@ -628,7 +648,10 @@ class LanDiscoveryManager(
                 val expectedDeviceId = trustedReconnectRequests.remove(requestId)
                 requestCreatedTimes.remove(requestId)
                 val secret = message.optString("secret")
-                if (expectedDeviceId == remoteDeviceId && secret.length >= 6) {
+                val controlToken = message.optString("controlToken")
+                if (expectedDeviceId == remoteDeviceId && secret.length >= 6 &&
+                    isValidTrustedControl(remoteDeviceId, controlToken)
+                ) {
                     addOrUpdateDevice(remoteDeviceId, remoteName, host, remotePort, refreshTrust = false)
                     _trustedPeerUpdates.tryEmit(
                         TrustedPeerUpdate(remoteDeviceId, remoteName, host, remotePort, secret)
@@ -638,10 +661,12 @@ class LanDiscoveryManager(
             }
             TYPE_STRATEGY_UPDATE -> {
                 val secret = message.optString("secret")
+                val controlToken = message.optString("controlToken")
                 val role = parseRole(message.optString("role"))
                 val rangeMode = parseRangeMode(message.optString("rangeMode"))
                 val since = parseSince(message, rangeMode)
-                if (secret.length >= 6 && role != null && rangeMode != null &&
+                if (secret.length >= 6 && isValidTrustedControl(remoteDeviceId, controlToken) &&
+                    role != null && rangeMode != null &&
                     (rangeMode == SyncRangeMode.ALL || since != null)
                 ) {
                     _strategyUpdates.tryEmit(
@@ -666,12 +691,14 @@ class LanDiscoveryManager(
                 }
                 if (seenIncomingRequests.putIfAbsent(requestId, System.currentTimeMillis()) != null) return
                 val secret = message.optString("secret")
+                val controlToken = message.optString("controlToken")
                 val role = parseRole(message.optString("role"))
                 val rangeMode = parseRangeMode(message.optString("rangeMode"))
                 val since = parseSince(message, rangeMode)
                 val until = message.optLong("untilEpochMillis", -1L)
                 val isPreview = message.optBoolean("isPreview", false)
-                if (requestId.isNotBlank() && secret.length >= 6 && role != null && rangeMode != null &&
+                if (secret.length >= 6 && isValidTrustedControl(remoteDeviceId, controlToken) &&
+                    role != null && rangeMode != null &&
                     (rangeMode == SyncRangeMode.ALL || since != null) && until > 0L
                 ) {
                     _syncPrepareRequests.tryEmit(
@@ -692,10 +719,13 @@ class LanDiscoveryManager(
             }
             TYPE_SYNC_ACTIVITY -> {
                 val secret = message.optString("secret")
+                val controlToken = message.optString("controlToken")
                 val activity = runCatching {
                     SyncActivityType.valueOf(message.optString("activity"))
                 }.getOrNull()
-                if (secret.length >= 6 && activity != null && isTrustedDevice(remoteDeviceId)) {
+                if (secret.length >= 6 && activity != null &&
+                    isValidTrustedControl(remoteDeviceId, controlToken)
+                ) {
                     _syncActivityUpdates.tryEmit(
                         SyncActivityUpdate(
                             deviceId = remoteDeviceId,
@@ -714,6 +744,8 @@ class LanDiscoveryManager(
             }
             TYPE_SYNC_READY -> {
                 val requestId = message.optString("requestId")
+                val controlToken = message.optString("controlToken")
+                if (!isValidTrustedControl(remoteDeviceId, controlToken)) return
                 val ready = message.optBoolean("ready", false)
                 val secret = message.optString("secret")
                 val result = SyncPrepareResult(
@@ -744,6 +776,11 @@ class LanDiscoveryManager(
             message.optLong("sinceEpochMillis", -1L).takeIf { it > 0L }
         } else null
 
+    private fun isValidTrustedControl(deviceId: String, receivedToken: String): Boolean {
+        val expectedToken = trustedControlToken(deviceId) ?: return false
+        return receivedToken.length >= MIN_CONTROL_TOKEN_LENGTH && receivedToken == expectedToken
+    }
+
     private fun addOrUpdateDevice(
         deviceId: String,
         name: String,
@@ -756,7 +793,7 @@ class LanDiscoveryManager(
             (current.filterNot { it.deviceId == deviceId } + device)
                 .sortedBy { it.name.lowercase() }
         }
-        if (isTrustedDevice(deviceId)) {
+        if (trustedControlToken(deviceId) != null) {
             _trustedPeerUpdates.tryEmit(TrustedPeerUpdate(deviceId, name, host, port))
             if (refreshTrust) {
                 val now = System.currentTimeMillis()
@@ -845,7 +882,8 @@ class LanDiscoveryManager(
         const val SCAN_WINDOW_MS = 8_000L
         private const val NSD_SERVICE_TYPE = "_rootsync._tcp."
         private const val MAGIC = "ROOTSYNC_LAN"
-        private const val PROTOCOL_VERSION = 6
+        private const val PROTOCOL_VERSION = 7
+        private const val MIN_CONTROL_TOKEN_LENGTH = 32
         private const val UDP_SCAN_BURSTS = 3
         private const val UDP_SCAN_INTERVAL_MS = 700L
         private const val PRESENCE_PROBE_BURSTS = 2

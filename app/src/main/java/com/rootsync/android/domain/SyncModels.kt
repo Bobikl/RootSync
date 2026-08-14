@@ -51,6 +51,7 @@ data class PeerProfile(
     val host: String,
     val port: Int = SyncUiState.DEFAULT_RSYNC_PORT,
     val secret: String,
+    val controlToken: String = "",
     val role: SyncRole = SyncRole.RECEIVE_ONLY,
     val rangeMode: SyncRangeMode = SyncRangeMode.ALL,
     val sinceEpochMillis: Long? = null,
@@ -73,6 +74,7 @@ data class PairRequest(
     val host: String,
     val port: Int,
     val secret: String,
+    val controlToken: String,
     val role: SyncRole,
     val rangeMode: SyncRangeMode,
     val sinceEpochMillis: Long?
@@ -84,6 +86,7 @@ data class PairAccepted(
     val host: String,
     val port: Int,
     val secret: String,
+    val controlToken: String,
     val role: SyncRole,
     val rangeMode: SyncRangeMode,
     val sinceEpochMillis: Long?
