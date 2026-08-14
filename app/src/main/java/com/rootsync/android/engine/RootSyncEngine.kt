@@ -696,25 +696,29 @@ class RootSyncEngine(private val context: Context) {
         ensureLifecycleWatchdog(bundledRsyncPath, onLog)
         onLog("DIAG_TRANSFER_COMMAND $command")
         val result = shell.execute(
-            "umask 077; echo \$\$ > ${SafeInput.shellQuote(File(runtimeDir, "transfer.pid").absolutePath)}; " +
-                "exec $command"
-        ) { line ->
-            onLog(line)
+            command = "umask 077; echo \$\$ > ${SafeInput.shellQuote(File(runtimeDir, "transfer.pid").absolutePath)}; " +
+                "exec $command",
+            onLine = { line ->
             val item = RsyncOutputParser.parseItem(line)
+            val transferredBytes = RsyncOutputParser.parseTransferredBytes(line)
+            val progress = Regex("(?:^|\\s)([0-9]{1,3})%(?:\\s|$)")
+                .find(line)?.groupValues?.getOrNull(1)?.toIntOrNull()
             if (item != null) {
                 parsedItemCount += 1
                 onItem(item)
             } else if (line.contains(RsyncOutputParser.ITEM_PREFIX)) {
                 onLog("DIAG_PARSER_REJECTED $line")
+            } else if (progress == null && transferredBytes == null) {
+                onLog(line)
             }
-            Regex("(?:^|\\s)([0-9]{1,3})%(?:\\s|$)")
-                .find(line)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let {
-                    onProgress(it.coerceIn(0, 100) / 100f)
-                }
-            RsyncOutputParser.parseTransferredBytes(line)?.let(onTransferredBytes)
-        }
+            progress?.let { onProgress(it.coerceIn(0, 100) / 100f) }
+            transferredBytes?.let(onTransferredBytes)
+            },
+            maxCapturedLines = 500
+        )
         onLog(
-            "DIAG_TRANSFER_FINISH exit=${result.exitCode} outputLines=${result.output.size} " +
+            "DIAG_TRANSFER_FINISH exit=${result.exitCode} outputLines=${result.totalOutputLines} " +
+                "capturedLines=${result.output.size} " +
                 "parsedItems=$parsedItemCount"
         )
         return result
