@@ -60,6 +60,9 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     private val transferSpeedSamples = ArrayDeque<TransferSpeedSample>()
     private var localTransferItemCount = 0
     private var lastTransferItemUiMillis = 0L
+    private var pendingUploadedBytes = 0L
+    private var pendingDownloadedBytes = 0L
+    private var lastTransferBytesUiMillis = 0L
     private var remoteSessionDeviceId: String? = null
     private var remoteSessionStartedAtMillis = 0L
     private val operationMutex = Mutex()
@@ -1064,6 +1067,9 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             pauseRequested = false
             localTransferItemCount = 0
             lastTransferItemUiMillis = 0L
+            pendingUploadedBytes = 0L
+            pendingDownloadedBytes = 0L
+            lastTransferBytesUiMillis = 0L
             val now = System.currentTimeMillis()
             val untilEpochMillis = now
             val activeRecord = if (dryRun) null else resumeRecord?.copy(
@@ -1304,6 +1310,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
             } finally {
+                if (!dryRun) flushTransferBytes(action, force = true)
                 etaJob?.cancel()
                 remoteHeartbeatJob.cancel()
                 discovery.sendSyncActivity(
@@ -1522,9 +1529,21 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun updateTransferBytes(upload: Boolean, bytes: Long, action: String) {
         val safeBytes = bytes.coerceAtLeast(0L)
+        if (upload) pendingUploadedBytes = maxOf(pendingUploadedBytes, safeBytes)
+        else pendingDownloadedBytes = maxOf(pendingDownloadedBytes, safeBytes)
+        val now = System.currentTimeMillis()
+        if (now - lastTransferBytesUiMillis >= TRANSFER_BYTES_UI_INTERVAL_MS) {
+            flushTransferBytes(action, force = false)
+        }
+    }
+
+    private fun flushTransferBytes(action: String, force: Boolean) {
+        val now = System.currentTimeMillis()
+        if (!force && now - lastTransferBytesUiMillis < TRANSFER_BYTES_UI_INTERVAL_MS) return
+        lastTransferBytesUiMillis = now
         _state.update { state ->
-            val uploaded = if (upload) maxOf(state.uploadedBytes, safeBytes) else state.uploadedBytes
-            val downloaded = if (upload) state.downloadedBytes else maxOf(state.downloadedBytes, safeBytes)
+            val uploaded = maxOf(state.uploadedBytes, pendingUploadedBytes)
+            val downloaded = maxOf(state.downloadedBytes, pendingDownloadedBytes)
             val done = safeAddBytes(uploaded, downloaded)
             val progress = if (state.totalSyncBytes > 0L) {
                 (done.toDouble() / state.totalSyncBytes).toFloat().coerceIn(0f, 1f)
@@ -1543,7 +1562,6 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
 
-        val now = System.currentTimeMillis()
         val snapshot = _state.value
         val done = safeAddBytes(snapshot.uploadedBytes, snapshot.downloadedBytes)
         synchronized(transferSpeedSamples) {
@@ -1554,7 +1572,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
         val notificationState = _state.value
-        val notificationNow = System.currentTimeMillis()
+        val notificationNow = now
         if (notificationNow - lastTransferPersistMillis >= 1_000L) {
             lastTransferPersistMillis = notificationNow
             persistTransferRecord()
@@ -2025,6 +2043,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         const val PROFILE_PRESENCE_RESPONSE_MS = 800L
         const val REMOTE_PREVIEW_ITEM_THROTTLE_MS = 150L
         const val TRANSFER_ITEM_REFRESH_MS = 3_000L
+        const val TRANSFER_BYTES_UI_INTERVAL_MS = 250L
         const val ETA_SAMPLE_WINDOW_MS = 10_000L
         const val ETA_UPDATE_INTERVAL_MS = 10_000L
         const val MAX_TRANSFER_RECORDS = 32
