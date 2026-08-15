@@ -726,11 +726,30 @@ class RootSyncEngine(private val context: Context) {
 
     private suspend fun ensureLifecycleWatchdog(rsyncPath: String, onLog: (String) -> Unit) {
         val watchdogPidFile = File(runtimeDir, "lifecycle-watchdog.pid")
+        val watchdogScriptFile = File(runtimeDir, "lifecycle-watchdog.sh")
         val transferPidFile = File(runtimeDir, "transfer.pid")
         val daemonPidFile = File(runtimeDir, "rsyncd.pid")
         val configFile = File(runtimeDir, "rsyncd.conf")
+        val existing = watchdogShell.execute(
+            "pid_file=${SafeInput.shellQuote(watchdogPidFile.absolutePath)}; " +
+                "script=${SafeInput.shellQuote(watchdogScriptFile.absolutePath)}; " +
+                "[ -s \"\$pid_file\" ] || exit 1; pid=\$(cat \"\$pid_file\"); " +
+                "case \"\$pid\" in *[!0-9]*|'') exit 1 ;; esac; " +
+                "[ -r \"/proc/\$pid/cmdline\" ] || exit 1; " +
+                "cmd=\$(tr '\\000' ' ' < \"/proc/\$pid/cmdline\"); " +
+                "kill -0 \"\$pid\" 2>/dev/null && " +
+                "printf '%s' \"\$cmd\" | grep -Fq \"\$script\" && " +
+                "printf '%s' \"\$cmd\" | grep -Fq 'rootsync-watchdog'"
+        )
+        if (existing.exitCode == 0) {
+            onLog("DIAG_WATCHDOG reuseExisting=true appPid=$appProcessId")
+            return
+        }
         val script = buildString {
+            append("#!/system/bin/sh\n")
+            append("umask 077\n")
             append("echo \$\$ > ${SafeInput.shellQuote(watchdogPidFile.absolutePath)}; ")
+            append("trap \"rm -f ${SafeInput.shellQuote(watchdogPidFile.absolutePath)}\" EXIT INT TERM HUP; ")
             append("while true; do ")
             append("alive=0; if [ -r /proc/$appProcessId/cmdline ]; then ")
             append("name=\$(tr '\\000' ' ' < /proc/$appProcessId/cmdline); ")
@@ -739,14 +758,23 @@ class RootSyncEngine(private val context: Context) {
             append(runtimeCleanupCommand(includeWatchdog = false))
             append("; exit 0; done")
         }
+        watchdogScriptFile.writeText(script, Charsets.UTF_8)
         val stopOld =
             "watchdog_file=${SafeInput.shellQuote(watchdogPidFile.absolutePath)}; " +
+                "script=${SafeInput.shellQuote(watchdogScriptFile.absolutePath)}; " +
                 "if [ -s \"\$watchdog_file\" ]; then old=\$(cat \"\$watchdog_file\"); " +
-                "case \"\$old\" in *[!0-9]*|'') ;; *) kill \"\$old\" 2>/dev/null || true ;; esac; fi; " +
+                "case \"\$old\" in *[!0-9]*|'') ;; *) " +
+                "if [ -r \"/proc/\$old/cmdline\" ] && " +
+                "tr '\\000' ' ' < \"/proc/\$old/cmdline\" | grep -Fq \"\$script\"; then " +
+                "kill \"\$old\" 2>/dev/null || true; attempt=0; " +
+                "while kill -0 \"\$old\" 2>/dev/null && [ \"\$attempt\" -lt 10 ]; do " +
+                "attempt=\$((attempt + 1)); sleep 0.1; done; " +
+                "kill -KILL \"\$old\" 2>/dev/null || true; fi ;; esac; fi; " +
                 "rm -f \"\$watchdog_file\""
         watchdogShell.execute(stopOld)
         val launch =
-            "umask 077; nohup sh -c ${SafeInput.shellQuote(script)} rootsync-watchdog " +
+            "umask 077; chmod 700 ${SafeInput.shellQuote(watchdogScriptFile.absolutePath)}; " +
+                "nohup sh ${SafeInput.shellQuote(watchdogScriptFile.absolutePath)} rootsync-watchdog " +
                 ">/dev/null 2>&1 &"
         val result = watchdogShell.execute(launch)
         onLog(
@@ -761,6 +789,7 @@ class RootSyncEngine(private val context: Context) {
         val daemonPidFile = File(runtimeDir, "rsyncd.pid")
         val configFile = File(runtimeDir, "rsyncd.conf")
         val watchdogPidFile = File(runtimeDir, "lifecycle-watchdog.pid")
+        val watchdogScriptFile = File(runtimeDir, "lifecycle-watchdog.sh")
         return buildString {
             append("for pid_file in ")
             append(SafeInput.shellQuote(transferPidFile.absolutePath)).append(' ')
@@ -786,9 +815,20 @@ class RootSyncEngine(private val context: Context) {
             append("kill -KILL \"\$pid\" 2>/dev/null || true; fi; done")
             if (includeWatchdog) {
                 append("; watchdog_file=${SafeInput.shellQuote(watchdogPidFile.absolutePath)}; ")
+                append("watchdog_script=${SafeInput.shellQuote(watchdogScriptFile.absolutePath)}; ")
                 append("if [ -s \"\$watchdog_file\" ]; then pid=\$(cat \"\$watchdog_file\"); ")
-                append("case \"\$pid\" in *[!0-9]*|'') ;; *) kill \"\$pid\" 2>/dev/null || true ;; esac; fi; ")
-                append("rm -f \"\$watchdog_file\"")
+                append("case \"\$pid\" in *[!0-9]*|'') ;; *) if [ -r \"/proc/\$pid/cmdline\" ] && ")
+                append("tr '\\000' ' ' < \"/proc/\$pid/cmdline\" | grep -Fq \"\$watchdog_script\"; then ")
+                append("kill \"\$pid\" 2>/dev/null || true; fi ;; esac; fi; ")
+                append("rm -f \"\$watchdog_file\"; ")
+                append("for cmdline in /proc/[0-9]*/cmdline; do [ -r \"\$cmdline\" ] || continue; ")
+                append("pid=\${cmdline#/proc/}; pid=\${pid%/cmdline}; ")
+                append("[ \"\$pid\" = \"\$self\" ] && continue; [ \"\$pid\" = \"\$parent\" ] && continue; ")
+                append("cmd=\$(tr '\\000' ' ' < \"\$cmdline\"); ")
+                append("if printf '%s' \"\$cmd\" | grep -Fq \"\$watchdog_script\" && ")
+                append("printf '%s' \"\$cmd\" | grep -Fq 'rootsync-watchdog'; then ")
+                append("kill \"\$pid\" 2>/dev/null || true; sleep 0.1; ")
+                append("kill -KILL \"\$pid\" 2>/dev/null || true; fi; done")
             }
         }
     }
