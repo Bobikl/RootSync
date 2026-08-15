@@ -158,7 +158,9 @@ class TransferForegroundService : Service() {
 
     companion object {
         private const val CHANNEL_ID = "rootsync_transfer"
+        private const val COMPLETION_CHANNEL_ID = "rootsync_completion"
         private const val NOTIFICATION_ID = 8873
+        private const val COMPLETION_NOTIFICATION_ID = 8875
         private const val ACTION_UPDATE = "com.rootsync.android.action.UPDATE_TRANSFER"
         private const val EXTRA_TITLE = "title"
         private const val EXTRA_DETAIL = "detail"
@@ -187,6 +189,37 @@ class TransferForegroundService : Service() {
 
         fun stop(context: Context) {
             context.stopService(Intent(context, TransferForegroundService::class.java))
+        }
+
+        fun notifyCompleted(context: Context, title: String, detail: String) {
+            val manager = context.getSystemService(NotificationManager::class.java)
+            manager.createNotificationChannel(
+                NotificationChannel(
+                    COMPLETION_CHANNEL_ID,
+                    "同步完成提醒",
+                    NotificationManager.IMPORTANCE_DEFAULT
+                ).apply { description = "仅在数据完整性校验通过后提醒同步完成" }
+            )
+            val openApp = PendingIntent.getActivity(
+                context,
+                1,
+                Intent(context, MainActivity::class.java).addFlags(
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                ),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            manager.notify(
+                COMPLETION_NOTIFICATION_ID,
+                NotificationCompat.Builder(context, COMPLETION_CHANNEL_ID)
+                    .setSmallIcon(android.R.drawable.stat_sys_upload_done)
+                    .setContentTitle(title)
+                    .setContentText(detail)
+                    .setStyle(NotificationCompat.BigTextStyle().bigText(detail))
+                    .setContentIntent(openApp)
+                    .setAutoCancel(true)
+                    .setCategory(NotificationCompat.CATEGORY_STATUS)
+                    .build()
+            )
         }
     }
 }

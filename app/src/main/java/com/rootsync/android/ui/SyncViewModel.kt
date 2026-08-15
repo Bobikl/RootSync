@@ -1327,7 +1327,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                                 if (dryRun) {
                                     "双向差异预览完成；全程零删除"
                                 } else {
-                                    "双向同步完成；较新版本优先，未删除任何用户数据"
+                                    "双向同步完成，两个方向数据完整性校验均通过；较新版本优先，未删除任何用户数据"
                                 }
                             )
                         } else pushResult
@@ -1396,6 +1396,13 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             }
             if (!dryRun) {
                 persistTransferRecord()
+                if (result.success) {
+                    TransferForegroundService.notifyCompleted(
+                        getApplication(),
+                        "RootSync 同步完成",
+                        "${current.profileName.ifBlank { current.remoteHost }}：数据完整性校验通过"
+                    )
+                }
                 TransferForegroundService.stop(getApplication())
             }
             appendLog(if (result.success) "OK" else "ERROR", result.summary)
@@ -1899,7 +1906,29 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         super.onCleared()
     }
 
-    private fun streamLog(message: String) = appendLog("RSYNC", message)
+    private fun streamLog(message: String) {
+        when {
+            message.startsWith("INTEGRITY_VERIFY_START") -> {
+                _state.update {
+                    it.copy(
+                        phase = "正在校验已同步数据完整性",
+                        estimatedCompletionTime = "正在逐文件计算并比对校验和…"
+                    )
+                }
+                val state = _state.value
+                updateTransferNotification(
+                    state.role.label,
+                    "数据传输结束，正在执行完整性校验",
+                    state.estimatedCompletionTime,
+                    state.progress
+                )
+            }
+            message.startsWith("INTEGRITY_VERIFY_PASSED") -> {
+                _state.update { it.copy(phase = "数据完整性校验通过") }
+            }
+        }
+        appendLog("RSYNC", message)
+    }
 
     private fun appendLog(level: String, message: String) {
         if (message.isBlank()) return

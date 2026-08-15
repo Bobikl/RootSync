@@ -107,6 +107,35 @@ class SafeInputTest {
     }
 
     @Test
+    fun buildsZeroWriteChecksumVerificationCommands() {
+        val pull = RsyncCommandBuilder.verifyPull(
+            rsyncPath = "/data/app/librsync.so",
+            host = "192.168.1.20",
+            port = 8873,
+            destination = "/storage/emulated/0/receive",
+            passwordFile = "/data/user/0/app/password",
+            filesFrom = "/data/user/0/app/integrity.files"
+        )
+        val push = RsyncCommandBuilder.verifyPush(
+            rsyncPath = "/data/app/librsync.so",
+            host = "192.168.1.30",
+            port = 8873,
+            source = "/storage/emulated/0/send",
+            passwordFile = "/data/user/0/app/password",
+            filesFrom = "/data/user/0/app/integrity.files"
+        )
+        listOf(pull, push).forEach { command ->
+            assertTrue(command.contains("--checksum"))
+            assertTrue(command.contains("--dry-run"))
+            assertTrue(command.contains("--files-from="))
+            assertTrue(command.contains("--from0"))
+            assertFalse(command.contains("--delete"))
+            assertFalse(command.contains("--remove-source-files"))
+            assertFalse(command.contains("--backup"))
+        }
+    }
+
+    @Test
     fun parsesChangedFoldersFromStableRsyncOutput() {
         val file = RsyncOutputParser.parseItem(
             "ROOTSYNC_ITEM:>f+++++++++|season/episode/video.m4s"

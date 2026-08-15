@@ -510,6 +510,7 @@ class RootSyncEngine(private val context: Context) {
 
         val operation = if (bidirectional) "双向同步·接收阶段" else "只接收"
         onLog(if (dryRun) "开始${operation}差异预览…" else "开始${operation}增量传输…")
+        val integrityCapture = TransferIntegrityCapture()
         val command = RsyncCommandBuilder.pull(
             rsyncPath = rsyncPath,
             host = host,
@@ -521,7 +522,14 @@ class RootSyncEngine(private val context: Context) {
             bidirectional = bidirectional,
             dryRun = dryRun
         )
-        val transfer = executeTransfer(command, onLog, onProgress, onItem, onTransferredBytes)
+        val transfer = executeTransfer(
+            command,
+            onLog,
+            onProgress,
+            onItem,
+            onTransferredBytes,
+            integrityCapture.takeUnless { dryRun }
+        )
         if (transfer.exitCode != 0) {
             return@withContext EngineResult(
                 false,
@@ -546,14 +554,25 @@ class RootSyncEngine(private val context: Context) {
             onLog
         )
         if (verify.exitCode != 0) {
-            EngineResult(false, "接收完成，但部分目录时间超过 2 秒误差", verify.exitCode)
-        } else {
-            onProgress(1f)
-            EngineResult(
-                true,
-                "${if (bidirectional) "双向同步接收阶段" else "只接收"}完成；未删除目标端数据，覆盖前版本已保存到 .rootsync-history"
-            )
+            return@withContext EngineResult(false, "接收完成，但部分目录时间超过 2 秒误差", verify.exitCode)
         }
+        val integrity = verifyTransferredData(
+            rsyncPath = rsyncPath,
+            host = host,
+            port = port,
+            localPath = destinationPath,
+            passwordFile = password,
+            direction = VerificationDirection.PULL,
+            capture = integrityCapture,
+            onLog = onLog
+        )
+        if (!integrity.success) return@withContext integrity
+        onProgress(1f)
+        EngineResult(
+            true,
+            "${if (bidirectional) "双向同步接收阶段" else "只接收"}完成，数据完整性校验通过；" +
+                "未删除目标端数据，覆盖前版本已保存到 .rootsync-history"
+        )
     }
 
     suspend fun push(
@@ -602,6 +621,7 @@ class RootSyncEngine(private val context: Context) {
         }
         val operation = if (bidirectional) "双向同步·发送阶段" else "只发送"
         onLog(if (dryRun) "开始${operation}差异预览…" else "开始${operation}增量传输…")
+        val integrityCapture = TransferIntegrityCapture()
         val command = RsyncCommandBuilder.push(
             rsyncPath = rsyncPath,
             host = host,
@@ -613,7 +633,14 @@ class RootSyncEngine(private val context: Context) {
             bidirectional = bidirectional,
             dryRun = dryRun
         )
-        val transfer = executeTransfer(command, onLog, onProgress, onItem, onTransferredBytes)
+        val transfer = executeTransfer(
+            command,
+            onLog,
+            onProgress,
+            onItem,
+            onTransferredBytes,
+            integrityCapture.takeUnless { dryRun }
+        )
         if (transfer.exitCode != 0) {
             return@withContext EngineResult(
                 false,
@@ -623,12 +650,110 @@ class RootSyncEngine(private val context: Context) {
         }
         if (dryRun) EngineResult(true, previewSummary())
         else {
+            val integrity = verifyTransferredData(
+                rsyncPath = rsyncPath,
+                host = host,
+                port = port,
+                localPath = sourcePath,
+                passwordFile = password,
+                direction = VerificationDirection.PUSH,
+                capture = integrityCapture,
+                onLog = onLog
+            )
+            if (!integrity.success) return@withContext integrity
             onProgress(1f)
             EngineResult(
                 true,
-                "${if (bidirectional) "双向同步发送阶段" else "只发送"}完成；未删除目标端数据，覆盖前版本已保存到 .rootsync-history"
+                "${if (bidirectional) "双向同步发送阶段" else "只发送"}完成，数据完整性校验通过；" +
+                    "未删除目标端数据，覆盖前版本已保存到 .rootsync-history"
             )
         }
+    }
+
+    private suspend fun verifyTransferredData(
+        rsyncPath: String,
+        host: String,
+        port: Int,
+        localPath: String,
+        passwordFile: File,
+        direction: VerificationDirection,
+        capture: TransferIntegrityCapture,
+        onLog: (String) -> Unit
+    ): EngineResult {
+        if (capture.relativeFiles.isEmpty()) {
+            return if (capture.observedBytes > 0L) {
+                EngineResult(false, "传输产生了数据，但未能建立完整性校验清单；任务不会标记为完成")
+            } else {
+                onLog("INTEGRITY_VERIFY_PASSED count=0 没有新增或更新文件")
+                EngineResult(true, "没有新增或更新文件，完整性校验通过")
+            }
+        }
+        val safeFiles = capture.relativeFiles.filter { relative ->
+            relative.isNotBlank() && !relative.startsWith('/') && '\u0000' !in relative &&
+                relative.split('/').none { it == ".." } &&
+                !relative.startsWith(".rootsync-history/") &&
+                !relative.startsWith(".rsync-partial/")
+        }.distinct()
+        if (safeFiles.size != capture.relativeFiles.size) {
+            return EngineResult(false, "完整性校验清单包含不安全路径；任务不会标记为完成")
+        }
+        val verifyList = File(runtimeDir, "integrity-${direction.name.lowercase()}.files")
+        verifyList.outputStream().buffered().use { output ->
+            safeFiles.forEach { relative ->
+                output.write(relative.toByteArray(Charsets.UTF_8))
+                output.write(0)
+            }
+        }
+        onLog("INTEGRITY_VERIFY_START count=${safeFiles.size} 正在逐文件计算并比对校验和…")
+        val command = when (direction) {
+            VerificationDirection.PULL -> RsyncCommandBuilder.verifyPull(
+                rsyncPath,
+                host,
+                port,
+                localPath,
+                passwordFile.absolutePath,
+                verifyList.absolutePath
+            )
+            VerificationDirection.PUSH -> RsyncCommandBuilder.verifyPush(
+                rsyncPath,
+                host,
+                port,
+                localPath,
+                passwordFile.absolutePath,
+                verifyList.absolutePath
+            )
+        }
+        val mismatches = linkedSetOf<String>()
+        val result = shell.execute(
+            command = command,
+            onLine = { line ->
+                val item = RsyncOutputParser.parseItem(line)
+                if (item != null && item.itemizedChange.getOrNull(1) != 'd') {
+                    if (mismatches.size < MAX_REPORTED_INTEGRITY_MISMATCHES) {
+                        mismatches += item.relativePath
+                    }
+                } else if (!line.contains(RsyncOutputParser.ITEM_PREFIX)) {
+                    onLog(line)
+                }
+            },
+            maxCapturedLines = 500
+        )
+        if (result.exitCode != 0) {
+            return EngineResult(
+                false,
+                "数据已传输，但完整性校验执行失败：${rsyncFailureSummary(result.exitCode, result.text)}",
+                result.exitCode
+            )
+        }
+        if (mismatches.isNotEmpty()) {
+            mismatches.forEach { onLog("INTEGRITY_MISMATCH $it") }
+            return EngineResult(
+                false,
+                "完整性校验未通过，发现至少 ${mismatches.size} 个内容不一致文件；任务不会标记为完成"
+            )
+        }
+        onLog("INTEGRITY_VERIFY_PASSED count=${safeFiles.size} 已同步文件内容一致")
+        return EngineResult(true, "${safeFiles.size} 个已同步文件完整性校验通过")
     }
 
     private suspend fun createTimeFileList(
@@ -690,7 +815,8 @@ class RootSyncEngine(private val context: Context) {
         onLog: (String) -> Unit,
         onProgress: (Float) -> Unit,
         onItem: (RsyncItem) -> Unit,
-        onTransferredBytes: (Long) -> Unit
+        onTransferredBytes: (Long) -> Unit,
+        integrityCapture: TransferIntegrityCapture? = null
     ): CommandResult {
         var parsedItemCount = 0
         ensureLifecycleWatchdog(bundledRsyncPath, onLog)
@@ -705,6 +831,9 @@ class RootSyncEngine(private val context: Context) {
                 .find(line)?.groupValues?.getOrNull(1)?.toIntOrNull()
             if (item != null) {
                 parsedItemCount += 1
+                if (item.itemizedChange.getOrNull(1) != 'd') {
+                    integrityCapture?.relativeFiles?.add(item.relativePath.trimEnd('/'))
+                }
                 onItem(item)
             } else if (line.contains(RsyncOutputParser.ITEM_PREFIX)) {
                 onLog("DIAG_PARSER_REJECTED $line")
@@ -712,7 +841,10 @@ class RootSyncEngine(private val context: Context) {
                 onLog(line)
             }
             progress?.let { onProgress(it.coerceIn(0, 100) / 100f) }
-            transferredBytes?.let(onTransferredBytes)
+            transferredBytes?.let { bytes ->
+                integrityCapture?.observedBytes = maxOf(integrityCapture?.observedBytes ?: 0L, bytes)
+                onTransferredBytes(bytes)
+            }
             },
             maxCapturedLines = 500
         )
@@ -722,6 +854,17 @@ class RootSyncEngine(private val context: Context) {
                 "parsedItems=$parsedItemCount"
         )
         return result
+    }
+
+    private enum class VerificationDirection { PULL, PUSH }
+
+    private data class TransferIntegrityCapture(
+        val relativeFiles: MutableSet<String> = linkedSetOf(),
+        var observedBytes: Long = 0L
+    )
+
+    private companion object {
+        const val MAX_REPORTED_INTEGRITY_MISMATCHES = 20
     }
 
     private suspend fun ensureLifecycleWatchdog(rsyncPath: String, onLog: (String) -> Unit) {

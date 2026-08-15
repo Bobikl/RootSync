@@ -1,23 +1,22 @@
 # RootSync APK
 
-- 文件：`RootSync-v0.2.24-debug-arm64.apk`
+- 文件：`RootSync-v0.2.26-debug-arm64.apk`
 - applicationId：`com.rootsync.android.debug`
-- versionCode / versionName：`26` / `0.2.24-debug`
+- versionCode / versionName：`28` / `0.2.26-debug`
 - minSdk / targetSdk：`26` / `36`
 - ABI：`arm64-v8a`
-- APK SHA-256：`64B31D088624205B8D0CEAEF42EBDDA4AA57CD4C7856D51709481E046C5D85FB`
+- APK SHA-256：`6A6D694A943E21CDC3E81B4D946273837288DB31CAEA720C2A4CB7A0B60F2E71`
 - 内置 rsync 3.4.4 SHA-256：`38FF6DE1B36F18CE391DF512713192F3129B733C8F2FE55122DA26B0A600A6E9`
 - 签名：Android Debug，APK Signature Scheme v2
 
-这是调试签名技术验证包，可覆盖安装此前的 RootSync debug 包。v0.2.15 至
-v0.2.24 的每个修复版本均保存在本目录，并对应同名 Git 标签；完整说明见
-`docs/修复回滚清单.md`。
+v0.2.25 将生命周期看门狗改成带唯一脚本路径和 PID 文件的独立 `sh` 进程。重复任务
+不再反复创建看门狗；应用异常退出时会清理本应用 rsync、daemon 以及孤立看门狗。
 
-本版继续强制零删除保护：目标端独有文件不删除，被更新文件的旧版本保存到
-`.rootsync-history/<同步时间>/`；客户端与 rsync daemon 双重拒绝删除类选项。
+v0.2.26 在正式传输结束后，为本次实际新增或更新的文件建立 NUL 分隔清单，并执行
+rsync `--checksum --dry-run` 零写入校验。校验失败时任务保持暂停；只有校验全部通过，
+界面、传输记录和系统通知才会显示同步完成。
 
-本轮重点改进后台接收保活、任务互斥、远端心跳、按设备隔离的续传记录、有界日志、
-界面刷新节流、局域网请求重试和短时预览统计复用。局域网控制协议升级到 v7，策略、
-服务准备、进度和密钥轮换消息均验证设备控制令牌。
+零删除保护保持不变：目标端独有文件不会删除，被更新文件的旧版本保存在
+`.rootsync-history/<同步时间>/`，完整性校验命令同样不包含任何删除或写入选项。
 
-两端必须同时安装 v0.2.24；已有配对配置会在覆盖安装后自动迁移，无需重新配对。
+两端必须同时安装 v0.2.26。完整分步版本见 `docs/修复回滚清单.md`。

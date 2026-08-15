@@ -3,7 +3,7 @@
 面向已 ROOT Android 手机的局域网 rsync 同步工具，依据
 `Android_ROOT_rsync_开发大纲.md` 开发。当前版本为 arm64 技术验证 APK。
 
-## 当前版本（0.2.24）
+## 当前版本（0.2.26）
 
 - Kotlin、Jetpack Compose、Material 3；`compileSdk/targetSdk 36`，适配 Android 15/16；
 - APK 内置经上游签名验证的 **rsync 3.4.4 arm64**，无需额外安装 ROOT rsync 模块；
@@ -37,6 +37,7 @@
 - 修复 300 GB、约 1.2 万文件目录在双向差异预览时因 `--checksum` 对双方全部文件逐个读取而长时间没有输出的问题；双向预览改用大小和修改时间快速筛选；
 - 修复取消预览只关闭 Java 端管道、ROOT rsync 子进程仍残留的问题；取消时校验 PID 后发送 INT，超时后强制结束，并清理 PID 文件；
 - 修复 Android 杀死应用进程后 ROOT `librsync.so` 脱离父进程继续占用 CPU：任务启动时创建独立生命周期看门狗，检测应用 PID 消失后终止传输进程和本应用 daemon；下次启动还会按 PID、配置路径和应用安装路径清理遗留进程；
+- 生命周期看门狗使用独立脚本路径和 PID 标记；重复任务复用同一实例，异常退出后同时清理 rsync、daemon 与孤立的本应用 `sh` 看门狗；
 - 前台传输任务从最近任务中被移除时立即转为暂停并终止底层 rsync，不再依赖 ViewModel 的 `onCleared`；
 - 新增跨重启持久诊断日志，保留当前与上一段日志；可从日志页导出 UTF-8 文本或复制 ADB 读取命令；
 - 对端扫描/同步结束后保留 8 秒完成提示，不再从“正在扫描”状态直接闪退消失；
@@ -52,6 +53,7 @@
 - rsync 客户端和服务端密钥文件改为 ROOT 所有、0600 权限，修复 ROOT 模式的密钥文件校验与部分错误 10；
 - rsync daemon 提供受限的 `send` 只读模块和 `receive` 只写模块，并拒绝全部删除类参数；
 - 客户端命令不生成删除参数，运行时再次拦截删除选项，代码中不执行显式清理命令；
+- 正式传输后只对本次实际新增或更新的文件执行 rsync `--checksum --dry-run` 零写入校验；校验失败时自动暂停，只有全部通过才标记完成并发送系统通知；
 - 目标端独有文件始终保留；被更新文件的旧版本保存到目标目录下的 `.rootsync-history`；
 - dry-run、partial 续传、超时和实时日志；
 - 修正默认哔哩哔哩包名为 `tv.danmaku.bili`；本机接收目录不存在时由 ROOT 自动创建；
@@ -69,7 +71,7 @@
 
 APK 输出：`app/build/outputs/apk/debug/app-debug.apk`
 
-已构建版本：`dist/RootSync-v0.2.24-debug-arm64.apk`
+已构建版本：`dist/RootSync-v0.2.26-debug-arm64.apk`
 
 ## 两机使用
 
@@ -83,7 +85,7 @@ APK 输出：`app/build/outputs/apk/debug/app-debug.apk`
 自动发现和首次连接弹窗要求对方 RootSync 处于打开状态。完成配对并启动 rsync
 服务后，rsync daemon 可独立运行，另一台设备可按已保存的 IP 和策略连接。
 
-0.2.24 使用带设备控制令牌认证的局域网控制协议 v7；两端必须同时安装 v0.2.24。
+0.2.26 使用带设备控制令牌认证的局域网控制协议 v7；两端必须同时安装 v0.2.26。
 
 ## 第三方源码与许可证
 

@@ -55,7 +55,6 @@ object RsyncOutputParser {
         val relativePath = pathPayload
             .substringBefore(" -> ")
             .removePrefix("./")
-            .trim()
         if (relativePath.isBlank()) return null
         val normalized = relativePath.trimEnd('/')
         val isDirectory = relativePath.endsWith('/') || itemized.getOrNull(1) == 'd'
@@ -110,6 +109,40 @@ object RsyncServerLogParser {
 }
 
 object RsyncCommandBuilder {
+    fun verifyPull(
+        rsyncPath: String,
+        host: String,
+        port: Int,
+        destination: String,
+        passwordFile: String,
+        filesFrom: String
+    ): String = verificationCommand(
+        rsyncPath = rsyncPath,
+        host = host,
+        port = port,
+        localPath = destination,
+        passwordFile = passwordFile,
+        filesFrom = filesFrom,
+        pull = true
+    )
+
+    fun verifyPush(
+        rsyncPath: String,
+        host: String,
+        port: Int,
+        source: String,
+        passwordFile: String,
+        filesFrom: String
+    ): String = verificationCommand(
+        rsyncPath = rsyncPath,
+        host = host,
+        port = port,
+        localPath = source,
+        passwordFile = passwordFile,
+        filesFrom = filesFrom,
+        pull = false
+    )
+
     fun pull(
         rsyncPath: String,
         host: String,
@@ -196,6 +229,47 @@ object RsyncCommandBuilder {
         if (dryRun) args += listOf("--dry-run", "--itemize-changes")
         args += source.trimEnd('/') + "/"
         args += "rsync://sync-user@$host:$port/receive/"
+        require(args.none(::isDeletionOption)) { "零删除模式禁止生成删除参数" }
+        return args.joinToString(" ") { SafeInput.shellQuote(it) }
+    }
+
+    private fun verificationCommand(
+        rsyncPath: String,
+        host: String,
+        port: Int,
+        localPath: String,
+        passwordFile: String,
+        filesFrom: String,
+        pull: Boolean
+    ): String {
+        require(SafeInput.isValidIpv4(host))
+        require(SafeInput.validateStoragePath(localPath) == null)
+        require(port in 1024..65535)
+        require(filesFrom.startsWith("/data/"))
+        val args = mutableListOf(
+            rsyncPath,
+            "-rlt",
+            "--checksum",
+            "--dry-run",
+            "--itemize-changes",
+            "--out-format=${RsyncOutputParser.ITEM_PREFIX}%i|%n%L|%l",
+            "--files-from=$filesFrom",
+            "--from0",
+            "--exclude=/.rootsync-history/***",
+            "--timeout=300",
+            "--contimeout=30",
+            "--no-perms",
+            "--no-owner",
+            "--no-group",
+            "--password-file=$passwordFile"
+        )
+        if (pull) {
+            args += "rsync://sync-user@$host:$port/send/"
+            args += localPath.trimEnd('/') + "/"
+        } else {
+            args += localPath.trimEnd('/') + "/"
+            args += "rsync://sync-user@$host:$port/receive/"
+        }
         require(args.none(::isDeletionOption)) { "零删除模式禁止生成删除参数" }
         return args.joinToString(" ") { SafeInput.shellQuote(it) }
     }
