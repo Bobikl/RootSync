@@ -40,6 +40,7 @@ captures/
 !dist/RootSync-v0.2.26-debug-arm64.apk
 !dist/RootSync-v0.2.27-debug-arm64.apk
 !dist/RootSync-v0.2.28-debug-arm64.apk
+!dist/RootSync-v0.2.29-debug-arm64.apk
 *.aab
 /native/rsync/build-android/
 /native/rsync/tmp/

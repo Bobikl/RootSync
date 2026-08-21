@@ -191,6 +191,7 @@ fun RootSyncApp(viewModel: SyncViewModel) {
 @Composable
 private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: PaddingValues) {
     val context = LocalContext.current
+    val configurationEnabled = !state.isBusy && !state.isCheckingPeerOnline
     val nearbyPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
@@ -245,7 +246,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        StatusHero(state, viewModel::refreshCapabilities)
+        StatusHero(state, viewModel::refreshCapabilities, refreshEnabled = configurationEnabled)
 
         state.remoteActivity?.let { activity ->
             SectionCard(
@@ -293,17 +294,22 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                         profile = profile,
                         selected = profile.id == state.selectedProfileId,
                         online = profile.deviceId in state.onlineDeviceIds,
+                        enabled = configurationEnabled,
                         onClick = { viewModel.selectProfile(profile.id) }
                     )
                 }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = viewModel::newProfile, modifier = Modifier.weight(1f)) {
+                OutlinedButton(
+                    onClick = viewModel::newProfile,
+                    enabled = configurationEnabled,
+                    modifier = Modifier.weight(1f)
+                ) {
                     Text("新建设备")
                 }
                 OutlinedButton(
                     onClick = viewModel::deleteSelectedProfile,
-                    enabled = state.selectedProfileId != null,
+                    enabled = configurationEnabled && state.selectedProfileId != null,
                     modifier = Modifier.weight(1f)
                 ) { Text("删除当前") }
             }
@@ -315,7 +321,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
         ) {
             Button(
                 onClick = startLanScan,
-                enabled = !state.isScanning,
+                enabled = configurationEnabled && !state.isScanning,
                 modifier = Modifier.fillMaxWidth()
             ) {
                 if (state.isScanning) {
@@ -333,6 +339,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                     DiscoveredDeviceRow(
                         device = device,
                         trusted = state.profiles.any { it.deviceId == device.deviceId },
+                        enabled = configurationEnabled,
                         onPair = { viewModel.requestPair(device.deviceId) }
                     )
                 }
@@ -343,6 +350,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
             OutlinedTextField(
                 value = state.profileName,
                 onValueChange = viewModel::setProfileName,
+                enabled = configurationEnabled,
                 label = { Text("设备名称") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth()
@@ -351,6 +359,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                 OutlinedTextField(
                     value = state.remoteHost,
                     onValueChange = viewModel::setRemoteHost,
+                    enabled = configurationEnabled,
                     label = { Text("远端 IP") },
                     placeholder = { Text("192.168.1.20") },
                     singleLine = true,
@@ -359,6 +368,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                 OutlinedTextField(
                     value = state.portText,
                     onValueChange = viewModel::setPort,
+                    enabled = configurationEnabled,
                     label = { Text("端口") },
                     singleLine = true,
                     modifier = Modifier.weight(0.55f)
@@ -367,6 +377,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
             OutlinedTextField(
                 value = state.remoteSecret,
                 onValueChange = viewModel::setRemoteSecret,
+                enabled = configurationEnabled,
                 label = { Text("远端配对密钥") },
                 placeholder = { Text("扫描配对后自动填写") },
                 singleLine = true,
@@ -383,6 +394,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                     FilterChip(
                         selected = state.role == role,
                         onClick = { viewModel.setRole(role) },
+                        enabled = configurationEnabled,
                         modifier = Modifier.fillMaxWidth(),
                         label = {
                             Text(
@@ -405,6 +417,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                     FilterChip(
                         selected = state.rangeMode == rangeMode,
                         onClick = { viewModel.setRangeMode(rangeMode) },
+                        enabled = configurationEnabled,
                         label = { Text(rangeMode.label) },
                         modifier = Modifier.weight(1f)
                     )
@@ -440,7 +453,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                                     ?: System.currentTimeMillis() - 24L * 60L * 60L * 1000L,
                                 onPicked = viewModel::setSinceEpochMillis
                             )
-                        }) { Text("选择") }
+                        }, enabled = configurationEnabled) { Text("选择") }
                     }
                 }
             }
@@ -481,6 +494,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                 SyncRole.SEND_ONLY -> OutlinedTextField(
                     value = state.sourcePath,
                     onValueChange = viewModel::setSourcePath,
+                    enabled = configurationEnabled,
                     label = { Text("本机发送源目录") },
                     minLines = 2,
                     modifier = Modifier.fillMaxWidth()
@@ -488,6 +502,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                 SyncRole.RECEIVE_ONLY -> OutlinedTextField(
                     value = state.destinationPath,
                     onValueChange = viewModel::setDestinationPath,
+                    enabled = configurationEnabled,
                     label = { Text("本机接收目录（不存在会自动创建）") },
                     minLines = 2,
                     modifier = Modifier.fillMaxWidth()
@@ -495,13 +510,18 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                 SyncRole.BIDIRECTIONAL -> OutlinedTextField(
                     value = state.sourcePath,
                     onValueChange = viewModel::setBidirectionalPath,
+                    enabled = configurationEnabled,
                     label = { Text("本机双向同步目录") },
                     supportingText = { Text("同一目录同时用于发送和接收") },
                     minLines = 2,
                     modifier = Modifier.fillMaxWidth()
                 )
             }
-            OutlinedButton(onClick = viewModel::saveCurrentProfile, modifier = Modifier.fillMaxWidth()) {
+            OutlinedButton(
+                onClick = viewModel::saveCurrentProfile,
+                enabled = configurationEnabled,
+                modifier = Modifier.fillMaxWidth()
+            ) {
                 Text("保存当前设备策略")
             }
         }
@@ -738,13 +758,14 @@ private fun ProfileRow(
     profile: PeerProfile,
     selected: Boolean,
     online: Boolean,
+    enabled: Boolean,
     onClick: () -> Unit
 ) {
     Surface(
         color = if (selected) MaterialTheme.colorScheme.primaryContainer
         else MaterialTheme.colorScheme.surfaceContainerHighest,
         shape = RoundedCornerShape(14.dp),
-        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick)
+        modifier = Modifier.fillMaxWidth().clickable(enabled = enabled, onClick = onClick)
     ) {
         Column(
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 11.dp),
@@ -790,6 +811,7 @@ private fun ProfileRow(
 private fun DiscoveredDeviceRow(
     device: DiscoveredDevice,
     trusted: Boolean,
+    enabled: Boolean,
     onPair: () -> Unit
 ) {
     Surface(
@@ -806,7 +828,7 @@ private fun DiscoveredDeviceRow(
                 Text(device.name, fontWeight = FontWeight.Medium)
                 Text("${device.host}:${device.port}", style = MaterialTheme.typography.bodySmall)
             }
-            Button(onClick = onPair) { Text(if (trusted) "已连接" else "配对") }
+            Button(onClick = onPair, enabled = enabled) { Text(if (trusted) "已连接" else "配对") }
         }
     }
 }
@@ -993,7 +1015,7 @@ private fun LogsPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
 }
 
 @Composable
-private fun StatusHero(state: SyncUiState, onRefresh: () -> Unit) {
+private fun StatusHero(state: SyncUiState, onRefresh: () -> Unit, refreshEnabled: Boolean = true) {
     Card(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
         shape = RoundedCornerShape(26.dp),
@@ -1023,7 +1045,7 @@ private fun StatusHero(state: SyncUiState, onRefresh: () -> Unit) {
                     )
                 }
                 if (state.isChecking) CircularProgressIndicator(Modifier.size(28.dp), strokeWidth = 3.dp)
-                else TextButton(onClick = onRefresh) { Text("刷新") }
+                else TextButton(onClick = onRefresh, enabled = refreshEnabled) { Text("刷新") }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 StatusPill("ROOT", state.capabilities.rootGranted)
