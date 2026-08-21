@@ -1706,8 +1706,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         val units = arrayOf("B", "KB", "MB", "GB", "TB", "PB")
         var scaled = value
         var unitIndex = 0
-        while (scaled >= 1024.0 && unitIndex < units.lastIndex) {
-            scaled /= 1024.0
+        while (scaled >= 1000.0 && unitIndex < units.lastIndex) {
+            scaled /= 1000.0
             unitIndex += 1
         }
         return if (unitIndex == 0) "${scaled.toLong()} ${units[unitIndex]}"

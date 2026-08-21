@@ -162,12 +162,16 @@ class SafeInputTest {
     @Test
     fun parsesHumanReadableTransferredBytes() {
         assertEquals(
-            12_582_912L,
+            12_000_000L,
             RsyncOutputParser.parseTransferredBytes("  12.00M  25%   4.00MB/s    0:00:03")
         )
         assertEquals(
             1_024L,
             RsyncOutputParser.parseTransferredBytes("1,024  50%   1.00kB/s    0:00:01")
+        )
+        assertEquals(
+            325_310_000_000L,
+            RsyncOutputParser.parseTransferredBytes("325.31G  99%  80.61MB/s    1:07:00")
         )
         assertNull(RsyncOutputParser.parseTransferredBytes("ROOTSYNC_ITEM:>f+++++++++|a|10"))
     }

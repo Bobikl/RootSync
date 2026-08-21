@@ -717,8 +717,8 @@ private fun formatDataSize(bytes: Long): String {
     val units = arrayOf("B", "KB", "MB", "GB", "TB", "PB")
     var value = bytes.coerceAtLeast(0L).toDouble()
     var index = 0
-    while (value >= 1024.0 && index < units.lastIndex) {
-        value /= 1024.0
+    while (value >= 1000.0 && index < units.lastIndex) {
+        value /= 1000.0
         index += 1
     }
     return if (index == 0) "${value.toLong()} ${units[index]}"

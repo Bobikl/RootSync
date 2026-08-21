@@ -80,8 +80,10 @@ object RsyncOutputParser {
         val number = if (suffix == null) raw else raw.dropLast(1)
         val value = number.toDoubleOrNull() ?: return null
         val power = suffix?.let { "KMGTPE".indexOf(it) + 1 } ?: 0
+        // rsync 单个 --human-readable（-h）使用 SI 1000 进位；此前按 1024 解析会把
+        // 已传输量放大约 7.37%，导致它与由 %l 精确求和的同步总量不一致。
         var factor = 1.0
-        repeat(power) { factor *= 1024.0 }
+        repeat(power) { factor *= 1000.0 }
         return (value * factor).toLong().coerceAtLeast(0L)
     }
 }
