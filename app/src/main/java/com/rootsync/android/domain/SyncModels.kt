@@ -211,6 +211,7 @@ data class SyncUiState(
     val discoveredDevices: List<DiscoveredDevice> = emptyList(),
     val onlineDeviceIds: Set<String> = emptySet(),
     val isScanning: Boolean = false,
+    val isCheckingPeerOnline: Boolean = false,
     val pendingPairRequest: PairRequest? = null,
     val serverRunning: Boolean = false,
     val phase: String = "等待检查",
@@ -236,6 +237,17 @@ data class SyncUiState(
 ) {
     val canOperate: Boolean
         get() = capabilities.rootGranted && capabilities.rsyncPath != null && !isBusy
+
+    val selectedPairedDeviceId: String?
+        get() = profiles.firstOrNull { it.id == selectedProfileId }
+            ?.deviceId
+            ?.takeUnless { it.startsWith("manual:") }
+
+    val isSelectedPeerOnline: Boolean
+        get() = selectedPairedDeviceId?.let { it in onlineDeviceIds } ?: true
+
+    val canStartTransfer: Boolean
+        get() = canOperate && !isCheckingPeerOnline && isSelectedPeerOnline
 
     companion object {
         const val DEFAULT_RSYNC_PORT = 8873

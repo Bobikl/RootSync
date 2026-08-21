@@ -1005,11 +1005,11 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun preview() = runTransfer(dryRun = true)
+    fun preview() = runTransferAfterPresenceCheck(dryRun = true)
 
     fun execute() {
         if (_state.value.transferRecord?.status == TransferStatus.PAUSED) resumeTransfer()
-        else runTransfer(dryRun = false)
+        else runTransferAfterPresenceCheck(dryRun = false)
     }
 
     fun resumeTransfer() {
@@ -1033,7 +1033,49 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         saveConfig()
-        runTransfer(dryRun = false, resumeRecord = record)
+        runTransferAfterPresenceCheck(dryRun = false, resumeRecord = record)
+    }
+
+    private fun runTransferAfterPresenceCheck(
+        dryRun: Boolean,
+        resumeRecord: TransferRecord? = null
+    ) {
+        val current = _state.value
+        if (current.isBusy || current.isCheckingPeerOnline) return
+        val profile = current.profiles.firstOrNull { it.id == current.selectedProfileId }
+        val pairedDeviceId = profile?.deviceId?.takeUnless { it.startsWith("manual:") }
+        if (pairedDeviceId == null) {
+            runTransfer(dryRun, resumeRecord)
+            return
+        }
+        _state.update {
+            it.copy(
+                isCheckingPeerOnline = true,
+                phase = "正在确认 ${profile.name} 是否在线",
+                lastResult = "正在发送实时在线探测…"
+            )
+        }
+        viewModelScope.launch {
+            val online = discovery.confirmPresence(pairedDeviceId, profile.host)
+            _state.update { state ->
+                state.copy(
+                    isCheckingPeerOnline = false,
+                    onlineDeviceIds = if (online) {
+                        state.onlineDeviceIds + pairedDeviceId
+                    } else {
+                        state.onlineDeviceIds - pairedDeviceId
+                    },
+                    phase = if (online) "设备在线，正在开始任务" else "所选设备离线",
+                    lastResult = if (online) {
+                        "${profile.name} 在线，已通过实时探测"
+                    } else {
+                        "${profile.name} 当前离线，未启动任何预览或传输"
+                    }
+                )
+            }
+            if (online) runTransfer(dryRun, resumeRecord)
+            else appendLog("WARN", "实时在线探测失败：${profile.name}/${profile.host}")
+        }
     }
 
     private fun runTransfer(dryRun: Boolean, resumeRecord: TransferRecord? = null) {

@@ -509,18 +509,19 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
             OutlinedButton(
                 onClick = viewModel::preview,
-                enabled = state.canOperate,
+                enabled = state.canStartTransfer,
                 modifier = Modifier.weight(1f)
             ) { Text("差异预览") }
             Button(
                 onClick = if (state.isBusy) {
                     if (state.isPreviewing) viewModel::cancel else viewModel::pauseTransfer
                 } else executeWithNotification,
-                enabled = state.isBusy || state.canOperate,
+                enabled = state.isBusy || state.canStartTransfer,
                 modifier = Modifier.weight(1f)
             ) {
                 Text(
                     when {
+                        state.isCheckingPeerOnline -> "正在确认在线"
                         state.isBusy && state.isPreviewing -> "取消预览"
                         state.isBusy -> "暂停传输"
                         state.transferRecord?.status == TransferStatus.PAUSED -> "继续传输"
@@ -528,6 +529,13 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                     }
                 )
             }
+        }
+        if (!state.isSelectedPeerOnline && state.selectedPairedDeviceId != null) {
+            Text(
+                "所选设备当前离线，差异预览、执行和继续传输已禁用。设备重新回应实时探测后才能开始。",
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall
+            )
         }
 
         AnimatedVisibility(state.isBusy || state.progress != null) {

@@ -174,6 +174,28 @@ class LanDiscoveryManager(
         }
     }
 
+    suspend fun confirmPresence(
+        deviceId: String,
+        host: String,
+        timeoutMillis: Long = ACTIVE_PRESENCE_TIMEOUT_MS
+    ): Boolean = withContext(Dispatchers.IO) {
+        start()
+        val startedAt = System.currentTimeMillis()
+        val address = runCatching { InetAddress.getByName(host) }.getOrNull() ?: return@withContext false
+        repeat(ACTIVE_PRESENCE_PROBE_BURSTS) { index ->
+            send(baseMessage(TYPE_DISCOVER), address)
+            if (index < ACTIVE_PRESENCE_PROBE_BURSTS - 1) delay(ACTIVE_PRESENCE_PROBE_INTERVAL_MS)
+        }
+        val deadline = System.currentTimeMillis() + timeoutMillis
+        while (System.currentTimeMillis() < deadline) {
+            if (_devices.value.any { it.deviceId == deviceId && it.lastSeenMillis >= startedAt }) {
+                return@withContext true
+            }
+            delay(100L)
+        }
+        false
+    }
+
     fun requestPair(
         device: DiscoveredDevice,
         role: SyncRole,
@@ -904,6 +926,9 @@ class LanDiscoveryManager(
         private const val PREPARE_TIMEOUT_MS = 30_000L
         private const val TRUST_RECONNECT_COOLDOWN_MS = 10_000L
         private const val REQUEST_TTL_MS = 2L * 60L * 1000L
+        private const val ACTIVE_PRESENCE_TIMEOUT_MS = 1_500L
+        private const val ACTIVE_PRESENCE_PROBE_BURSTS = 3
+        private const val ACTIVE_PRESENCE_PROBE_INTERVAL_MS = 180L
     }
 
     private data class PairIntent(
