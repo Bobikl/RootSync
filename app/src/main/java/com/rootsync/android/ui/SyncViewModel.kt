@@ -10,6 +10,7 @@ import androidx.lifecycle.viewModelScope
 import com.rootsync.android.BuildConfig
 import com.rootsync.android.diagnostics.DiagnosticLogger
 import com.rootsync.android.discovery.LanDiscoveryManager
+import com.rootsync.android.domain.DirectoryCreationPrompt
 import com.rootsync.android.domain.LogEntry
 import com.rootsync.android.domain.PairAccepted
 import com.rootsync.android.domain.PairRequest
@@ -25,11 +26,13 @@ import com.rootsync.android.domain.SyncUiState
 import com.rootsync.android.domain.TransferRecord
 import com.rootsync.android.domain.TransferStatus
 import com.rootsync.android.domain.TrustedPeerUpdate
+import com.rootsync.android.engine.DestinationDirectoryState
 import com.rootsync.android.engine.RootSyncEngine
 import com.rootsync.android.engine.EngineResult
 import com.rootsync.android.engine.RsyncItem
 import com.rootsync.android.engine.SafeInput
 import com.rootsync.android.service.TransferForegroundService
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -38,6 +41,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.LocalTime
@@ -74,6 +78,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     private var lastPreviewPlan: PreviewPlanCache? = null
     private var remoteSessionDeviceId: String? = null
     private var remoteSessionStartedAtMillis = 0L
+    @Volatile private var pendingDirectoryDecision: CompletableDeferred<Boolean>? = null
     private val operationMutex = Mutex()
     private val discovery = LanDiscoveryManager(
         context = application,
@@ -679,6 +684,53 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
+        if (localRole != SyncRole.SEND_ONLY) {
+            val destinationCheck = engine.inspectDestinationDirectory(activeProfile.destinationPath)
+            when (destinationCheck.state) {
+                DestinationDirectoryState.READY -> Unit
+                DestinationDirectoryState.MISSING -> {
+                    val allowed = awaitDirectoryCreationDecision(request, activeProfile.destinationPath)
+                    if (allowed != true) {
+                        val reason = if (allowed == false) {
+                            "接收端已拒绝创建接收目录"
+                        } else {
+                            "等待接收端确认创建目录超时"
+                        }
+                        releaseRemoteSession(request.deviceId, reason)
+                        _state.update {
+                            it.copy(
+                                isBusy = false,
+                                pendingDirectoryCreation = null,
+                                phase = reason,
+                                lastResult = reason
+                            )
+                        }
+                        discovery.answerSyncPreparation(request, false, reason, port)
+                        return
+                    }
+                    val createResult = engine.createDestinationDirectory(activeProfile.destinationPath)
+                    appendLog(if (createResult.success) "OK" else "ERROR", createResult.summary)
+                    if (!createResult.success) {
+                        releaseRemoteSession(request.deviceId, createResult.summary)
+                        _state.update {
+                            it.copy(isBusy = false, phase = "接收目录创建失败", lastResult = createResult.summary)
+                        }
+                        discovery.answerSyncPreparation(request, false, createResult.summary, port)
+                        return
+                    }
+                }
+                DestinationDirectoryState.UNWRITABLE,
+                DestinationDirectoryState.INVALID -> {
+                    releaseRemoteSession(request.deviceId, destinationCheck.message)
+                    _state.update {
+                        it.copy(isBusy = false, phase = "接收目录不可用", lastResult = destinationCheck.message)
+                    }
+                    discovery.answerSyncPreparation(request, false, destinationCheck.message, port)
+                    return
+                }
+            }
+        }
+
         _state.update { it.copy(isBusy = true, phase = "正在为 ${request.name} 准备服务端") }
         val result = try {
             engine.startServer(
@@ -691,7 +743,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 mode = localRole,
                 rangeMode = request.rangeMode,
                 sinceEpochMillis = request.sinceEpochMillis,
-                untilEpochMillis = request.untilEpochMillis
+                untilEpochMillis = request.untilEpochMillis,
+                allowCreateDestination = false
             )
         } catch (error: Exception) {
             com.rootsync.android.engine.EngineResult(
@@ -711,6 +764,64 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         if (!result.success) clearRemoteActivity(request.deviceId)
         else scheduleRemoteSessionStartTimeout(request.deviceId, remoteSessionStartedAtMillis)
         discovery.answerSyncPreparation(request, result.success, result.summary, port)
+    }
+
+    private suspend fun awaitDirectoryCreationDecision(
+        request: SyncPrepareRequest,
+        path: String
+    ): Boolean? {
+        val decision = CompletableDeferred<Boolean>()
+        pendingDirectoryDecision = decision
+        val prompt = DirectoryCreationPrompt(
+            deviceId = request.deviceId,
+            deviceName = request.name,
+            path = path,
+            isPreview = request.isPreview
+        )
+        _state.update {
+            it.copy(
+                isBusy = true,
+                pendingDirectoryCreation = prompt,
+                phase = "等待选择是否创建接收目录",
+                lastResult = "${request.name} 请求向不存在的目录发送数据"
+            )
+        }
+        discovery.answerSyncPreparationWaiting(request, "接收目录不存在，正在等待用户选择是否创建")
+        TransferForegroundService.update(
+            context = getApplication(),
+            title = "RootSync 需要确认接收目录",
+            detail = "${request.name} 请求创建：$path",
+            eta = null,
+            progress = null,
+            incoming = true
+        )
+        appendLog("LAN", "${request.name} 等待本机确认创建接收目录：$path")
+        val answer = withTimeoutOrNull(DIRECTORY_DECISION_TIMEOUT_MS) { decision.await() }
+        if (pendingDirectoryDecision === decision) pendingDirectoryDecision = null
+        _state.update { state ->
+            if (state.pendingDirectoryCreation == prompt) {
+                state.copy(pendingDirectoryCreation = null)
+            } else state
+        }
+        TransferForegroundService.stop(getApplication())
+        return answer
+    }
+
+    fun answerDirectoryCreation(allow: Boolean) {
+        val prompt = _state.value.pendingDirectoryCreation ?: return
+        val completed = pendingDirectoryDecision?.complete(allow) == true
+        if (!completed) return
+        _state.update {
+            it.copy(
+                pendingDirectoryCreation = null,
+                phase = if (allow) "正在创建接收目录" else "已拒绝创建接收目录",
+                lastResult = if (allow) {
+                    "已允许为 ${prompt.deviceName} 创建接收目录"
+                } else {
+                    "已拒绝 ${prompt.deviceName} 的接收目录创建请求"
+                }
+            )
+        }
     }
 
     private fun applySyncActivity(update: SyncActivityUpdate) {
@@ -1816,7 +1927,26 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             rangeMode = current.rangeMode,
             sinceEpochMillis = current.sinceEpochMillis,
             untilEpochMillis = untilEpochMillis,
-            isPreview = isPreview
+            isPreview = isPreview,
+            onWaiting = { status ->
+                val waitingText = "${profile.name} 正在选择操作：$status"
+                _state.update { state ->
+                    state.copy(
+                        phase = "${profile.name} 正在选择操作",
+                        previewStatusText = if (isPreview) waitingText else state.previewStatusText,
+                        lastResult = waitingText,
+                        transferRecord = if (!isPreview) {
+                            state.transferRecord?.copy(
+                                updatedAtMillis = System.currentTimeMillis(),
+                                message = waitingText
+                            )
+                        } else state.transferRecord
+                    )
+                }
+                if (!isPreview) {
+                    updateTransferNotification(current.role.label, waitingText, null, current.progress)
+                }
+            }
         )
         if (prepared == null) {
             val reachableFallback = engine.isServerReachable(current.remoteHost, configuredPort)
@@ -1944,6 +2074,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     override fun onCleared() {
+        pendingDirectoryDecision?.cancel()
         discovery.stop()
         super.onCleared()
     }
@@ -2185,6 +2316,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         const val REMOTE_ACTIVITY_HEARTBEAT_MS = 30_000L
         const val REMOTE_ACTIVITY_FINISHED_HOLD_MS = 8_000L
         const val REMOTE_SESSION_START_TIMEOUT_MS = 2L * 60L * 1000L
+        const val DIRECTORY_DECISION_TIMEOUT_MS = 110_000L
         const val RSYNC_PROBE_RELEASE_DELAY_MS = 1_000L
         const val PROFILE_PRESENCE_INTERVAL_MS = 15_000L
         const val PROFILE_ONLINE_TTL_MS = 45_000L

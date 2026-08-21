@@ -77,6 +77,7 @@ class LanDiscoveryManager(
     private val cachedResponses = ConcurrentHashMap<String, CachedResponse>()
     private val trustedReconnectTimes = ConcurrentHashMap<String, Long>()
     private val prepareWaiters = ConcurrentHashMap<String, CompletableDeferred<SyncPrepareResult>>()
+    private val prepareStatusListeners = ConcurrentHashMap<String, (String) -> Unit>()
     private val resolveQueue = ConcurrentLinkedQueue<NsdServiceInfo>()
     private val resolving = AtomicBoolean(false)
     private val scanGeneration = AtomicInteger(0)
@@ -276,12 +277,14 @@ class LanDiscoveryManager(
         sinceEpochMillis: Long?,
         untilEpochMillis: Long,
         isPreview: Boolean,
-        timeoutMillis: Long = PREPARE_TIMEOUT_MS
+        timeoutMillis: Long = PREPARE_TIMEOUT_MS,
+        onWaiting: (String) -> Unit = {}
     ): SyncPrepareResult? {
         start()
         val requestId = UUID.randomUUID().toString()
         val waiter = CompletableDeferred<SyncPrepareResult>()
         prepareWaiters[requestId] = waiter
+        prepareStatusListeners[requestId] = onWaiting
         val message = baseMessage(TYPE_SYNC_PREPARE)
             .put("requestId", requestId)
             .put("secret", localSecret())
@@ -300,6 +303,7 @@ class LanDiscoveryManager(
         } finally {
             retryJob.cancel()
             prepareWaiters.remove(requestId, waiter)
+            prepareStatusListeners.remove(requestId)
         }
     }
 
@@ -364,6 +368,15 @@ class LanDiscoveryManager(
         if (ready) message.put("secret", localSecret())
         cachedResponses[request.requestId] = CachedResponse(message.toString(), System.currentTimeMillis())
         scope.launch { send(message, InetAddress.getByName(request.host)) }
+    }
+
+    fun answerSyncPreparationWaiting(request: SyncPrepareRequest, messageText: String) {
+        start()
+        val message = baseMessage(TYPE_SYNC_WAITING)
+            .put("requestId", request.requestId)
+            .put("controlToken", localControlToken())
+            .put("message", messageText.take(240))
+        scope.launch { sendRepeated(message, InetAddress.getByName(request.host), 2, 180L) }
     }
 
     fun stop() {
@@ -784,6 +797,15 @@ class LanDiscoveryManager(
                 )
                 prepareWaiters.remove(requestId)?.complete(result)
             }
+            TYPE_SYNC_WAITING -> {
+                val requestId = message.optString("requestId")
+                val controlToken = message.optString("controlToken")
+                if (!isValidTrustedControl(remoteDeviceId, controlToken)) return
+                val status = message.optString("message").ifBlank { "对方正在选择操作" }
+                prepareStatusListeners[requestId]?.let { listener ->
+                    runCatching { listener(status) }
+                }
+            }
         }
     }
 
@@ -922,8 +944,9 @@ class LanDiscoveryManager(
         private const val TYPE_STRATEGY_UPDATE = "strategy_update"
         private const val TYPE_SYNC_PREPARE = "sync_prepare"
         private const val TYPE_SYNC_READY = "sync_ready"
+        private const val TYPE_SYNC_WAITING = "sync_waiting"
         private const val TYPE_SYNC_ACTIVITY = "sync_activity"
-        private const val PREPARE_TIMEOUT_MS = 30_000L
+        private const val PREPARE_TIMEOUT_MS = 120_000L
         private const val TRUST_RECONNECT_COOLDOWN_MS = 10_000L
         private const val REQUEST_TTL_MS = 2L * 60L * 1000L
         private const val ACTIVE_PRESENCE_TIMEOUT_MS = 1_500L

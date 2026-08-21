@@ -134,6 +134,13 @@ data class SyncPrepareResult(
     val secret: String
 )
 
+data class DirectoryCreationPrompt(
+    val deviceId: String,
+    val deviceName: String,
+    val path: String,
+    val isPreview: Boolean
+)
+
 data class SyncActivityUpdate(
     val deviceId: String,
     val name: String,
@@ -213,6 +220,7 @@ data class SyncUiState(
     val isScanning: Boolean = false,
     val isCheckingPeerOnline: Boolean = false,
     val pendingPairRequest: PairRequest? = null,
+    val pendingDirectoryCreation: DirectoryCreationPrompt? = null,
     val serverRunning: Boolean = false,
     val phase: String = "等待检查",
     val progress: Float? = null,

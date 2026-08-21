@@ -28,6 +28,18 @@ data class EngineResult(
     val exitCode: Int = 0
 )
 
+enum class DestinationDirectoryState {
+    READY,
+    MISSING,
+    UNWRITABLE,
+    INVALID
+}
+
+data class DestinationDirectoryCheck(
+    val state: DestinationDirectoryState,
+    val message: String
+)
+
 class RootSyncEngine(private val context: Context) {
     private val shell = RootShell()
     private val controlShell = RootShell()
@@ -126,21 +138,26 @@ class RootSyncEngine(private val context: Context) {
         val destinationError = SafeInput.validateStoragePath(destinationPath)
         val destinationResult = if (destinationError == null) {
             shell.execute(
-                "mkdir -p ${SafeInput.shellQuote(destinationPath)} && " +
-                    "test -d ${SafeInput.shellQuote(destinationPath)} && " +
+                "test -d ${SafeInput.shellQuote(destinationPath)} && " +
                     "test -w ${SafeInput.shellQuote(destinationPath)}"
             )
         } else null
+        val destinationExists = destinationError == null && shell.execute(
+            "test -d ${SafeInput.shellQuote(destinationPath)}"
+        ).exitCode == 0
         checks += CapabilityCheck(
             "本机接收目录",
             when {
                 destinationError != null -> CheckState.FAIL
                 destinationResult?.exitCode == 0 -> CheckState.PASS
+                !destinationExists -> CheckState.WARNING
                 else -> CheckState.FAIL
             },
             destinationError ?: if (destinationResult?.exitCode == 0) {
-                "ROOT 可写；原目录不存在时已自动创建"
-            } else "无法创建或写入该目录"
+                "ROOT 可写"
+            } else if (!destinationExists) {
+                "目录不存在；接收任务开始时会询问是否创建"
+            } else "目录存在但无法写入"
         )
 
         return DeviceCapabilities(
@@ -174,6 +191,37 @@ class RootSyncEngine(private val context: Context) {
         return shell.execute(command).output.firstOrNull { it.startsWith("/storage/") }?.trim()
     }
 
+    suspend fun inspectDestinationDirectory(path: String): DestinationDirectoryCheck =
+        withContext(Dispatchers.IO) {
+            SafeInput.validateStoragePath(path)?.let {
+                return@withContext DestinationDirectoryCheck(DestinationDirectoryState.INVALID, it)
+            }
+            val result = shell.execute(
+                "if [ -d ${SafeInput.shellQuote(path)} ]; then " +
+                    "if [ -w ${SafeInput.shellQuote(path)} ]; then echo READY; else echo UNWRITABLE; fi; " +
+                    "elif [ -e ${SafeInput.shellQuote(path)} ]; then echo UNWRITABLE; " +
+                    "else echo MISSING; fi"
+            )
+            when (result.output.firstOrNull()?.trim()) {
+                "READY" -> DestinationDirectoryCheck(DestinationDirectoryState.READY, "接收目录已存在且可写")
+                "MISSING" -> DestinationDirectoryCheck(DestinationDirectoryState.MISSING, "接收目录不存在")
+                else -> DestinationDirectoryCheck(DestinationDirectoryState.UNWRITABLE, "接收目录存在但不可写")
+            }
+        }
+
+    suspend fun createDestinationDirectory(path: String): EngineResult = withContext(Dispatchers.IO) {
+        SafeInput.validateStoragePath(path)?.let { return@withContext EngineResult(false, it) }
+        val result = shell.execute(
+            "mkdir -p ${SafeInput.shellQuote(path)} && " +
+                "test -d ${SafeInput.shellQuote(path)} && test -w ${SafeInput.shellQuote(path)}"
+        )
+        if (result.exitCode == 0) {
+            EngineResult(true, "已创建接收目录：$path")
+        } else {
+            EngineResult(false, "接收目录创建失败或不可写：$path", result.exitCode)
+        }
+    }
+
     suspend fun startServer(
         rsyncPath: String,
         sourcePath: String,
@@ -184,7 +232,8 @@ class RootSyncEngine(private val context: Context) {
         mode: SyncRole? = null,
         rangeMode: SyncRangeMode = SyncRangeMode.ALL,
         sinceEpochMillis: Long? = null,
-        untilEpochMillis: Long = System.currentTimeMillis()
+        untilEpochMillis: Long = System.currentTimeMillis(),
+        allowCreateDestination: Boolean = true
     ): EngineResult = withContext(Dispatchers.IO) {
         onLog(
             "DIAG_SERVER_PREPARE mode=${mode?.name ?: "MANUAL"} range=${rangeMode.name} " +
@@ -211,10 +260,22 @@ class RootSyncEngine(private val context: Context) {
         }
         if (servesReceiveModule) {
             val destinationReady = shell.execute(
-                "mkdir -p ${SafeInput.shellQuote(destinationPath)} && test -w ${SafeInput.shellQuote(destinationPath)}"
+                if (allowCreateDestination) {
+                    "mkdir -p ${SafeInput.shellQuote(destinationPath)} && " +
+                        "test -d ${SafeInput.shellQuote(destinationPath)} && test -w ${SafeInput.shellQuote(destinationPath)}"
+                } else {
+                    "test -d ${SafeInput.shellQuote(destinationPath)} && test -w ${SafeInput.shellQuote(destinationPath)}"
+                }
             )
             if (destinationReady.exitCode != 0) {
-                return@withContext EngineResult(false, "接收目录无法创建或不可写：$destinationPath")
+                return@withContext EngineResult(
+                    false,
+                    if (allowCreateDestination) {
+                        "接收目录无法创建或不可写：$destinationPath"
+                    } else {
+                        "接收目录不存在或不可写：$destinationPath"
+                    }
+                )
             }
         }
 

@@ -136,6 +136,40 @@ fun RootSyncApp(viewModel: SyncViewModel) {
             )
         }
 
+        state.pendingDirectoryCreation?.let { prompt ->
+            AlertDialog(
+                onDismissRequest = { viewModel.answerDirectoryCreation(false) },
+                title = { Text("创建接收文件夹？") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
+                            "${prompt.deviceName} 准备${if (prompt.isPreview) "扫描差异" else "发送数据"}，" +
+                                "但本机接收文件夹不存在。"
+                        )
+                        Text(
+                            prompt.path,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            "选择创建后才会继续；拒绝不会创建目录，也不会写入任何文件。",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                },
+                confirmButton = {
+                    Button(onClick = { viewModel.answerDirectoryCreation(true) }) {
+                        Text("创建并继续")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { viewModel.answerDirectoryCreation(false) }) {
+                        Text("拒绝")
+                    }
+                }
+            )
+        }
+
         Scaffold(
             topBar = {
                 TopAppBar(
