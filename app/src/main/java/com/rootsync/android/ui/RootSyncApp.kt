@@ -909,7 +909,7 @@ private fun ServerPage(state: SyncUiState, viewModel: SyncViewModel, padding: Pa
                 value = state.destinationPath,
                 onValueChange = viewModel::setDestinationPath,
                 enabled = !state.serverRunning,
-                label = { Text("receive：本机接收目录（自动创建）") },
+                label = { Text("receive：本机接收目录（缺失时询问）") },
                 minLines = 2,
                 modifier = Modifier.fillMaxWidth()
             )

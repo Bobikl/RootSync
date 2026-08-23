@@ -846,6 +846,55 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         return answer
     }
 
+    private suspend fun ensureLocalDestinationReady(
+        requesterName: String,
+        path: String,
+        isPreview: Boolean
+    ): Boolean {
+        val check = engine.inspectDestinationDirectory(path)
+        when (check.state) {
+            DestinationDirectoryState.READY -> return true
+            DestinationDirectoryState.UNWRITABLE,
+            DestinationDirectoryState.INVALID -> {
+                appendLog("ERROR", check.message)
+                _state.update { it.copy(phase = "接收目录不可用", lastResult = check.message) }
+                return false
+            }
+            DestinationDirectoryState.MISSING -> Unit
+        }
+
+        val decision = CompletableDeferred<Boolean>()
+        pendingDirectoryDecision = decision
+        val prompt = DirectoryCreationPrompt(
+            deviceId = _state.value.selectedPairedDeviceId ?: "local",
+            deviceName = requesterName,
+            path = path,
+            isPreview = isPreview
+        )
+        _state.update {
+            it.copy(
+                pendingDirectoryCreation = prompt,
+                phase = "等待确认创建本机接收目录",
+                lastResult = "本机接收目录不存在，确认后才会创建"
+            )
+        }
+        val allowed = withTimeoutOrNull(DIRECTORY_DECISION_TIMEOUT_MS) { decision.await() }
+        if (pendingDirectoryDecision === decision) pendingDirectoryDecision = null
+        _state.update { state ->
+            if (state.pendingDirectoryCreation == prompt) state.copy(pendingDirectoryCreation = null) else state
+        }
+        if (allowed != true) {
+            val message = if (allowed == false) "用户拒绝创建本机接收目录" else "确认创建本机接收目录超时"
+            appendLog("WARN", message)
+            _state.update { it.copy(phase = "未创建接收目录", lastResult = message) }
+            return false
+        }
+        val createResult = engine.createDestinationDirectory(path)
+        appendLog(if (createResult.success) "OK" else "ERROR", createResult.summary)
+        _state.update { it.copy(lastResult = createResult.summary) }
+        return createResult.success
+    }
+
     fun answerDirectoryCreation(allow: Boolean) {
         val prompt = _state.value.pendingDirectoryCreation ?: return
         val completed = pendingDirectoryDecision?.complete(allow) == true
@@ -1155,6 +1204,9 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             sourceError != null -> appendLog("ERROR", sourceError)
             destinationError != null -> appendLog("ERROR", destinationError)
             else -> launchBusy("正在启动服务端") {
+                if (!ensureLocalDestinationReady("本机服务端", current.destinationPath, false)) {
+                    return@launchBusy
+                }
                 val result = engine.startServer(
                     rsync,
                     current.sourcePath,
@@ -1305,8 +1357,14 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         val action = current.role.label
         launchBusy(
             phase = if (dryRun) "正在预览${action}差异" else "正在执行$action",
-            localTransfer = true
+            localTransfer = false
         ) {
+            if (current.role != SyncRole.SEND_ONLY &&
+                !ensureLocalDestinationReady(current.profileName, current.destinationPath, dryRun)
+            ) {
+                return@launchBusy
+            }
+            _state.update { it.copy(localTransferActive = true) }
             pauseRequested = false
             localTransferItemCount = 0
             lastTransferItemUiMillis = 0L

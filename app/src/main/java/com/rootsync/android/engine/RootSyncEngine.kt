@@ -233,7 +233,7 @@ class RootSyncEngine(private val context: Context) {
         rangeMode: SyncRangeMode = SyncRangeMode.ALL,
         sinceEpochMillis: Long? = null,
         untilEpochMillis: Long = System.currentTimeMillis(),
-        allowCreateDestination: Boolean = true
+        allowCreateDestination: Boolean = false
     ): EngineResult = withContext(Dispatchers.IO) {
         onLog(
             "DIAG_SERVER_PREPARE mode=${mode?.name ?: "MANUAL"} range=${rangeMode.name} " +
@@ -522,10 +522,10 @@ class RootSyncEngine(private val context: Context) {
             return@withContext EngineResult(false, it)
         }
         val destinationReady = shell.execute(
-            "mkdir -p ${SafeInput.shellQuote(destinationPath)} && test -w ${SafeInput.shellQuote(destinationPath)}"
+            "test -d ${SafeInput.shellQuote(destinationPath)} && test -w ${SafeInput.shellQuote(destinationPath)}"
         )
         if (destinationReady.exitCode != 0) {
-            return@withContext EngineResult(false, "本机接收目录无法创建或不可写")
+            return@withContext EngineResult(false, "本机接收目录不存在或不可写；未获得确认时不会自动创建")
         }
 
         val password = File(runtimeDir, "client.password")
