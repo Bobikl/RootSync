@@ -84,6 +84,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     private var nsdPortRefreshJob: Job? = null
     @Volatile private var pendingDirectoryDecision: CompletableDeferred<Boolean>? = null
     private val operationMutex = Mutex()
+    private val remotePrepareMutex = Mutex()
     private val discovery = LanDiscoveryManager(
         context = application,
         deviceId = deviceId,
@@ -162,7 +163,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             discovery.strategyUpdates.collect { update -> applyRemoteStrategy(update) }
         }
         viewModelScope.launch {
-            discovery.syncPrepareRequests.collect { request -> handleSyncPrepareRequest(request) }
+            discovery.syncPrepareRequests.collect { request -> dispatchSyncPrepareRequest(request) }
         }
         viewModelScope.launch {
             discovery.syncActivityUpdates.collect { update -> applySyncActivity(update) }
@@ -826,6 +827,22 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             port = port,
             sessionSecret = sessionSecret.takeIf { result.success }
         )
+    }
+
+    private fun dispatchSyncPrepareRequest(request: SyncPrepareRequest) {
+        if (!remotePrepareMutex.tryLock()) {
+            val port = SafeInput.parsePort(_state.value.serverPortText) ?: SyncUiState.DEFAULT_RSYNC_PORT
+            discovery.answerSyncPreparation(request, false, "本机正在处理另一台设备的连接请求", port)
+            appendLog("LAN", "已向 ${request.name} 返回忙碌状态，未排队等待其他设备的决定")
+            return
+        }
+        viewModelScope.launch {
+            try {
+                handleSyncPrepareRequest(request)
+            } finally {
+                remotePrepareMutex.unlock()
+            }
+        }
     }
 
     private suspend fun awaitDirectoryCreationDecision(
