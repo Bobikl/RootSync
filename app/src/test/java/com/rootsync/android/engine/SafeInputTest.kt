@@ -55,7 +55,6 @@ class SafeInputTest {
             passwordFile = "/data/user/0/app/password",
             backupRunId = "20260809-210000-000",
             filesFrom = null,
-            bidirectional = false,
             dryRun = true
         )
         val push = RsyncCommandBuilder.push(
@@ -66,7 +65,6 @@ class SafeInputTest {
             passwordFile = "/data/user/0/app/password",
             backupRunId = "20260809-210000-000",
             filesFrom = null,
-            bidirectional = false,
             dryRun = false
         )
         assertTrue(pull.contains("/send/"))
@@ -76,6 +74,8 @@ class SafeInputTest {
         assertTrue(push.contains("--backup"))
         assertTrue(pull.contains("--partial-dir=.rsync-partial"))
         assertTrue(push.contains("--partial-dir=.rsync-partial"))
+        assertTrue(pull.contains("--update"))
+        assertTrue(push.contains("--update"))
         assertTrue(pull.contains("ROOTSYNC_ITEM:%i|%n%L"))
         assertTrue(push.contains("ROOTSYNC_ITEM:%i|%n%L"))
         assertTrue(pull.contains(".rootsync-history/20260809-210000-000"))
@@ -96,7 +96,6 @@ class SafeInputTest {
             passwordFile = "/data/user/0/app/password",
             backupRunId = "20260809-210000-000",
             filesFrom = "/data/user/0/app/remote.files",
-            bidirectional = true,
             dryRun = false
         )
         assertTrue(command.contains("--files-from=/data/user/0/app/remote.files"))
@@ -117,7 +116,6 @@ class SafeInputTest {
             passwordFile = "/data/user/0/app/password",
             backupRunId = "20260809-210000-000",
             filesFrom = null,
-            bidirectional = false,
             dryRun = true,
             strictChecksum = true
         )

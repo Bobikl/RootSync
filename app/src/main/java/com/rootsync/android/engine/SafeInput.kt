@@ -159,7 +159,6 @@ object RsyncCommandBuilder {
         passwordFile: String,
         backupRunId: String,
         filesFrom: String?,
-        bidirectional: Boolean,
         dryRun: Boolean,
         strictChecksum: Boolean = false
     ): String {
@@ -190,7 +189,8 @@ object RsyncCommandBuilder {
         )
         filesFrom?.let { args += listOf("--files-from=$it", "--from0") }
         if (strictChecksum) args += "--checksum"
-        if (bidirectional) args += "--update"
+        // 单向和双向都不允许较旧来源覆盖目标端更新版本；目标端独有文件也始终保留。
+        args += "--update"
         if (dryRun) args += listOf("--dry-run", "--itemize-changes")
         args += "rsync://sync-user@$host:$port/send/"
         args += destination.trimEnd('/') + "/"
@@ -206,7 +206,6 @@ object RsyncCommandBuilder {
         passwordFile: String,
         backupRunId: String,
         filesFrom: String?,
-        bidirectional: Boolean,
         dryRun: Boolean,
         strictChecksum: Boolean = false
     ): String {
@@ -237,7 +236,7 @@ object RsyncCommandBuilder {
         )
         filesFrom?.let { args += listOf("--files-from=$it", "--from0") }
         if (strictChecksum) args += "--checksum"
-        if (bidirectional) args += "--update"
+        args += "--update"
         if (dryRun) args += listOf("--dry-run", "--itemize-changes")
         args += source.trimEnd('/') + "/"
         args += "rsync://sync-user@$host:$port/receive/"

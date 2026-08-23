@@ -582,7 +582,6 @@ class RootSyncEngine(private val context: Context) {
             passwordFile = password.absolutePath,
             backupRunId = backupRunId(),
             filesFrom = remoteFileList.absolutePath.takeIf { rangeMode == SyncRangeMode.SINCE },
-            bidirectional = bidirectional,
             dryRun = dryRun,
             strictChecksum = strictChecksum
         )
@@ -697,7 +696,6 @@ class RootSyncEngine(private val context: Context) {
             passwordFile = password.absolutePath,
             backupRunId = backupRunId(),
             filesFrom = localFileList.absolutePath.takeIf { rangeMode == SyncRangeMode.SINCE },
-            bidirectional = bidirectional,
             dryRun = dryRun,
             strictChecksum = strictChecksum
         )
