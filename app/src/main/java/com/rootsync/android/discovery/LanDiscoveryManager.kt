@@ -11,6 +11,8 @@ import android.os.Build
 import com.rootsync.android.domain.DiscoveredDevice
 import com.rootsync.android.domain.PairAccepted
 import com.rootsync.android.domain.PairRequest
+import com.rootsync.android.domain.RemoteStorageCheckRequest
+import com.rootsync.android.domain.RemoteStorageCheckResult
 import com.rootsync.android.domain.StrategyUpdate
 import com.rootsync.android.domain.SyncActivityType
 import com.rootsync.android.domain.SyncActivityUpdate
@@ -77,6 +79,7 @@ class LanDiscoveryManager(
     private val cachedResponses = ConcurrentHashMap<String, CachedResponse>()
     private val trustedReconnectTimes = ConcurrentHashMap<String, Long>()
     private val prepareWaiters = ConcurrentHashMap<String, CompletableDeferred<SyncPrepareResult>>()
+    private val storageCheckWaiters = ConcurrentHashMap<String, CompletableDeferred<RemoteStorageCheckResult>>()
     private val prepareStatusListeners = ConcurrentHashMap<String, (String) -> Unit>()
     private val activityAckWaiters = ConcurrentHashMap<String, CompletableDeferred<Unit>>()
     private val resolveQueue = ConcurrentLinkedQueue<NsdServiceInfo>()
@@ -115,6 +118,13 @@ class LanDiscoveryManager(
         onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
     val syncPrepareRequests: SharedFlow<SyncPrepareRequest> = _syncPrepareRequests.asSharedFlow()
+
+    private val _remoteStorageCheckRequests = MutableSharedFlow<RemoteStorageCheckRequest>(
+        extraBufferCapacity = 8,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val remoteStorageCheckRequests: SharedFlow<RemoteStorageCheckRequest> =
+        _remoteStorageCheckRequests.asSharedFlow()
 
     private val _syncActivityUpdates = MutableSharedFlow<SyncActivityUpdate>(
         extraBufferCapacity = 16,
@@ -324,6 +334,36 @@ class LanDiscoveryManager(
         }
     }
 
+    suspend fun requestRemoteStorageCheck(
+        host: String,
+        expectedDownloadBytes: Long,
+        timeoutMillis: Long = STORAGE_CHECK_TIMEOUT_MS
+    ): RemoteStorageCheckResult? {
+        if (expectedDownloadBytes <= 0L) return null
+        start()
+        val requestId = UUID.randomUUID().toString()
+        val waiter = CompletableDeferred<RemoteStorageCheckResult>()
+        storageCheckWaiters[requestId] = waiter
+        val message = baseMessage(TYPE_STORAGE_CHECK)
+            .put("requestId", requestId)
+            .put("secret", localSecret())
+            .put("controlToken", localControlToken())
+            .put("expectedDownloadBytes", expectedDownloadBytes)
+        val retryJob = scope.launch {
+            val address = InetAddress.getByName(host)
+            while (isActive && !waiter.isCompleted) {
+                send(message, address)
+                delay(STORAGE_CHECK_RETRY_INTERVAL_MS)
+            }
+        }
+        return try {
+            withTimeoutOrNull(timeoutMillis) { waiter.await() }
+        } finally {
+            retryJob.cancel()
+            storageCheckWaiters.remove(requestId, waiter)
+        }
+    }
+
     suspend fun sendSyncActivity(
         host: String,
         type: SyncActivityType,
@@ -414,6 +454,23 @@ class LanDiscoveryManager(
             .put("controlToken", localControlToken())
             .put("message", messageText.take(240))
         scope.launch { sendRepeated(message, InetAddress.getByName(request.host), 2, 180L) }
+    }
+
+    fun answerRemoteStorageCheck(
+        request: RemoteStorageCheckRequest,
+        ready: Boolean,
+        messageText: String,
+        availableBytes: Long
+    ) {
+        start()
+        val message = baseMessage(TYPE_STORAGE_CHECK_RESULT)
+            .put("requestId", request.requestId)
+            .put("controlToken", localControlToken())
+            .put("ready", ready)
+            .put("message", messageText.take(240))
+            .put("availableBytes", availableBytes.coerceAtLeast(0L))
+        cachedResponses[request.requestId] = CachedResponse(message.toString(), System.currentTimeMillis())
+        scope.launch { send(message, InetAddress.getByName(request.host)) }
     }
 
     fun refreshNsdRegistration() {
@@ -872,6 +929,41 @@ class LanDiscoveryManager(
                     runCatching { listener(status) }
                 }
             }
+            TYPE_STORAGE_CHECK -> {
+                val requestId = message.optString("requestId")
+                if (requestId.isBlank()) return
+                cachedResponses[requestId]?.let { cached ->
+                    scope.launch { send(JSONObject(cached.payload), sender) }
+                    return
+                }
+                if (seenIncomingRequests.putIfAbsent(requestId, System.currentTimeMillis()) != null) return
+                val controlToken = message.optString("controlToken")
+                val expectedBytes = message.optLong("expectedDownloadBytes", -1L)
+                if (expectedBytes > 0L && isValidTrustedControl(remoteDeviceId, controlToken)) {
+                    _remoteStorageCheckRequests.tryEmit(
+                        RemoteStorageCheckRequest(
+                            requestId = requestId,
+                            deviceId = remoteDeviceId,
+                            name = remoteName,
+                            host = host,
+                            expectedDownloadBytes = expectedBytes
+                        )
+                    )
+                }
+            }
+            TYPE_STORAGE_CHECK_RESULT -> {
+                val controlToken = message.optString("controlToken")
+                if (!isValidTrustedControl(remoteDeviceId, controlToken)) return
+                val requestId = message.optString("requestId")
+                val result = RemoteStorageCheckResult(
+                    requestId = requestId,
+                    deviceId = remoteDeviceId,
+                    ready = message.optBoolean("ready", false),
+                    message = message.optString("message").ifBlank { "远端未返回空间检查详情" },
+                    availableBytes = message.optLong("availableBytes", 0L).coerceAtLeast(0L)
+                )
+                storageCheckWaiters.remove(requestId)?.complete(result)
+            }
         }
     }
 
@@ -1013,11 +1105,15 @@ class LanDiscoveryManager(
         private const val TYPE_SYNC_WAITING = "sync_waiting"
         private const val TYPE_SYNC_ACTIVITY = "sync_activity"
         private const val TYPE_SYNC_ACTIVITY_ACK = "sync_activity_ack"
+        private const val TYPE_STORAGE_CHECK = "storage_check"
+        private const val TYPE_STORAGE_CHECK_RESULT = "storage_check_result"
         private const val PREPARE_TIMEOUT_MS = 120_000L
         private const val PREPARE_RETRY_INTERVAL_MS = 4_000L
         private const val PAIR_RETRY_INTERVAL_MS = 3_000L
         private const val ACTIVITY_FINISH_RETRY_INTERVAL_MS = 500L
         private const val ACTIVITY_FINISH_ACK_TIMEOUT_MS = 5_000L
+        private const val STORAGE_CHECK_TIMEOUT_MS = 10_000L
+        private const val STORAGE_CHECK_RETRY_INTERVAL_MS = 1_000L
         private const val NSD_REREGISTER_DELAY_MS = 500L
         private const val TRUST_RECONNECT_COOLDOWN_MS = 10_000L
         private const val REQUEST_TTL_MS = 2L * 60L * 1000L

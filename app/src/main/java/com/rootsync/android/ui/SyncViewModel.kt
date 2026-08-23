@@ -16,6 +16,7 @@ import com.rootsync.android.domain.PairAccepted
 import com.rootsync.android.domain.PairRequest
 import com.rootsync.android.domain.PeerProfile
 import com.rootsync.android.domain.RemoteSyncActivity
+import com.rootsync.android.domain.RemoteStorageCheckRequest
 import com.rootsync.android.domain.StrategyUpdate
 import com.rootsync.android.domain.SyncActivityType
 import com.rootsync.android.domain.SyncActivityUpdate
@@ -163,6 +164,9 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         }
         viewModelScope.launch {
             discovery.syncPrepareRequests.collect { request -> dispatchSyncPrepareRequest(request) }
+        }
+        viewModelScope.launch {
+            discovery.remoteStorageCheckRequests.collect { request -> handleRemoteStorageCheckRequest(request) }
         }
         viewModelScope.launch {
             discovery.syncActivityUpdates.collect { update -> applySyncActivity(update) }
@@ -831,6 +835,35 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             port = port,
             sessionSecret = sessionSecret.takeIf { result.success }
         )
+    }
+
+    private suspend fun handleRemoteStorageCheckRequest(request: RemoteStorageCheckRequest) {
+        val profile = _state.value.profiles.firstOrNull { it.deviceId == request.deviceId }
+        val sessionMatches = remoteSessionDeviceId == request.deviceId && !remoteSessionStopping
+        if (profile == null || !sessionMatches) {
+            val message = "本机没有为该设备准备中的接收会话"
+            discovery.answerRemoteStorageCheck(request, false, message, 0L)
+            appendLog("WARN", "已拒绝 ${request.name} 的无会话空间检查")
+            return
+        }
+        val availableBytes = engine.availableStorageBytes(profile.destinationPath)
+        if (availableBytes == null) {
+            val message = "本机无法读取接收目录剩余空间"
+            discovery.answerRemoteStorageCheck(request, false, message, 0L)
+            appendLog("ERROR", "$message：${profile.destinationPath}")
+            return
+        }
+        val requiredBytes = requiredStorageBytes(request.expectedDownloadBytes)
+        val ready = availableBytes >= requiredBytes
+        val message = if (ready) {
+            "接收空间检查通过：需要 ${formatBytes(requiredBytes)}，可用 ${formatBytes(availableBytes)}"
+        } else {
+            "接收空间不足：预计接收 ${formatBytes(request.expectedDownloadBytes)}，" +
+                "至少需要 ${formatBytes(requiredBytes)}，当前可用 ${formatBytes(availableBytes)}"
+        }
+        discovery.answerRemoteStorageCheck(request, ready, message, availableBytes)
+        appendLog(if (ready) "OK" else "ERROR", "${request.name}：$message")
+        _state.update { state -> state.copy(phase = message, lastResult = message) }
     }
 
     private fun dispatchSyncPrepareRequest(request: SyncPrepareRequest) {
@@ -1534,9 +1567,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             if (!dryRun && planned.result.success && planned.downloadBytes > 0L) {
                 val availableBytes = engine.availableStorageBytes(current.destinationPath)
                 if (availableBytes != null) {
-                    val reserveBytes = (planned.downloadBytes / 10L)
-                        .coerceIn(MIN_STORAGE_RESERVE_BYTES, MAX_STORAGE_RESERVE_BYTES)
-                    val requiredBytes = safeAddBytes(planned.downloadBytes, reserveBytes)
+                    val requiredBytes = requiredStorageBytes(planned.downloadBytes)
                     if (availableBytes < requiredBytes) {
                         val message = "本机接收空间不足：预计下载 ${formatBytes(planned.downloadBytes)}，" +
                             "需保留至少 ${formatBytes(requiredBytes)}，当前可用 ${formatBytes(availableBytes)}"
@@ -1545,6 +1576,26 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 } else {
                     appendLog("WARN", "无法读取本机接收目录剩余空间，将由 rsync 写入错误保护任务")
+                }
+            }
+            if (!dryRun && planned.result.success && planned.uploadBytes > 0L) {
+                val profile = current.profiles.firstOrNull { it.id == current.selectedProfileId }
+                if (profile != null && !profile.deviceId.startsWith("manual:")) {
+                    _state.update { it.copy(phase = "正在检查对方接收空间") }
+                    val remoteStorage = discovery.requestRemoteStorageCheck(endpoint.host, planned.uploadBytes)
+                    if (remoteStorage == null) {
+                        val message = "${profile.name} 未响应接收空间检查；为避免写满对方存储，本次任务已暂停"
+                        appendLog("ERROR", message)
+                        planned = planned.copy(result = EngineResult(false, message))
+                    } else if (!remoteStorage.ready) {
+                        val message = "${profile.name}：${remoteStorage.message}"
+                        appendLog("ERROR", message)
+                        planned = planned.copy(result = EngineResult(false, message))
+                    } else {
+                        appendLog("OK", "${profile.name}：${remoteStorage.message}")
+                    }
+                } else {
+                    appendLog("WARN", "手动 rsync 设备不支持远端空间预检，请在接收端自行确认可用空间")
                 }
             }
             if (!dryRun && planned.result.success) {
@@ -1863,6 +1914,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     private fun safeAddBytes(current: Long, increment: Long): Long {
         val safeIncrement = increment.coerceAtLeast(0L)
         return if (Long.MAX_VALUE - current < safeIncrement) Long.MAX_VALUE else current + safeIncrement
+    }
+
+    private fun requiredStorageBytes(downloadBytes: Long): Long {
+        val reserveBytes = (downloadBytes.coerceAtLeast(0L) / 10L)
+            .coerceIn(MIN_STORAGE_RESERVE_BYTES, MAX_STORAGE_RESERVE_BYTES)
+        return safeAddBytes(downloadBytes, reserveBytes)
     }
 
     private fun updateTransferItem(

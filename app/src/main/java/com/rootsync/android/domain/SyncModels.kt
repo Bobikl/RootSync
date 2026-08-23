@@ -134,6 +134,22 @@ data class SyncPrepareResult(
     val secret: String
 )
 
+data class RemoteStorageCheckRequest(
+    val requestId: String,
+    val deviceId: String,
+    val name: String,
+    val host: String,
+    val expectedDownloadBytes: Long
+)
+
+data class RemoteStorageCheckResult(
+    val requestId: String,
+    val deviceId: String,
+    val ready: Boolean,
+    val message: String,
+    val availableBytes: Long
+)
+
 data class DirectoryCreationPrompt(
     val deviceId: String,
     val deviceName: String,
