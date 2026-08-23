@@ -107,6 +107,9 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 "android=${Build.VERSION.RELEASE}/${Build.VERSION.SDK_INT} model=${Build.MANUFACTURER} ${Build.MODEL}"
         )
         diagnosticLogger.append("STATE", diagnosticStateHeader())
+        if (preferences.contains(TransferForegroundService.PREF_PENDING_ACTION_MESSAGE)) {
+            preferences.edit { remove(TransferForegroundService.PREF_PENDING_ACTION_MESSAGE) }
+        }
         viewModelScope.launch {
             val cleanup = engine.cleanupStaleRuntimeProcesses(::streamLog)
             appendLog(if (cleanup.success) "INFO" else "ERROR", cleanup.summary)
@@ -217,6 +220,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         val selectedRecord = if (selected != null) {
             transferRecords.filter { recordMatchesProfile(it, selected) }.maxByOrNull { it.updatedAtMillis }
         } else legacyRecord
+        val pendingActionMessage = preferences.getString(
+            TransferForegroundService.PREF_PENDING_ACTION_MESSAGE,
+            null
+        )
         return SyncUiState(
             deviceName = deviceName,
             profileName = selected?.name ?: preferences.getString("profileName", "手动设备").orEmpty(),
@@ -243,7 +250,9 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 preferences.getString("remoteHost", "").orEmpty().isNotBlank(),
             transferRecord = selectedRecord,
             transferRecords = transferRecords,
-            localIp = engine.localIpv4()
+            localIp = engine.localIpv4(),
+            phase = if (pendingActionMessage.isNullOrBlank()) "等待检查" else "需要用户操作",
+            lastResult = pendingActionMessage
         )
     }
 

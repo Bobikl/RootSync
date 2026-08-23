@@ -255,6 +255,9 @@ class TransferForegroundService : Service() {
         }
 
         private fun notifyActionRequired(context: Context, title: String, detail: String) {
+            context.getSharedPreferences("rootsync", 0).edit {
+                putString(PREF_PENDING_ACTION_MESSAGE, "$title：$detail")
+            }
             val manager = context.getSystemService(NotificationManager::class.java)
             manager.createNotificationChannel(
                 NotificationChannel(
@@ -285,5 +288,7 @@ class TransferForegroundService : Service() {
                     .build()
             )
         }
+
+        const val PREF_PENDING_ACTION_MESSAGE = "pendingActionMessage"
     }
 }
