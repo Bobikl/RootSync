@@ -764,6 +764,33 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         appendLog(if (result.success) "OK" else "ERROR", "${request.name}：${result.summary}")
+        if (result.success) {
+            val foregroundReady = TransferForegroundService.update(
+                context = getApplication(),
+                title = if (request.isPreview) "RootSync 正在响应远端差异预览" else "RootSync 正在等待远端传输",
+                detail = "${request.name} 已连接，正在保持接收端后台运行",
+                eta = null,
+                progress = null,
+                incoming = true
+            )
+            if (!foregroundReady) {
+                val stopResult = engine.stopServer(::streamLog)
+                val message = "系统不允许从后台启动接收服务；请打开本机 RootSync 后由对方重试"
+                remoteSessionOwnsServer = false
+                releaseRemoteSession(request.deviceId, message)
+                _state.update {
+                    it.copy(
+                        serverRunning = false,
+                        isBusy = false,
+                        phase = "等待用户打开应用",
+                        lastResult = if (stopResult.success) message else "$message；${stopResult.summary}"
+                    )
+                }
+                discovery.answerSyncPreparation(request, false, message, port)
+                appendLog("WARN", message)
+                return
+            }
+        }
         if (!result.success) clearRemoteActivity(request.deviceId)
         else {
             remoteSessionOwnsServer = true

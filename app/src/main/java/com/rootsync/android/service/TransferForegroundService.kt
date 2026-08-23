@@ -21,6 +21,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
@@ -36,7 +38,14 @@ class TransferForegroundService : Service() {
         createChannel()
         wakeLock = getSystemService(PowerManager::class.java)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "RootSync:Transfer")
-            .apply { setReferenceCounted(false); acquire(MAX_WAKE_LOCK_MILLIS) }
+            .apply { setReferenceCounted(false) }
+        renewWakeLock()
+        serviceScope.launch {
+            while (isActive) {
+                delay(WAKE_LOCK_RENEW_INTERVAL_MS)
+                renewWakeLock()
+            }
+        }
         @Suppress("DEPRECATION")
         wifiLock = getSystemService(WifiManager::class.java)
             .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "RootSync:TransferWifi")
@@ -44,6 +53,7 @@ class TransferForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        getSystemService(NotificationManager::class.java).cancel(ACTION_REQUIRED_NOTIFICATION_ID)
         incomingTransfer = intent?.getBooleanExtra(EXTRA_INCOMING, false) ?: incomingTransfer
         val notification = buildNotification(
             title = intent?.getStringExtra(EXTRA_TITLE) ?: "RootSync 正在传输",
@@ -79,7 +89,9 @@ class TransferForegroundService : Service() {
                 markTransferPaused("系统后台传输时限到达，已自动暂停，可重新打开后继续")
             }
             withTimeoutOrNull(2_000L) {
-                RootSyncEngine(applicationContext).pauseTransfer()
+                val engine = RootSyncEngine(applicationContext)
+                if (incomingTransfer) engine.cleanupStaleRuntimeProcesses {}
+                else engine.pauseTransfer()
             }
             stopSelf()
         }
@@ -99,6 +111,13 @@ class TransferForegroundService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun renewWakeLock() {
+        wakeLock?.let { lock ->
+            if (lock.isHeld) lock.release()
+            lock.acquire(MAX_WAKE_LOCK_MILLIS)
+        }
+    }
 
     private fun markTransferPaused(message: String) {
         val preferences = getSharedPreferences("rootsync", 0)
@@ -161,6 +180,8 @@ class TransferForegroundService : Service() {
         private const val COMPLETION_CHANNEL_ID = "rootsync_completion"
         private const val NOTIFICATION_ID = 8873
         private const val COMPLETION_NOTIFICATION_ID = 8875
+        private const val ACTION_REQUIRED_NOTIFICATION_ID = 8876
+        private const val ACTION_REQUIRED_CHANNEL_ID = "rootsync_action_required"
         private const val ACTION_UPDATE = "com.rootsync.android.action.UPDATE_TRANSFER"
         private const val EXTRA_TITLE = "title"
         private const val EXTRA_DETAIL = "detail"
@@ -168,6 +189,7 @@ class TransferForegroundService : Service() {
         private const val EXTRA_PROGRESS = "progress"
         private const val EXTRA_INCOMING = "incoming"
         private const val MAX_WAKE_LOCK_MILLIS = 6L * 60L * 60L * 1_000L
+        private const val WAKE_LOCK_RENEW_INTERVAL_MS = 4L * 60L * 60L * 1_000L
 
         fun update(
             context: Context,
@@ -176,7 +198,7 @@ class TransferForegroundService : Service() {
             eta: String?,
             progress: Float?,
             incoming: Boolean = false
-        ) {
+        ): Boolean {
             val intent = Intent(context, TransferForegroundService::class.java)
                 .setAction(ACTION_UPDATE)
                 .putExtra(EXTRA_TITLE, title)
@@ -184,7 +206,17 @@ class TransferForegroundService : Service() {
                 .putExtra(EXTRA_ETA, eta)
                 .putExtra(EXTRA_PROGRESS, progress?.times(100)?.toInt() ?: -1)
                 .putExtra(EXTRA_INCOMING, incoming)
-            ContextCompat.startForegroundService(context, intent)
+            return try {
+                ContextCompat.startForegroundService(context, intent)
+                true
+            } catch (error: RuntimeException) {
+                notifyActionRequired(
+                    context,
+                    "RootSync 需要打开应用继续",
+                    "$title：系统限制从后台启动传输服务，请点击打开后重试"
+                )
+                false
+            }
         }
 
         fun stop(context: Context) {
@@ -218,6 +250,38 @@ class TransferForegroundService : Service() {
                     .setContentIntent(openApp)
                     .setAutoCancel(true)
                     .setCategory(NotificationCompat.CATEGORY_STATUS)
+                    .build()
+            )
+        }
+
+        private fun notifyActionRequired(context: Context, title: String, detail: String) {
+            val manager = context.getSystemService(NotificationManager::class.java)
+            manager.createNotificationChannel(
+                NotificationChannel(
+                    ACTION_REQUIRED_CHANNEL_ID,
+                    "需要用户操作",
+                    NotificationManager.IMPORTANCE_HIGH
+                ).apply { description = "后台同步受到系统限制时提示用户打开 RootSync" }
+            )
+            val openApp = PendingIntent.getActivity(
+                context,
+                2,
+                Intent(context, MainActivity::class.java).addFlags(
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                ),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            manager.notify(
+                ACTION_REQUIRED_NOTIFICATION_ID,
+                NotificationCompat.Builder(context, ACTION_REQUIRED_CHANNEL_ID)
+                    .setSmallIcon(android.R.drawable.stat_notify_sync_noanim)
+                    .setContentTitle(title)
+                    .setContentText(detail)
+                    .setStyle(NotificationCompat.BigTextStyle().bigText(detail))
+                    .setContentIntent(openApp)
+                    .setAutoCancel(true)
+                    .setPriority(NotificationCompat.PRIORITY_HIGH)
+                    .setCategory(NotificationCompat.CATEGORY_ERROR)
                     .build()
             )
         }
