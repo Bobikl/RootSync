@@ -233,6 +233,7 @@ data class SyncUiState(
     val sinceEpochMillis: Long? = null,
     val profiles: List<PeerProfile> = emptyList(),
     val selectedProfileId: String? = null,
+    val hasUnsavedProfileChanges: Boolean = false,
     val discoveredDevices: List<DiscoveredDevice> = emptyList(),
     val onlineDeviceIds: Set<String> = emptySet(),
     val isScanning: Boolean = false,
@@ -273,7 +274,7 @@ data class SyncUiState(
         get() = selectedPairedDeviceId?.let { it in onlineDeviceIds } ?: true
 
     val canStartTransfer: Boolean
-        get() = canOperate && !isCheckingPeerOnline && isSelectedPeerOnline
+        get() = canOperate && !isCheckingPeerOnline && isSelectedPeerOnline && !hasUnsavedProfileChanges
 
     companion object {
         const val DEFAULT_RSYNC_PORT = 8873

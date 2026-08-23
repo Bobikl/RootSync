@@ -239,6 +239,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             sinceEpochMillis = if (selected != null) selected.sinceEpochMillis else fallbackSince,
             profiles = profiles,
             selectedProfileId = selected?.id,
+            hasUnsavedProfileChanges = selected == null &&
+                preferences.getString("remoteHost", "").orEmpty().isNotBlank(),
             transferRecord = selectedRecord,
             transferRecords = transferRecords,
             localIp = engine.localIpv4()
@@ -257,14 +259,20 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     current.sourcePath == SyncUiState.LEGACY_BILI_PATH
                 val canReplaceDestination = current.destinationPath == SyncUiState.DEFAULT_BILI_PATH ||
                     current.destinationPath == SyncUiState.LEGACY_BILI_PATH
-                current.copy(
+                val updated = current.copy(
                     isChecking = false,
                     capabilities = capabilities,
                     sourcePath = if (detected != null && canReplaceSource) detected else current.sourcePath,
                     destinationPath = if (detected != null && canReplaceDestination) detected else current.destinationPath,
                     localIp = engine.localIpv4(),
                     phase = if (capabilities.rootGranted) "能力检查完成" else "ROOT 不可用"
-                ).syncSelectedProfile()
+                )
+                updated.copy(
+                    hasUnsavedProfileChanges = current.hasUnsavedProfileChanges ||
+                        (current.selectedProfileId != null &&
+                            (updated.sourcePath != current.sourcePath ||
+                                updated.destinationPath != current.destinationPath))
+                )
             }
             saveConfig()
             capabilities.checks.forEach { appendLog("CHECK", "${it.name}：${it.detail}") }
@@ -282,7 +290,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     }
     fun setServerPort(value: String) {
         val normalized = value.filter(Char::isDigit).take(5)
-        updateConfig { copy(serverPortText = normalized, previewReady = false) }
+        updateConfig(profileDraft = false) { copy(serverPortText = normalized, previewReady = false) }
         nsdPortRefreshJob?.cancel()
         nsdPortRefreshJob = viewModelScope.launch {
             delay(NSD_PORT_DEBOUNCE_MS)
@@ -306,7 +314,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     fun setRemoteSecret(value: String) = updateConfig {
         copy(remoteSecret = value.trim().take(128), previewReady = false)
     }
-    fun setServerSecret(value: String) = updateConfig {
+    fun setServerSecret(value: String) = updateConfig(profileDraft = false) {
         copy(
             serverSecret = value.filterNot { it.isISOControl() }.trim().take(64),
             previewReady = false
@@ -320,7 +328,6 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 previewReady = false
             )
         }
-        publishCurrentStrategy()
     }
     fun setRangeMode(value: SyncRangeMode) {
         updateConfig {
@@ -332,38 +339,25 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 previewReady = false
             )
         }
-        publishCurrentStrategy()
     }
     fun setSinceEpochMillis(value: Long) {
         updateConfig { copy(sinceEpochMillis = value.coerceAtLeast(1L), previewReady = false) }
-        publishCurrentStrategy()
     }
 
-    fun setStrictContentCheck(enabled: Boolean) = updateConfig {
+    fun setStrictContentCheck(enabled: Boolean) = updateConfig(profileDraft = false) {
         copy(strictContentCheck = enabled, previewReady = false)
     }
 
-    private fun updateConfig(block: SyncUiState.() -> SyncUiState) {
-        _state.update { it.block().syncSelectedProfile() }
-        saveConfig()
-    }
-
-    private fun SyncUiState.syncSelectedProfile(): SyncUiState {
-        val selected = selectedProfileId ?: return this
-        val updated = profiles.map { profile ->
-            if (profile.id != selected) profile else profile.copy(
-                name = profileName.ifBlank { profile.name },
-                host = remoteHost,
-                port = SafeInput.parsePort(portText) ?: profile.port,
-                secret = remoteSecret,
-                role = role,
-                rangeMode = rangeMode,
-                sinceEpochMillis = sinceEpochMillis,
-                sourcePath = sourcePath,
-                destinationPath = destinationPath
-            )
+    private fun updateConfig(
+        profileDraft: Boolean = true,
+        block: SyncUiState.() -> SyncUiState
+    ) {
+        _state.update {
+            it.block().let { updated ->
+                if (profileDraft) updated.copy(hasUnsavedProfileChanges = true) else updated
+            }
         }
-        return copy(profiles = updated)
+        saveConfig()
     }
 
     fun saveCurrentProfile() {
@@ -395,6 +389,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                         profiles = it.profiles.filterNot { item -> item.id == id } + profile,
                         selectedProfileId = id,
                         profileName = profile.name,
+                        hasUnsavedProfileChanges = false,
                         lastResult = "已保存 ${profile.name} 的独立同步策略"
                     )
                 }
@@ -413,6 +408,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 .maxByOrNull { record -> record.updatedAtMillis }
             it.copy(
                 selectedProfileId = profile.id,
+                hasUnsavedProfileChanges = false,
                 profileName = profile.name,
                 remoteHost = profile.host,
                 portText = profile.port.toString(),
@@ -436,6 +432,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         _state.update {
             it.copy(
                 selectedProfileId = null,
+                hasUnsavedProfileChanges = false,
                 profileName = "新设备",
                 remoteHost = "",
                 remoteSecret = "",
@@ -460,6 +457,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             it.copy(
                 profiles = it.profiles.filterNot { profile -> profile.id == id },
                 selectedProfileId = null,
+                hasUnsavedProfileChanges = false,
                 profileName = "新设备",
                 remoteHost = "",
                 remoteSecret = "",
@@ -583,7 +581,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 sourcePath = profile.sourcePath,
                 destinationPath = profile.destinationPath,
                 transferRecord = profileRecord,
-                previewReady = false
+                previewReady = false,
+                hasUnsavedProfileChanges = false
             )
         }
         saveConfig()
@@ -664,6 +663,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     updatedProfile.sourcePath
                 } else state.destinationPath,
                 previewReady = if (selected) false else state.previewReady,
+                hasUnsavedProfileChanges = if (selected) false else state.hasUnsavedProfileChanges,
                 lastResult = "${update.name} 已设为${update.role.label}；本机自动切换为${localRole.label}"
             )
         }
@@ -686,6 +686,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         if (profile == null) {
             appendLog("WARN", "已拒绝 ${request.name} 的未认证同步准备请求")
             discovery.answerSyncPreparation(request, false, "设备未配对或已主动删除", port)
+            return
+        }
+        if (initial.selectedProfileId == profile.id && initial.hasUnsavedProfileChanges) {
+            val message = "本机正在编辑该设备策略，请先保存或切换设备后重试"
+            appendLog("WARN", "已拒绝 ${request.name} 的同步准备请求：$message")
+            discovery.answerSyncPreparation(request, false, message, port)
             return
         }
         if (profile.secret != request.secret) {
@@ -1347,6 +1353,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 sinceEpochMillis = record.sinceEpochMillis,
                 sourcePath = record.sourcePath,
                 destinationPath = record.destinationPath,
+                hasUnsavedProfileChanges = false,
                 lastResult = "正在继续上次未完成传输"
             )
         }

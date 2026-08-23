@@ -658,7 +658,14 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                 enabled = configurationEnabled,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Text("保存当前设备策略")
+                Text(if (state.hasUnsavedProfileChanges) "保存并应用当前设备策略" else "当前设备策略已保存")
+            }
+            if (state.hasUnsavedProfileChanges) {
+                Text(
+                    "当前编辑内容尚未应用；保存后才可预览或正式传输，并会把互补方向通知给已配对设备。",
+                    color = MaterialTheme.colorScheme.tertiary,
+                    style = MaterialTheme.typography.bodySmall
+                )
             }
         }
 
@@ -692,6 +699,13 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                 "所选设备当前离线，差异预览、执行和继续传输已禁用。设备重新回应实时探测后才能开始。",
                 color = MaterialTheme.colorScheme.error,
                 style = MaterialTheme.typography.bodySmall
+            )
+        }
+        if (state.hasUnsavedProfileChanges) {
+            Text(
+                "请先保存当前设备策略，再执行差异预览或传输。",
+                color = MaterialTheme.colorScheme.tertiary,
+                style = MaterialTheme.typography.labelMedium
             )
         }
 
