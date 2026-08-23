@@ -78,6 +78,7 @@ class LanDiscoveryManager(
     private val trustedReconnectTimes = ConcurrentHashMap<String, Long>()
     private val prepareWaiters = ConcurrentHashMap<String, CompletableDeferred<SyncPrepareResult>>()
     private val prepareStatusListeners = ConcurrentHashMap<String, (String) -> Unit>()
+    private val activityAckWaiters = ConcurrentHashMap<String, CompletableDeferred<Unit>>()
     private val resolveQueue = ConcurrentLinkedQueue<NsdServiceInfo>()
     private val resolving = AtomicBoolean(false)
     private val scanGeneration = AtomicInteger(0)
@@ -215,8 +216,20 @@ class LanDiscoveryManager(
             .put("rangeMode", rangeMode.name)
         sinceEpochMillis?.let { message.put("sinceEpochMillis", it) }
         scope.launch {
-            sendRepeated(message, InetAddress.getByName(device.host), 3, 250L)
+            val address = InetAddress.getByName(device.host)
+            sendRepeated(message, address, 3, 250L)
             onLog("已向 ${device.name} 发出配对请求")
+            val deadline = System.currentTimeMillis() + REQUEST_TTL_MS
+            while (isActive && outgoingPairRequests.containsKey(requestId) &&
+                System.currentTimeMillis() < deadline
+            ) {
+                delay(PAIR_RETRY_INTERVAL_MS)
+                if (outgoingPairRequests.containsKey(requestId)) send(message, address)
+            }
+            if (outgoingPairRequests.remove(requestId) != null) {
+                requestCreatedTimes.remove(requestId)
+                onLog("等待 ${device.name} 确认配对超时")
+            }
         }
     }
 
@@ -295,8 +308,12 @@ class LanDiscoveryManager(
             .put("isPreview", isPreview)
         sinceEpochMillis?.let { message.put("sinceEpochMillis", it) }
         val retryJob = scope.launch {
-            sendRepeated(message, InetAddress.getByName(host), 3, 8_000L)
+            val address = InetAddress.getByName(host)
             onLog("已请求远端自动准备 rsync 服务")
+            while (isActive && !waiter.isCompleted) {
+                send(message, address)
+                delay(PREPARE_RETRY_INTERVAL_MS)
+            }
         }
         return try {
             withTimeoutOrNull(timeoutMillis) { waiter.await() }
@@ -324,9 +341,28 @@ class LanDiscoveryManager(
                 .put("taskId", taskId)
                 .put("totalItems", totalItems.coerceAtLeast(0))
             val address = InetAddress.getByName(host)
-            repeat(2) { index ->
-                send(message, address)
-                if (index == 0) delay(80)
+            if (active) {
+                repeat(2) { index ->
+                    send(message, address)
+                    if (index == 0) delay(80)
+                }
+            } else {
+                val messageId = UUID.randomUUID().toString()
+                val waiter = CompletableDeferred<Unit>()
+                activityAckWaiters[messageId] = waiter
+                message.put("messageId", messageId)
+                val retryJob = scope.launch {
+                    while (isActive && !waiter.isCompleted) {
+                        send(message, address)
+                        delay(ACTIVITY_FINISH_RETRY_INTERVAL_MS)
+                    }
+                }
+                val acknowledged = withTimeoutOrNull(ACTIVITY_FINISH_ACK_TIMEOUT_MS) {
+                    waiter.await()
+                } != null
+                retryJob.cancel()
+                activityAckWaiters.remove(messageId, waiter)
+                if (!acknowledged) onLog("远端未确认任务结束消息，已完成多次重发")
             }
         }
 
@@ -762,6 +798,12 @@ class LanDiscoveryManager(
                 if (secret.length >= 6 && activity != null &&
                     isValidTrustedControl(remoteDeviceId, controlToken)
                 ) {
+                    message.optString("messageId").takeIf { it.isNotBlank() }?.let { messageId ->
+                        val ack = baseMessage(TYPE_SYNC_ACTIVITY_ACK)
+                            .put("controlToken", localControlToken())
+                            .put("messageId", messageId)
+                        scope.launch { send(ack, sender) }
+                    }
                     _syncActivityUpdates.tryEmit(
                         SyncActivityUpdate(
                             deviceId = remoteDeviceId,
@@ -777,6 +819,12 @@ class LanDiscoveryManager(
                         )
                     )
                 }
+            }
+            TYPE_SYNC_ACTIVITY_ACK -> {
+                val controlToken = message.optString("controlToken")
+                if (!isValidTrustedControl(remoteDeviceId, controlToken)) return
+                val messageId = message.optString("messageId")
+                activityAckWaiters.remove(messageId)?.complete(Unit)
             }
             TYPE_SYNC_READY -> {
                 val requestId = message.optString("requestId")
@@ -947,7 +995,12 @@ class LanDiscoveryManager(
         private const val TYPE_SYNC_READY = "sync_ready"
         private const val TYPE_SYNC_WAITING = "sync_waiting"
         private const val TYPE_SYNC_ACTIVITY = "sync_activity"
+        private const val TYPE_SYNC_ACTIVITY_ACK = "sync_activity_ack"
         private const val PREPARE_TIMEOUT_MS = 120_000L
+        private const val PREPARE_RETRY_INTERVAL_MS = 4_000L
+        private const val PAIR_RETRY_INTERVAL_MS = 3_000L
+        private const val ACTIVITY_FINISH_RETRY_INTERVAL_MS = 500L
+        private const val ACTIVITY_FINISH_ACK_TIMEOUT_MS = 5_000L
         private const val TRUST_RECONNECT_COOLDOWN_MS = 10_000L
         private const val REQUEST_TTL_MS = 2L * 60L * 1000L
         private const val ACTIVE_PRESENCE_TIMEOUT_MS = 1_500L

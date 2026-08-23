@@ -2372,7 +2372,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     private companion object {
         const val MAX_VISIBLE_TRANSFER_FOLDERS = 400
         const val DEFAULT_RANGE_MILLIS = 24L * 60L * 60L * 1000L
-        const val REMOTE_ACTIVITY_TIMEOUT_MS = 15L * 60L * 1000L
+        const val REMOTE_ACTIVITY_TIMEOUT_MS = 90_000L
         const val REMOTE_ACTIVITY_HEARTBEAT_MS = 30_000L
         const val REMOTE_ACTIVITY_FINISHED_HOLD_MS = 8_000L
         const val REMOTE_SESSION_START_TIMEOUT_MS = 2L * 60L * 1000L
