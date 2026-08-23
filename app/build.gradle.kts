@@ -11,8 +11,8 @@ android {
         applicationId = "com.rootsync.android"
         minSdk = 26
         targetSdk = 36
-        versionCode = 51
-        versionName = "0.2.49"
+        versionCode = 52
+        versionName = "0.2.50"
 
         ndk {
             abiFilters += "arm64-v8a"

@@ -228,6 +228,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
     val context = LocalContext.current
     var confirmProfileDeletion by remember { mutableStateOf(false) }
     var confirmRecordDeletion by remember { mutableStateOf(false) }
+    var confirmTransferStart by remember { mutableStateOf(false) }
     val configurationEnabled = !state.isBusy && !state.isCheckingPeerOnline
     val nearbyPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -305,6 +306,46 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
             },
             dismissButton = {
                 TextButton(onClick = { confirmRecordDeletion = false }) { Text("取消") }
+            }
+        )
+    }
+    if (confirmTransferStart) {
+        val pausedRecord = state.transferRecord?.takeIf { it.status == TransferStatus.PAUSED }
+        val peerName = pausedRecord?.peerName ?: state.profileName.ifBlank { state.remoteHost }
+        val host = pausedRecord?.host ?: state.remoteHost
+        val role = pausedRecord?.role ?: state.role
+        val rangeMode = pausedRecord?.rangeMode ?: state.rangeMode
+        val since = pausedRecord?.sinceEpochMillis ?: state.sinceEpochMillis
+        val sourcePath = pausedRecord?.sourcePath ?: state.sourcePath
+        val destinationPath = pausedRecord?.destinationPath ?: state.destinationPath
+        AlertDialog(
+            onDismissRequest = { confirmTransferStart = false },
+            title = { Text(if (pausedRecord == null) "确认开始同步" else "确认继续同步") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("设备：$peerName（$host）")
+                    Text("策略：${role.label} · ${rangeMode.label}")
+                    if (rangeMode == SyncRangeMode.SINCE) Text("起始：${formatSyncTime(since)}")
+                    when (role) {
+                        SyncRole.SEND_ONLY -> Text("本机发送目录：$sourcePath")
+                        SyncRole.RECEIVE_ONLY -> Text("本机接收目录：$destinationPath")
+                        SyncRole.BIDIRECTIONAL -> Text("本机双向目录：$sourcePath")
+                    }
+                    Text(if (state.strictContentCheck) "比较：严格内容校验" else "比较：快速比较")
+                    Text(
+                        "零删除保护保持开启；目标端独有文件和较新文件会保留，覆盖前版本进入 .rootsync-history。",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmTransferStart = false
+                    executeWithNotification()
+                }) { Text(if (pausedRecord == null) "开始同步" else "继续同步") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmTransferStart = false }) { Text("取消") }
             }
         )
     }
@@ -630,7 +671,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
             Button(
                 onClick = if (state.localTransferActive) {
                     if (state.isPreviewing) viewModel::cancel else viewModel::pauseTransfer
-                } else executeWithNotification,
+                } else ({ confirmTransferStart = true }),
                 enabled = state.localTransferActive || state.canStartTransfer,
                 modifier = Modifier.weight(1f)
             ) {
@@ -781,7 +822,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                     Text(record.message, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 if (record.status == TransferStatus.PAUSED && !state.isBusy) {
-                    Button(onClick = executeWithNotification, modifier = Modifier.fillMaxWidth()) {
+                    Button(onClick = { confirmTransferStart = true }, modifier = Modifier.fillMaxWidth()) {
                         Text("继续传输")
                     }
                 }
