@@ -1,6 +1,8 @@
 package com.rootsync.android.root
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicReference
@@ -15,32 +17,35 @@ data class CommandResult(
 
 class RootShell {
     private val activeProcess = AtomicReference<Process?>(null)
+    private val executeMutex = Mutex()
 
     suspend fun execute(
         command: String,
         onLine: (String) -> Unit = {},
         maxCapturedLines: Int = DEFAULT_MAX_CAPTURED_LINES
-    ): CommandResult = withContext(Dispatchers.IO) {
-        val process = ProcessBuilder("su", "-c", command)
-            .redirectErrorStream(true)
-            .start()
-        activeProcess.set(process)
-        val lines = ArrayDeque<String>()
-        var totalOutputLines = 0
-        try {
-            process.inputStream.bufferedReader().useLines { stream ->
-                stream.forEach { line ->
-                    totalOutputLines += 1
-                    if (maxCapturedLines > 0) {
-                        if (lines.size >= maxCapturedLines) lines.removeFirst()
-                        lines.addLast(line)
+    ): CommandResult = executeMutex.withLock {
+        withContext(Dispatchers.IO) {
+            val process = ProcessBuilder("su", "-c", command)
+                .redirectErrorStream(true)
+                .start()
+            activeProcess.set(process)
+            val lines = ArrayDeque<String>()
+            var totalOutputLines = 0
+            try {
+                process.inputStream.bufferedReader().useLines { stream ->
+                    stream.forEach { line ->
+                        totalOutputLines += 1
+                        if (maxCapturedLines > 0) {
+                            if (lines.size >= maxCapturedLines) lines.removeFirst()
+                            lines.addLast(line)
+                        }
+                        onLine(line)
                     }
-                    onLine(line)
                 }
+                CommandResult(process.waitFor(), lines.toList(), totalOutputLines)
+            } finally {
+                activeProcess.compareAndSet(process, null)
             }
-            CommandResult(process.waitFor(), lines.toList(), totalOutputLines)
-        } finally {
-            activeProcess.compareAndSet(process, null)
         }
     }
 
