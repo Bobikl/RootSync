@@ -33,6 +33,7 @@ import com.rootsync.android.engine.RsyncItem
 import com.rootsync.android.engine.SafeInput
 import com.rootsync.android.service.TransferForegroundService
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -80,6 +81,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     private var remoteSessionStartedAtMillis = 0L
     private var remoteSessionOwnsServer = false
     private var remoteSessionStopping = false
+    private var nsdPortRefreshJob: Job? = null
     @Volatile private var pendingDirectoryDecision: CompletableDeferred<Boolean>? = null
     private val operationMutex = Mutex()
     private val discovery = LanDiscoveryManager(
@@ -273,8 +275,17 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     fun setPort(value: String) = updateConfig {
         copy(portText = value.filter(Char::isDigit).take(5), previewReady = false)
     }
-    fun setServerPort(value: String) = updateConfig {
-        copy(serverPortText = value.filter(Char::isDigit).take(5), previewReady = false)
+    fun setServerPort(value: String) {
+        val normalized = value.filter(Char::isDigit).take(5)
+        updateConfig { copy(serverPortText = normalized, previewReady = false) }
+        nsdPortRefreshJob?.cancel()
+        nsdPortRefreshJob = viewModelScope.launch {
+            delay(NSD_PORT_DEBOUNCE_MS)
+            if (_state.value.serverPortText == normalized && SafeInput.parsePort(normalized) != null) {
+                discovery.refreshNsdRegistration()
+                appendLog("LAN", "NSD 已更新本机服务端口为 $normalized")
+            }
+        }
     }
     fun setSourcePath(value: String) = updateConfig {
         copy(
@@ -2237,6 +2248,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         pendingDirectoryDecision?.cancel()
+        nsdPortRefreshJob?.cancel()
         discovery.stop()
         super.onCleared()
     }
@@ -2489,6 +2501,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         const val PROFILE_PRESENCE_INTERVAL_MS = 15_000L
         const val PROFILE_ONLINE_TTL_MS = 45_000L
         const val PROFILE_PRESENCE_RESPONSE_MS = 800L
+        const val NSD_PORT_DEBOUNCE_MS = 800L
         const val REMOTE_PREVIEW_ITEM_THROTTLE_MS = 150L
         const val TRANSFER_ITEM_REFRESH_MS = 3_000L
         const val TRANSFER_BYTES_UI_INTERVAL_MS = 250L

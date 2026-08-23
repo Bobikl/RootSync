@@ -416,6 +416,23 @@ class LanDiscoveryManager(
         scope.launch { sendRepeated(message, InetAddress.getByName(request.host), 2, 180L) }
     }
 
+    fun refreshNsdRegistration() {
+        start()
+        val previous = registrationListener
+        if (previous == null) {
+            registerNsdService()
+            return
+        }
+        registrationListener = null
+        registeredServiceName = null
+        runCatching { nsdManager.unregisterService(previous) }
+            .onFailure { onLog("重新注册 NSD 前注销旧服务失败：${it.message ?: it::class.java.simpleName}") }
+        scope.launch {
+            delay(NSD_REREGISTER_DELAY_MS)
+            registerNsdService()
+        }
+    }
+
     fun stop() {
         stopNsdDiscovery()
         registrationListener?.let { listener ->
@@ -1001,6 +1018,7 @@ class LanDiscoveryManager(
         private const val PAIR_RETRY_INTERVAL_MS = 3_000L
         private const val ACTIVITY_FINISH_RETRY_INTERVAL_MS = 500L
         private const val ACTIVITY_FINISH_ACK_TIMEOUT_MS = 5_000L
+        private const val NSD_REREGISTER_DELAY_MS = 500L
         private const val TRUST_RECONNECT_COOLDOWN_MS = 10_000L
         private const val REQUEST_TTL_MS = 2L * 60L * 1000L
         private const val ACTIVE_PRESENCE_TIMEOUT_MS = 1_500L
