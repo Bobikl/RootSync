@@ -784,9 +784,11 @@ class RootSyncEngine(private val context: Context) {
                 verifyList.absolutePath
             )
         }
+        ensureLifecycleWatchdog(rsyncPath, onLog)
         val mismatches = linkedSetOf<String>()
         val result = shell.execute(
-            command = command,
+            command = "umask 077; echo \$\$ > ${SafeInput.shellQuote(File(runtimeDir, "transfer.pid").absolutePath)}; " +
+                "exec $command",
             onLine = { line ->
                 val item = RsyncOutputParser.parseItem(line)
                 if (item != null && item.itemizedChange.getOrNull(1) != 'd') {
@@ -954,11 +956,22 @@ class RootSyncEngine(private val context: Context) {
             append("umask 077\n")
             append("echo \$\$ > ${SafeInput.shellQuote(watchdogPidFile.absolutePath)}; ")
             append("trap \"rm -f ${SafeInput.shellQuote(watchdogPidFile.absolutePath)}\" EXIT INT TERM HUP; ")
-            append("while true; do ")
+            append("idle=0; while true; do ")
             append("alive=0; if [ -r /proc/$appProcessId/cmdline ]; then ")
             append("name=\$(tr '\\000' ' ' < /proc/$appProcessId/cmdline); ")
             append("case \"\$name\" in ${SafeInput.shellQuote(appProcessName)}*) alive=1 ;; esac; fi; ")
-            append("if [ \"\$alive\" -eq 1 ]; then sleep 2; continue; fi; ")
+            append("active=0; for pid_file in ")
+            append(SafeInput.shellQuote(transferPidFile.absolutePath)).append(' ')
+            append(SafeInput.shellQuote(daemonPidFile.absolutePath)).append("; do ")
+            append("if [ -s \"\$pid_file\" ]; then child=\$(cat \"\$pid_file\"); ")
+            append("case \"\$child\" in *[!0-9]*|'') ;; *) ")
+            append("if [ -r \"/proc/\$child/cmdline\" ] && kill -0 \"\$child\" 2>/dev/null && ")
+            append("tr '\\000' ' ' < \"/proc/\$child/cmdline\" | grep -Fq 'rsync'; then active=1; fi ;; esac; fi; done; ")
+            append("if [ \"\$alive\" -eq 1 ] && [ \"\$active\" -eq 1 ]; then idle=0; sleep 2; continue; fi; ")
+            append("if [ \"\$alive\" -eq 1 ]; then idle=\$((idle + 1)); ")
+            append("if [ \"\$idle\" -lt 5 ]; then sleep 2; continue; fi; rm -f ")
+            append(SafeInput.shellQuote(transferPidFile.absolutePath)).append(' ')
+            append(SafeInput.shellQuote(daemonPidFile.absolutePath)).append("; exit 0; fi; ")
             append(runtimeCleanupCommand(includeWatchdog = false))
             append("; exit 0; done")
         }
