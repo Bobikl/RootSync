@@ -372,12 +372,31 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     fun saveCurrentProfile() {
         val current = _state.value
         val port = SafeInput.parsePort(current.portText)
-        when {
-            !SafeInput.isValidIpv4(current.remoteHost) -> appendLog("ERROR", "请输入有效的远端 IPv4 地址")
-            port == null -> appendLog("ERROR", "端口必须位于 1024–65535")
+        val validationError = when {
+            !SafeInput.isValidIpv4(current.remoteHost) -> "请输入有效的远端 IPv4 地址"
+            SafeInput.isLocalSelfTarget(current.remoteHost, current.localIp) ->
+                "远端地址不能指向本机"
+            port == null -> "端口必须位于 1024–65535"
             current.remoteSecret.length < SyncUiState.MIN_SECRET_LENGTH ->
-                appendLog("ERROR", "密钥至少需要 ${SyncUiState.MIN_SECRET_LENGTH} 位")
-            else -> {
+                "密钥至少需要 ${SyncUiState.MIN_SECRET_LENGTH} 位"
+            SafeInput.validateStoragePath(current.sourcePath) != null ->
+                "发送目录无效：${SafeInput.validateStoragePath(current.sourcePath)}"
+            SafeInput.validateStoragePath(current.destinationPath) != null ->
+                "接收目录无效：${SafeInput.validateStoragePath(current.destinationPath)}"
+            current.rangeMode == SyncRangeMode.SINCE && current.sinceEpochMillis == null ->
+                "请选择同步起始时间"
+            current.rangeMode == SyncRangeMode.SINCE &&
+                current.sinceEpochMillis != null && current.sinceEpochMillis > System.currentTimeMillis() ->
+                "同步起始时间不能晚于当前时间"
+            else -> null
+        }
+        if (validationError != null) {
+            appendLog("ERROR", validationError)
+            _state.update { it.copy(phase = "策略未保存", lastResult = validationError) }
+            return
+        }
+        when {
+            port != null -> {
                 val id = current.selectedProfileId ?: UUID.randomUUID().toString()
                 val existing = current.profiles.firstOrNull { it.id == id }
                 val profile = PeerProfile(
