@@ -567,17 +567,18 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                 modifier = Modifier.weight(1f)
             ) { Text("差异预览") }
             Button(
-                onClick = if (state.isBusy) {
+                onClick = if (state.localTransferActive) {
                     if (state.isPreviewing) viewModel::cancel else viewModel::pauseTransfer
                 } else executeWithNotification,
-                enabled = state.isBusy || state.canStartTransfer,
+                enabled = state.localTransferActive || state.canStartTransfer,
                 modifier = Modifier.weight(1f)
             ) {
                 Text(
                     when {
                         state.isCheckingPeerOnline -> "正在确认在线"
-                        state.isBusy && state.isPreviewing -> "取消预览"
-                        state.isBusy -> "暂停传输"
+                        state.localTransferActive && state.isPreviewing -> "取消预览"
+                        state.localTransferActive -> "暂停传输"
+                        state.isBusy -> "对方任务进行中"
                         state.transferRecord?.status == TransferStatus.PAUSED -> "继续传输"
                         else -> "执行${state.role.label}"
                     }

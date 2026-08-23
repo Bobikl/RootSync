@@ -838,6 +838,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun applySyncActivity(update: SyncActivityUpdate) {
         val profile = _state.value.profiles.firstOrNull { it.deviceId == update.deviceId } ?: return
+        if (remoteSessionDeviceId != update.deviceId || remoteSessionStopping || operationMutex.isLocked) {
+            if (update.active) {
+                appendLog("WARN", "已忽略未匹配当前准备会话的远端任务消息：${update.name}")
+            }
+            return
+        }
         val currentActivity = _state.value.remoteActivity
         if (update.active && currentActivity?.deviceId == update.deviceId &&
             currentActivity.type == update.type && currentActivity.taskId == update.taskId &&
@@ -928,7 +934,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 _state.update { state ->
                     if (state.remoteActivity?.startedAtMillis == activity.startedAtMillis) {
                         expired = true
-                        state.copy(remoteActivity = null, isBusy = false)
+                        state.copy(remoteActivity = null, isBusy = operationMutex.isLocked)
                     } else state
                 }
                 if (expired) releaseRemoteSession(deviceId, "远端任务长时间无心跳，已释放会话")
@@ -941,7 +947,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         releaseRemoteSession(deviceId, "远端任务已清理")
         _state.update { state ->
             if (state.remoteActivity?.deviceId == deviceId) {
-                state.copy(remoteActivity = null, isBusy = false)
+                state.copy(remoteActivity = null, isBusy = operationMutex.isLocked)
             } else state
         }
     }
@@ -963,7 +969,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 state.copy(
                     remoteActivity = activity.copy(finished = true, startedAtMillis = finishedAt),
                     transferItemCount = maxOf(state.transferItemCount, totalItems),
-                    isBusy = false
+                    isBusy = operationMutex.isLocked
                 )
             } else state
         }
@@ -1270,7 +1276,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         val action = current.role.label
-        launchBusy(if (dryRun) "正在预览${action}差异" else "正在执行$action") {
+        launchBusy(
+            phase = if (dryRun) "正在预览${action}差异" else "正在执行$action",
+            localTransfer = true
+        ) {
             pauseRequested = false
             localTransferItemCount = 0
             lastTransferItemUiMillis = 0L
@@ -1602,7 +1611,11 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun pauseTransfer() {
-        if (!_state.value.isBusy || _state.value.isPreviewing) {
+        if (!_state.value.localTransferActive) {
+            appendLog("WARN", "当前是对方发起的任务，不能从本机伪暂停；请在发起设备操作")
+            return
+        }
+        if (_state.value.isPreviewing) {
             cancel()
             return
         }
@@ -2025,6 +2038,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun cancel() {
+        if (!_state.value.localTransferActive) {
+            appendLog("WARN", "当前没有可由本机取消的任务")
+            return
+        }
         viewModelScope.launch {
             val result = engine.cancel()
             appendLog(if (result.success) "INFO" else "ERROR", result.summary)
@@ -2032,6 +2049,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         _state.update { state ->
             state.copy(
                 isBusy = false,
+                localTransferActive = false,
                 isPreviewing = false,
                 phase = "任务已取消",
                 progress = if (state.isPreviewing) null else state.progress,
@@ -2082,14 +2100,20 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
 
     fun diagnosticLogPath(): String = diagnosticLogger.pathDescription()
 
-    private fun launchBusy(phase: String, block: suspend () -> Unit) {
+    private fun launchBusy(
+        phase: String,
+        localTransfer: Boolean = false,
+        block: suspend () -> Unit
+    ) {
         if (remoteSessionDeviceId != null) {
             appendLog("WARN", "正在为远端设备提供同步服务，请等待当前任务结束")
             return
         }
         if (_state.value.isBusy || !operationMutex.tryLock()) return
         viewModelScope.launch {
-            _state.update { it.copy(isBusy = true, phase = phase) }
+            _state.update {
+                it.copy(isBusy = true, localTransferActive = localTransfer, phase = phase)
+            }
             try {
                 block()
             } catch (error: Exception) {
@@ -2103,7 +2127,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     _state.update { it.copy(lastResult = message, phase = "操作失败", isPreviewing = false) }
                 }
             } finally {
-                _state.update { it.copy(isBusy = false) }
+                _state.update { it.copy(isBusy = false, localTransferActive = false) }
                 operationMutex.unlock()
             }
         }

@@ -199,6 +199,7 @@ data class TransferRecord(
 data class SyncUiState(
     val isChecking: Boolean = true,
     val isBusy: Boolean = false,
+    val localTransferActive: Boolean = false,
     val capabilities: DeviceCapabilities = DeviceCapabilities(),
     val localIp: String = "未连接 Wi-Fi",
     val deviceName: String = "Android 设备",
