@@ -356,7 +356,8 @@ class LanDiscoveryManager(
         request: SyncPrepareRequest,
         ready: Boolean,
         messageText: String,
-        port: Int
+        port: Int,
+        sessionSecret: String? = null
     ) {
         start()
         val message = baseMessage(TYPE_SYNC_READY)
@@ -365,7 +366,7 @@ class LanDiscoveryManager(
             .put("ready", ready)
             .put("message", messageText.take(240))
             .put("port", port)
-        if (ready) message.put("secret", localSecret())
+        if (ready && !sessionSecret.isNullOrBlank()) message.put("secret", sessionSecret)
         cachedResponses[request.requestId] = CachedResponse(message.toString(), System.currentTimeMillis())
         scope.launch { send(message, InetAddress.getByName(request.host)) }
     }

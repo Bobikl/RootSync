@@ -78,6 +78,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     private var lastPreviewPlan: PreviewPlanCache? = null
     private var remoteSessionDeviceId: String? = null
     private var remoteSessionStartedAtMillis = 0L
+    private var remoteSessionOwnsServer = false
+    private var remoteSessionStopping = false
     @Volatile private var pendingDirectoryDecision: CompletableDeferred<Boolean>? = null
     private val operationMutex = Mutex()
     private val discovery = LanDiscoveryManager(
@@ -732,13 +734,14 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         _state.update { it.copy(isBusy = true, phase = "正在为 ${request.name} 准备服务端") }
+        val sessionSecret = engine.generateSecret()
         val result = try {
             engine.startServer(
                 rsyncPath = rsync,
                 sourcePath = activeProfile.sourcePath,
                 destinationPath = activeProfile.destinationPath,
                 port = port,
-                secret = _state.value.serverSecret,
+                secret = sessionSecret,
                 onLog = ::streamLog,
                 mode = localRole,
                 rangeMode = request.rangeMode,
@@ -762,8 +765,17 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         }
         appendLog(if (result.success) "OK" else "ERROR", "${request.name}：${result.summary}")
         if (!result.success) clearRemoteActivity(request.deviceId)
-        else scheduleRemoteSessionStartTimeout(request.deviceId, remoteSessionStartedAtMillis)
-        discovery.answerSyncPreparation(request, result.success, result.summary, port)
+        else {
+            remoteSessionOwnsServer = true
+            scheduleRemoteSessionStartTimeout(request.deviceId, remoteSessionStartedAtMillis)
+        }
+        discovery.answerSyncPreparation(
+            request = request,
+            ready = result.success,
+            messageText = result.summary,
+            port = port,
+            sessionSecret = sessionSecret.takeIf { result.success }
+        )
     }
 
     private suspend fun awaitDirectoryCreationDecision(
@@ -1010,10 +1022,37 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun releaseRemoteSession(deviceId: String, reason: String) {
         if (remoteSessionDeviceId != deviceId) return
-        remoteSessionDeviceId = null
+        if (remoteSessionStopping) return
+        val shouldStopSessionServer = remoteSessionOwnsServer
         remoteSessionStartedAtMillis = 0L
+        remoteSessionOwnsServer = false
         TransferForegroundService.stop(getApplication())
         appendLog("LAN", reason)
+        if (shouldStopSessionServer) {
+            remoteSessionStopping = true
+            viewModelScope.launch {
+                val result = try {
+                    engine.stopServer(::streamLog)
+                } catch (error: Exception) {
+                    EngineResult(false, error.message ?: error::class.java.simpleName)
+                } finally {
+                    if (remoteSessionDeviceId == deviceId) remoteSessionDeviceId = null
+                    remoteSessionStopping = false
+                }
+                _state.update { state ->
+                    state.copy(
+                        serverRunning = false,
+                        lastResult = if (result.success) state.lastResult else result.summary
+                    )
+                }
+                appendLog(
+                    if (result.success) "LAN" else "ERROR",
+                    if (result.success) "远端会话结束，临时 rsync 服务和会话密钥已失效" else result.summary
+                )
+            }
+        } else {
+            remoteSessionDeviceId = null
+        }
     }
 
     private fun scheduleRemoteSessionStartTimeout(deviceId: String, startedAtMillis: Long) {
@@ -1949,13 +1988,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             }
         )
         if (prepared == null) {
-            val reachableFallback = engine.isServerReachable(current.remoteHost, configuredPort)
-            if (reachableFallback) {
-                appendLog("WARN", "${profile.name} 未响应控制消息，继续使用其后台 rsync 服务")
-                delay(RSYNC_PROBE_RELEASE_DELAY_MS)
-                return RemoteEndpoint(current.remoteHost, configuredPort, current.remoteSecret)
-            }
-            val message = "${profile.name} 未响应服务准备请求；请保持远端 RootSync 打开"
+            val message = "${profile.name} 未响应服务准备请求；为防止连接到旧设备策略，本次任务已停止"
             appendLog("ERROR", message)
             _state.update { it.copy(lastResult = message, phase = "远端无响应") }
             return null
@@ -1968,16 +2001,19 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         val preparedPort = prepared.port.takeIf { it in 1024..65535 } ?: configuredPort
-        val preparedSecret = prepared.secret.takeIf {
-            it.length >= SyncUiState.MIN_SECRET_LENGTH
-        } ?: current.remoteSecret
+        val preparedSecret = prepared.secret.takeIf { it.length >= SyncUiState.MIN_SECRET_LENGTH }
+        if (preparedSecret == null) {
+            val message = "${profile.name} 未返回本次任务的会话密钥；为防止复用旧服务，本次任务已停止"
+            appendLog("ERROR", message)
+            _state.update { it.copy(lastResult = message, phase = "远端会话无效") }
+            return null
+        }
         _state.update { state ->
             state.copy(
                 portText = preparedPort.toString(),
-                remoteSecret = preparedSecret,
                 profiles = state.profiles.map { item ->
                     if (item.id == profile.id) {
-                        item.copy(port = preparedPort, secret = preparedSecret, host = prepared.host)
+                        item.copy(port = preparedPort, host = prepared.host)
                     } else item
                 }
             )
@@ -2317,7 +2353,6 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         const val REMOTE_ACTIVITY_FINISHED_HOLD_MS = 8_000L
         const val REMOTE_SESSION_START_TIMEOUT_MS = 2L * 60L * 1000L
         const val DIRECTORY_DECISION_TIMEOUT_MS = 110_000L
-        const val RSYNC_PROBE_RELEASE_DELAY_MS = 1_000L
         const val PROFILE_PRESENCE_INTERVAL_MS = 15_000L
         const val PROFILE_ONLINE_TTL_MS = 45_000L
         const val PROFILE_PRESENCE_RESPONSE_MS = 800L
