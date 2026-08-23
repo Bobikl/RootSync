@@ -172,7 +172,19 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun loadState(): SyncUiState {
-        val profiles = decodeProfiles(preferences.getString("profiles", null))
+        val profilesRaw = preferences.getString("profiles", null)
+        val decodedProfiles = decodeProfiles(profilesRaw)
+        val profiles = if (decodedProfiles.isNotEmpty() || profilesRaw.isNullOrBlank() ||
+            profilesRaw.trim() == "[]"
+        ) {
+            decodedProfiles
+        } else {
+            decodeProfiles(preferences.getString("profilesBackup", null)).also { restored ->
+                if (restored.isNotEmpty()) {
+                    diagnosticLogger.append("WARN", "主设备配置无法恢复，已使用上一份配置备份")
+                }
+            }
+        }
         val selectedId = preferences.getString("selectedProfileId", null)
         val selected = profiles.firstOrNull { it.id == selectedId }
         val storedSource = migrateBiliPath(
@@ -196,9 +208,9 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         val legacyRecord = decodeTransferRecord(preferences.getString("transferRecord", null))
         val storedRecords = decodeTransferRecords(preferences.getString("transferRecords", null))
         val transferRecords = legacyRecord?.let { mergeTransferRecord(storedRecords, it) } ?: storedRecords
-        val selectedRecord = selected?.let { profile ->
-            transferRecords.filter { recordMatchesProfile(it, profile) }.maxByOrNull { it.updatedAtMillis }
-        } ?: legacyRecord
+        val selectedRecord = if (selected != null) {
+            transferRecords.filter { recordMatchesProfile(it, selected) }.maxByOrNull { it.updatedAtMillis }
+        } else legacyRecord
         return SyncUiState(
             deviceName = deviceName,
             profileName = selected?.name ?: preferences.getString("profileName", "手动设备").orEmpty(),
@@ -217,7 +229,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             remoteSecret = selected?.secret ?: preferences.getString("remoteSecret", "").orEmpty(),
             role = resolvedRole,
             rangeMode = selected?.rangeMode ?: fallbackRangeMode,
-            sinceEpochMillis = selected?.sinceEpochMillis ?: fallbackSince,
+            sinceEpochMillis = if (selected != null) selected.sinceEpochMillis else fallbackSince,
             profiles = profiles,
             selectedProfileId = selected?.id,
             transferRecord = selectedRecord,
@@ -1152,6 +1164,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun saveConfig() {
         val value = _state.value
+        val encodedProfiles = encodeProfiles(value.profiles)
+        val previousProfiles = preferences.getString("profiles", null)
         preferences.edit {
             putString("profileName", value.profileName)
             putString("remoteHost", value.remoteHost)
@@ -1165,7 +1179,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             putString("rangeMode", value.rangeMode.name)
             value.sinceEpochMillis?.let { putLong("sinceEpochMillis", it) }
                 ?: remove("sinceEpochMillis")
-            putString("profiles", encodeProfiles(value.profiles))
+            if (!previousProfiles.isNullOrBlank() && previousProfiles != encodedProfiles) {
+                putString("profilesBackup", previousProfiles)
+            }
+            putString("profiles", encodedProfiles)
             putString("selectedProfileId", value.selectedProfileId)
             value.transferRecord?.let { putString("transferRecord", encodeTransferRecord(it)) }
                 ?: remove("transferRecord")
@@ -2312,10 +2329,13 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun decodeProfiles(raw: String?): List<PeerProfile> {
         if (raw.isNullOrBlank()) return emptyList()
-        return runCatching {
-            val array = JSONArray(raw)
-            buildList {
-                for (index in 0 until array.length()) {
+        val array = runCatching { JSONArray(raw) }.getOrElse { error ->
+            diagnosticLogger.append("ERROR", "设备配置 JSON 损坏：${error.message ?: error::class.java.simpleName}")
+            return emptyList()
+        }
+        return buildList {
+            for (index in 0 until array.length()) {
+                val profile = runCatching {
                     val item = array.getJSONObject(index)
                     val role = runCatching { SyncRole.valueOf(item.getString("role")) }
                         .getOrDefault(SyncRole.RECEIVE_ONLY)
@@ -2327,8 +2347,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                         item.optString("sourcePath", SyncUiState.DEFAULT_BILI_PATH)
                     )
                     val secret = item.optString("secret")
-                    add(
-                        PeerProfile(
+                    PeerProfile(
                             id = item.getString("id"),
                             deviceId = item.optString("deviceId", "manual:${item.getString("host")}"),
                             name = item.optString("name", item.getString("host")),
@@ -2347,11 +2366,16 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                             } else migrateBiliPath(
                                 item.optString("destinationPath", SyncUiState.DEFAULT_BILI_PATH)
                             )
-                        )
                     )
+                }.onFailure { error ->
+                    diagnosticLogger.append(
+                        "ERROR",
+                        "已跳过损坏的第 ${index + 1} 条设备配置：${error.message ?: error::class.java.simpleName}"
+                    )
+                }.getOrNull()
+                if (profile != null) add(profile)
                 }
             }
-        }.getOrElse { emptyList() }
     }
 
     private fun encodeTransferRecord(record: TransferRecord): String = JSONObject().apply {
