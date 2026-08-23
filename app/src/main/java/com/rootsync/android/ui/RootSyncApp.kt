@@ -57,6 +57,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -225,6 +226,8 @@ fun RootSyncApp(viewModel: SyncViewModel) {
 @Composable
 private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: PaddingValues) {
     val context = LocalContext.current
+    var confirmProfileDeletion by remember { mutableStateOf(false) }
+    var confirmRecordDeletion by remember { mutableStateOf(false) }
     val configurationEnabled = !state.isBusy && !state.isCheckingPeerOnline
     val nearbyPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -271,6 +274,39 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
             // 两端都要获得局域网权限，才能在首次打开时互相发现并接收配对请求。
             nearbyPermissionLauncher.launch(Manifest.permission.NEARBY_WIFI_DEVICES)
         }
+    }
+    if (confirmProfileDeletion) {
+        val selectedName = state.profiles.firstOrNull { it.id == state.selectedProfileId }?.name ?: "当前设备"
+        AlertDialog(
+            onDismissRequest = { confirmProfileDeletion = false },
+            title = { Text("删除设备连接？") },
+            text = { Text("将删除“$selectedName”的配对信任、独立策略和关联传输记录；不会删除任何已同步文件。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmProfileDeletion = false
+                    viewModel.deleteSelectedProfile()
+                }) { Text("确认删除") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmProfileDeletion = false }) { Text("取消") }
+            }
+        )
+    }
+    if (confirmRecordDeletion) {
+        AlertDialog(
+            onDismissRequest = { confirmRecordDeletion = false },
+            title = { Text("删除传输记录？") },
+            text = { Text("只删除这条任务记录，不会删除已传输文件、断点分片或历史备份。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmRecordDeletion = false
+                    viewModel.deleteTransferRecord()
+                }) { Text("确认删除记录") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmRecordDeletion = false }) { Text("取消") }
+            }
+        )
     }
     Column(
         modifier = Modifier
@@ -342,7 +378,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                     Text("新建设备")
                 }
                 OutlinedButton(
-                    onClick = viewModel::deleteSelectedProfile,
+                    onClick = { confirmProfileDeletion = true },
                     enabled = configurationEnabled && state.selectedProfileId != null,
                     modifier = Modifier.weight(1f)
                 ) { Text("删除当前") }
@@ -750,7 +786,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                     }
                 }
                 OutlinedButton(
-                    onClick = viewModel::deleteTransferRecord,
+                    onClick = { confirmRecordDeletion = true },
                     enabled = !state.isBusy,
                     modifier = Modifier.fillMaxWidth()
                 ) {
@@ -896,11 +932,28 @@ private fun DiscoveredDeviceRow(
 @Composable
 private fun ServerPage(state: SyncUiState, viewModel: SyncViewModel, padding: PaddingValues) {
     val context = LocalContext.current
+    var confirmSecretRegeneration by remember { mutableStateOf(false) }
     val serverConfigurationEnabled = !state.serverRunning && !state.isBusy
     val serverActionEnabled = when {
         state.serverRunning && state.isBusy -> false
         state.serverRunning -> true
         else -> state.canOperate
+    }
+    if (confirmSecretRegeneration) {
+        AlertDialog(
+            onDismissRequest = { confirmSecretRegeneration = false },
+            title = { Text("重新生成本机密钥？") },
+            text = { Text("已配对设备会在下一次可信重连时自动更新密钥；手动配置的设备需要重新填写。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmSecretRegeneration = false
+                    viewModel.regenerateSecret()
+                }) { Text("确认重新生成") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmSecretRegeneration = false }) { Text("取消") }
+            }
+        )
     }
     Column(
         modifier = Modifier
@@ -958,7 +1011,7 @@ private fun ServerPage(state: SyncUiState, viewModel: SyncViewModel, padding: Pa
                     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                     clipboard.setPrimaryClip(ClipData.newPlainText("RootSync secret", state.serverSecret))
                 }) { Text("复制密钥") }
-                TextButton(onClick = viewModel::regenerateSecret, enabled = serverConfigurationEnabled) {
+                TextButton(onClick = { confirmSecretRegeneration = true }, enabled = serverConfigurationEnabled) {
                     Text("重新生成")
                 }
             }
