@@ -511,6 +511,7 @@ class RootSyncEngine(private val context: Context) {
         untilEpochMillis: Long,
         bidirectional: Boolean,
         dryRun: Boolean,
+        strictChecksum: Boolean = false,
         onLog: (String) -> Unit,
         onProgress: (Float) -> Unit,
         onItem: (RsyncItem) -> Unit,
@@ -581,7 +582,8 @@ class RootSyncEngine(private val context: Context) {
             backupRunId = backupRunId(),
             filesFrom = remoteFileList.absolutePath.takeIf { rangeMode == SyncRangeMode.SINCE },
             bidirectional = bidirectional,
-            dryRun = dryRun
+            dryRun = dryRun,
+            strictChecksum = strictChecksum
         )
         val transfer = executeTransfer(
             command,
@@ -631,8 +633,10 @@ class RootSyncEngine(private val context: Context) {
         onProgress(1f)
         EngineResult(
             true,
-            "${if (bidirectional) "双向同步接收阶段" else "只接收"}完成，数据完整性校验通过；" +
-                "未删除目标端数据，覆盖前版本已保存到 .rootsync-history"
+                "${if (bidirectional) "双向同步接收阶段" else "只接收"}完成，" +
+                    (if (strictChecksum) "所选范围严格内容比较和已传输文件校验通过；" else
+                        "本次实际传输文件校验通过（快速模式未读取未变化文件内容）；") +
+                    "未删除目标端数据，覆盖前版本已保存到 .rootsync-history"
         )
     }
 
@@ -647,6 +651,7 @@ class RootSyncEngine(private val context: Context) {
         untilEpochMillis: Long,
         bidirectional: Boolean,
         dryRun: Boolean,
+        strictChecksum: Boolean = false,
         onLog: (String) -> Unit,
         onProgress: (Float) -> Unit,
         onItem: (RsyncItem) -> Unit,
@@ -692,7 +697,8 @@ class RootSyncEngine(private val context: Context) {
             backupRunId = backupRunId(),
             filesFrom = localFileList.absolutePath.takeIf { rangeMode == SyncRangeMode.SINCE },
             bidirectional = bidirectional,
-            dryRun = dryRun
+            dryRun = dryRun,
+            strictChecksum = strictChecksum
         )
         val transfer = executeTransfer(
             command,
@@ -725,7 +731,9 @@ class RootSyncEngine(private val context: Context) {
             onProgress(1f)
             EngineResult(
                 true,
-                "${if (bidirectional) "双向同步发送阶段" else "只发送"}完成，数据完整性校验通过；" +
+                "${if (bidirectional) "双向同步发送阶段" else "只发送"}完成，" +
+                    (if (strictChecksum) "所选范围严格内容比较和已传输文件校验通过；" else
+                        "本次实际传输文件校验通过（快速模式未读取未变化文件内容）；") +
                     "未删除目标端数据，覆盖前版本已保存到 .rootsync-history"
             )
         }
@@ -745,8 +753,8 @@ class RootSyncEngine(private val context: Context) {
             return if (capture.observedBytes > 0L) {
                 EngineResult(false, "传输产生了数据，但未能建立完整性校验清单；任务不会标记为完成")
             } else {
-                onLog("INTEGRITY_VERIFY_PASSED count=0 没有新增或更新文件")
-                EngineResult(true, "没有新增或更新文件，完整性校验通过")
+                onLog("INTEGRITY_VERIFY_PASSED count=0 没有实际传输文件")
+                EngineResult(true, "没有实际传输文件，无需执行传输后逐文件校验")
             }
         }
         val safeFiles = capture.relativeFiles.filter { relative ->

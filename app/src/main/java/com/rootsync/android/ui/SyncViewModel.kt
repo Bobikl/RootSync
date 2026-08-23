@@ -232,6 +232,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             remoteSecret = selected?.secret ?: preferences.getString("remoteSecret", "").orEmpty(),
             role = resolvedRole,
             rangeMode = selected?.rangeMode ?: fallbackRangeMode,
+            strictContentCheck = preferences.getBoolean("strictContentCheck", false),
             sinceEpochMillis = if (selected != null) selected.sinceEpochMillis else fallbackSince,
             profiles = profiles,
             selectedProfileId = selected?.id,
@@ -333,6 +334,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     fun setSinceEpochMillis(value: Long) {
         updateConfig { copy(sinceEpochMillis = value.coerceAtLeast(1L), previewReady = false) }
         publishCurrentStrategy()
+    }
+
+    fun setStrictContentCheck(enabled: Boolean) = updateConfig {
+        copy(strictContentCheck = enabled, previewReady = false)
     }
 
     private fun updateConfig(block: SyncUiState.() -> SyncUiState) {
@@ -1205,6 +1210,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             putString("remoteSecret", value.remoteSecret)
             putString("role", value.role.name)
             putString("rangeMode", value.rangeMode.name)
+            putBoolean("strictContentCheck", value.strictContentCheck)
             value.sinceEpochMillis?.let { putLong("sinceEpochMillis", it) }
                 ?: remove("sinceEpochMillis")
             if (!previousProfiles.isNullOrBlank() && previousProfiles != encodedProfiles) {
@@ -1573,6 +1579,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     untilEpochMillis = untilEpochMillis,
                     bidirectional = false,
                     dryRun = dryRun,
+                    strictChecksum = current.strictContentCheck,
                     onLog = ::streamLog,
                     onProgress = updateProgress,
                     onItem = { item ->
@@ -1594,6 +1601,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     untilEpochMillis = untilEpochMillis,
                     bidirectional = false,
                     dryRun = dryRun,
+                    strictChecksum = current.strictContentCheck,
                     onLog = ::streamLog,
                     onProgress = updateProgress,
                     onItem = { item ->
@@ -1617,6 +1625,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                         untilEpochMillis = untilEpochMillis,
                         bidirectional = true,
                         dryRun = dryRun,
+                        strictChecksum = current.strictContentCheck,
                         onLog = ::streamLog,
                         onProgress = { progress -> updateProgress(progress * 0.5f) },
                         onItem = { item ->
@@ -1642,6 +1651,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                             untilEpochMillis = untilEpochMillis,
                             bidirectional = true,
                             dryRun = dryRun,
+                            strictChecksum = current.strictContentCheck,
                             onLog = ::streamLog,
                             onProgress = { progress -> updateProgress(0.5f + progress * 0.5f) },
                             onItem = { item ->
@@ -1658,7 +1668,11 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                                 if (dryRun) {
                                     "双向差异预览完成；全程零删除"
                                 } else {
-                                    "双向同步完成，两个方向数据完整性校验均通过；较新版本优先，未删除任何用户数据"
+                                    if (current.strictContentCheck) {
+                                        "双向同步完成，所选范围严格内容比较和两个方向传输后校验均通过；未删除任何用户数据"
+                                    } else {
+                                        "双向同步完成，本次实际传输文件校验通过；快速模式未读取未变化文件内容，未删除任何用户数据"
+                                    }
                                 }
                             )
                         } else pushResult
@@ -1731,7 +1745,11 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     TransferForegroundService.notifyCompleted(
                         getApplication(),
                         "RootSync 同步完成",
-                        "${current.profileName.ifBlank { current.remoteHost }}：数据完整性校验通过"
+                        if (current.strictContentCheck) {
+                            "${current.profileName.ifBlank { current.remoteHost }}：所选范围严格内容比较和传输后校验通过"
+                        } else {
+                            "${current.profileName.ifBlank { current.remoteHost }}：本次实际传输文件校验通过（快速模式）"
+                        }
                     )
                 }
                 TransferForegroundService.stop(getApplication())
@@ -1805,6 +1823,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 untilEpochMillis = untilEpochMillis,
                 bidirectional = current.role == SyncRole.BIDIRECTIONAL,
                 dryRun = true,
+                strictChecksum = current.strictContentCheck,
                 onLog = ::streamLog,
                 onProgress = {},
                 onItem = countDownload
@@ -1824,6 +1843,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 untilEpochMillis = untilEpochMillis,
                 bidirectional = current.role == SyncRole.BIDIRECTIONAL,
                 dryRun = true,
+                strictChecksum = current.strictContentCheck,
                 onLog = ::streamLog,
                 onProgress = {},
                 onItem = countUpload
@@ -1853,6 +1873,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         current.selectedProfileId.orEmpty(),
         current.role.name,
         current.rangeMode.name,
+        current.strictContentCheck.toString(),
         current.sinceEpochMillis?.toString().orEmpty(),
         current.sourcePath,
         current.destinationPath,
@@ -2288,7 +2309,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
             message.startsWith("INTEGRITY_VERIFY_PASSED") -> {
-                _state.update { it.copy(phase = "数据完整性校验通过") }
+                _state.update { it.copy(phase = "本次实际传输文件校验通过") }
             }
         }
         appendLog("RSYNC", message)

@@ -98,6 +98,26 @@ class SafeInputTest {
     }
 
     @Test
+    fun strictContentComparisonAddsChecksumWithoutDelete() {
+        val command = RsyncCommandBuilder.push(
+            rsyncPath = "/data/app/librsync.so",
+            host = "192.168.1.30",
+            port = 8873,
+            source = "/storage/emulated/0/send",
+            passwordFile = "/data/user/0/app/password",
+            backupRunId = "20260809-210000-000",
+            filesFrom = null,
+            bidirectional = false,
+            dryRun = true,
+            strictChecksum = true
+        )
+        assertTrue(command.contains("--checksum"))
+        assertTrue(command.contains("--dry-run"))
+        assertFalse(command.contains("--delete"))
+        assertFalse(command.contains("--remove-source-files"))
+    }
+
+    @Test
     fun identifiesEverySourceOrDestinationDeletionOption() {
         assertTrue(RsyncCommandBuilder.isDeletionOption("--delete"))
         assertTrue(RsyncCommandBuilder.isDeletionOption("--delete-delay"))

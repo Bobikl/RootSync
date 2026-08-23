@@ -213,6 +213,7 @@ data class SyncUiState(
     val remoteSecret: String = "",
     val role: SyncRole = SyncRole.RECEIVE_ONLY,
     val rangeMode: SyncRangeMode = SyncRangeMode.ALL,
+    val strictContentCheck: Boolean = false,
     val sinceEpochMillis: Long? = null,
     val profiles: List<PeerProfile> = emptyList(),
     val selectedProfileId: String? = null,

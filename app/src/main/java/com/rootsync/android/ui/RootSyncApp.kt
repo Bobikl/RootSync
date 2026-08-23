@@ -496,6 +496,31 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                FilterChip(
+                    selected = !state.strictContentCheck,
+                    onClick = { viewModel.setStrictContentCheck(false) },
+                    enabled = configurationEnabled,
+                    label = { Text("快速比较") },
+                    modifier = Modifier.weight(1f)
+                )
+                FilterChip(
+                    selected = state.strictContentCheck,
+                    onClick = { viewModel.setStrictContentCheck(true) },
+                    enabled = configurationEnabled,
+                    label = { Text("严格内容校验") },
+                    modifier = Modifier.weight(1f)
+                )
+            }
+            Text(
+                if (state.strictContentCheck) {
+                    "严格模式会读取所选范围内双方文件内容，可发现大小和修改时间相同但内容不同的文件；大型目录扫描会明显变慢。"
+                } else {
+                    "快速模式按大小和修改时间找差异，完成提示仅代表本次实际传输文件校验通过。"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
             Surface(
                 color = MaterialTheme.colorScheme.tertiaryContainer,
                 shape = RoundedCornerShape(14.dp),
@@ -517,7 +542,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                     SyncRole.RECEIVE_ONLY ->
                         "数据方向：${state.profileName.ifBlank { "远端" }} → 本机；本机执行时主动拉取。"
                     SyncRole.BIDIRECTIONAL ->
-                        "先接收再发送；较新修改时间优先，并用校验和确认差异。覆盖前版本保留在 .rootsync-history。"
+                        "先接收再发送；较新修改时间优先。${if (state.strictContentCheck) "所选范围使用内容校验和确认差异。" else "快速模式按大小和修改时间确认差异。"}覆盖前版本保留在 .rootsync-history。"
                 },
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -537,7 +562,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                     value = state.destinationPath,
                     onValueChange = viewModel::setDestinationPath,
                     enabled = configurationEnabled,
-                    label = { Text("本机接收目录（不存在会自动创建）") },
+                    label = { Text("本机接收目录（不存在时询问）") },
                     minLines = 2,
                     modifier = Modifier.fillMaxWidth()
                 )

@@ -154,7 +154,8 @@ object RsyncCommandBuilder {
         backupRunId: String,
         filesFrom: String?,
         bidirectional: Boolean,
-        dryRun: Boolean
+        dryRun: Boolean,
+        strictChecksum: Boolean = false
     ): String {
         require(SafeInput.isValidIpv4(host))
         require(SafeInput.validateStoragePath(destination) == null)
@@ -182,6 +183,7 @@ object RsyncCommandBuilder {
             "--password-file=$passwordFile"
         )
         filesFrom?.let { args += listOf("--files-from=$it", "--from0") }
+        if (strictChecksum) args += "--checksum"
         if (bidirectional) args += "--update"
         if (dryRun) args += listOf("--dry-run", "--itemize-changes")
         args += "rsync://sync-user@$host:$port/send/"
@@ -199,7 +201,8 @@ object RsyncCommandBuilder {
         backupRunId: String,
         filesFrom: String?,
         bidirectional: Boolean,
-        dryRun: Boolean
+        dryRun: Boolean,
+        strictChecksum: Boolean = false
     ): String {
         require(SafeInput.isValidIpv4(host))
         require(SafeInput.validateStoragePath(source) == null)
@@ -227,6 +230,7 @@ object RsyncCommandBuilder {
             "--password-file=$passwordFile"
         )
         filesFrom?.let { args += listOf("--files-from=$it", "--from0") }
+        if (strictChecksum) args += "--checksum"
         if (bidirectional) args += "--update"
         if (dryRun) args += listOf("--dry-run", "--itemize-changes")
         args += source.trimEnd('/') + "/"
