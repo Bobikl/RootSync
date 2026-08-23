@@ -896,6 +896,12 @@ private fun DiscoveredDeviceRow(
 @Composable
 private fun ServerPage(state: SyncUiState, viewModel: SyncViewModel, padding: PaddingValues) {
     val context = LocalContext.current
+    val serverConfigurationEnabled = !state.serverRunning && !state.isBusy
+    val serverActionEnabled = when {
+        state.serverRunning && state.isBusy -> false
+        state.serverRunning -> true
+        else -> state.canOperate
+    }
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -917,7 +923,7 @@ private fun ServerPage(state: SyncUiState, viewModel: SyncViewModel, padding: Pa
             OutlinedTextField(
                 value = state.serverPortText,
                 onValueChange = viewModel::setServerPort,
-                enabled = !state.serverRunning,
+                enabled = serverConfigurationEnabled,
                 label = { Text("本机监听端口") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth()
@@ -925,7 +931,7 @@ private fun ServerPage(state: SyncUiState, viewModel: SyncViewModel, padding: Pa
             OutlinedTextField(
                 value = state.sourcePath,
                 onValueChange = viewModel::setSourcePath,
-                enabled = !state.serverRunning,
+                enabled = serverConfigurationEnabled,
                 label = { Text("send：本机发送源目录") },
                 minLines = 2,
                 modifier = Modifier.fillMaxWidth()
@@ -933,7 +939,7 @@ private fun ServerPage(state: SyncUiState, viewModel: SyncViewModel, padding: Pa
             OutlinedTextField(
                 value = state.destinationPath,
                 onValueChange = viewModel::setDestinationPath,
-                enabled = !state.serverRunning,
+                enabled = serverConfigurationEnabled,
                 label = { Text("receive：本机接收目录（缺失时询问）") },
                 minLines = 2,
                 modifier = Modifier.fillMaxWidth()
@@ -941,7 +947,7 @@ private fun ServerPage(state: SyncUiState, viewModel: SyncViewModel, padding: Pa
             OutlinedTextField(
                 value = state.serverSecret,
                 onValueChange = viewModel::setServerSecret,
-                enabled = !state.serverRunning,
+                enabled = serverConfigurationEnabled,
                 label = { Text("本机密钥（可自定义）") },
                 supportingText = { Text("至少 6 位；局域网内两端一致即可") },
                 singleLine = true,
@@ -952,19 +958,28 @@ private fun ServerPage(state: SyncUiState, viewModel: SyncViewModel, padding: Pa
                     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                     clipboard.setPrimaryClip(ClipData.newPlainText("RootSync secret", state.serverSecret))
                 }) { Text("复制密钥") }
-                TextButton(onClick = viewModel::regenerateSecret, enabled = !state.serverRunning) {
+                TextButton(onClick = viewModel::regenerateSecret, enabled = serverConfigurationEnabled) {
                     Text("重新生成")
                 }
             }
             Button(
                 onClick = if (state.serverRunning) viewModel::stopServer else viewModel::startServer,
-                enabled = state.serverRunning || state.canOperate,
+                enabled = serverActionEnabled,
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Text(if (state.serverRunning) "停止服务端" else "生成快照并启动服务端")
             }
             Text(
-                "服务启动后 rsync daemon 独立运行；已配对设备可按各自策略连接。本页关闭不会自动停止服务。",
+                when {
+                    state.serverRunning && state.isBusy ->
+                        "当前同步任务正在占用服务端；为防止中途断开，端口、目录、密钥和停止按钮已锁定。"
+                    state.serverRunning ->
+                        "手动服务端正在运行；已配对设备可按各自策略连接，本页关闭不会自动停止服务。"
+                    state.isBusy ->
+                        "当前同步任务进行中；服务端配置暂时只读，任务暂停、中断或完成后恢复编辑。"
+                    else ->
+                        "手动启动后 rsync daemon 独立运行；已配对设备可按各自策略连接。"
+                },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
