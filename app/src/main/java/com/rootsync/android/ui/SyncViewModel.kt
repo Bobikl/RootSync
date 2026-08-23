@@ -1520,7 +1520,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
             }
-            val planned = if (dryRun) {
+            var planned = if (dryRun) {
                 PlannedTransfer()
             } else {
                 _state.update { it.copy(phase = "正在统计需要同步的数据", estimatedCompletionTime = "正在统计同步总量…") }
@@ -1530,6 +1530,22 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     rsync,
                     untilEpochMillis
                 )
+            }
+            if (!dryRun && planned.result.success && planned.downloadBytes > 0L) {
+                val availableBytes = engine.availableStorageBytes(current.destinationPath)
+                if (availableBytes != null) {
+                    val reserveBytes = (planned.downloadBytes / 10L)
+                        .coerceIn(MIN_STORAGE_RESERVE_BYTES, MAX_STORAGE_RESERVE_BYTES)
+                    val requiredBytes = safeAddBytes(planned.downloadBytes, reserveBytes)
+                    if (availableBytes < requiredBytes) {
+                        val message = "本机接收空间不足：预计下载 ${formatBytes(planned.downloadBytes)}，" +
+                            "需保留至少 ${formatBytes(requiredBytes)}，当前可用 ${formatBytes(availableBytes)}"
+                        appendLog("ERROR", message)
+                        planned = planned.copy(result = EngineResult(false, message))
+                    }
+                } else {
+                    appendLog("WARN", "无法读取本机接收目录剩余空间，将由 rsync 写入错误保护任务")
+                }
             }
             if (!dryRun && planned.result.success) {
                 resetTransferSpeedTracking()
@@ -2502,6 +2518,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         const val PROFILE_ONLINE_TTL_MS = 45_000L
         const val PROFILE_PRESENCE_RESPONSE_MS = 800L
         const val NSD_PORT_DEBOUNCE_MS = 800L
+        const val MIN_STORAGE_RESERVE_BYTES = 64L * 1024L * 1024L
+        const val MAX_STORAGE_RESERVE_BYTES = 512L * 1024L * 1024L
         const val REMOTE_PREVIEW_ITEM_THROTTLE_MS = 150L
         const val TRANSFER_ITEM_REFRESH_MS = 3_000L
         const val TRANSFER_BYTES_UI_INTERVAL_MS = 250L

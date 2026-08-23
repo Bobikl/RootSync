@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Process
+import android.os.StatFs
 import com.rootsync.android.domain.CapabilityCheck
 import com.rootsync.android.domain.CheckState
 import com.rootsync.android.domain.DeviceCapabilities
@@ -1149,6 +1150,11 @@ class RootSyncEngine(private val context: Context) {
     fun generateSecret(): String {
         val bytes = ByteArray(18).also { SecureRandom().nextBytes(it) }
         return bytes.joinToString("") { "%02x".format(it.toInt() and 0xff) }
+    }
+
+    fun availableStorageBytes(path: String): Long? {
+        if (SafeInput.validateStoragePath(path) != null) return null
+        return runCatching { StatFs(path).availableBytes.coerceAtLeast(0L) }.getOrNull()
     }
 
     fun localIpv4(): String = try {
