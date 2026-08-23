@@ -1413,6 +1413,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         val validation = when {
             rsync == null -> "内置 rsync 不可执行"
             !SafeInput.isValidIpv4(current.remoteHost) -> "请输入有效的远端 IPv4 地址"
+            SafeInput.isLocalSelfTarget(current.remoteHost, current.localIp) ->
+                "远端地址指向本机，已阻止可能递归写入自身目录的任务"
             port == null -> "端口必须位于 1024–65535"
             current.remoteSecret.length < SyncUiState.MIN_SECRET_LENGTH -> "请完成配对或输入远端密钥"
             current.rangeMode == SyncRangeMode.SINCE && current.sinceEpochMillis == null ->

@@ -19,10 +19,16 @@ object SafeInput {
         if (!path.startsWith("/storage/emulated/0/")) {
             return "首版只允许 /storage/emulated/0/ 下的目录"
         }
-        if (path.split('/').any { it == ".." }) return "路径不能包含 .."
-        if (path.endsWith("/.rsync-partial")) return "不能选择 rsync 临时目录"
+        val segments = path.split('/')
+        if (segments.any { it == "." || it == ".." }) return "路径不能包含 . 或 .. 段"
+        if (segments.any { it == ".rsync-partial" || it == ".rootsync-history" }) {
+            return "不能选择 RootSync 临时目录或历史备份目录及其子目录"
+        }
         return null
     }
+
+    fun isLocalSelfTarget(remoteHost: String, localHost: String): Boolean =
+        remoteHost == localHost || remoteHost == "0.0.0.0" || remoteHost.startsWith("127.")
 
     fun shellQuote(value: String): String = "'" + value.replace("'", "'\\''") + "'"
 }

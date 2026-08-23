@@ -28,6 +28,16 @@ class SafeInputTest {
         assertNull(SafeInput.validateStoragePath("/storage/emulated/0/Android/data/example"))
         assertNotNull(SafeInput.validateStoragePath("/storage/emulated/0/a/../b"))
         assertNotNull(SafeInput.validateStoragePath("/data/local/tmp"))
+        assertNotNull(SafeInput.validateStoragePath("/storage/emulated/0/.rsync-partial/resume"))
+        assertNotNull(SafeInput.validateStoragePath("/storage/emulated/0/archive/.rootsync-history/run"))
+    }
+
+    @Test
+    fun rejectsLocalSelfTarget() {
+        assertTrue(SafeInput.isLocalSelfTarget("192.168.1.20", "192.168.1.20"))
+        assertTrue(SafeInput.isLocalSelfTarget("127.0.0.1", "192.168.1.20"))
+        assertTrue(SafeInput.isLocalSelfTarget("0.0.0.0", "192.168.1.20"))
+        assertFalse(SafeInput.isLocalSelfTarget("192.168.1.21", "192.168.1.20"))
     }
 
     @Test
