@@ -82,6 +82,7 @@ class LanDiscoveryManager(
     private val storageCheckWaiters = ConcurrentHashMap<String, CompletableDeferred<RemoteStorageCheckResult>>()
     private val prepareStatusListeners = ConcurrentHashMap<String, (String) -> Unit>()
     private val activityAckWaiters = ConcurrentHashMap<String, CompletableDeferred<Unit>>()
+    private val strategyAckWaiters = ConcurrentHashMap<String, CompletableDeferred<Unit>>()
     private val resolveQueue = ConcurrentLinkedQueue<NsdServiceInfo>()
     private val resolving = AtomicBoolean(false)
     private val scanGeneration = AtomicInteger(0)
@@ -281,15 +282,34 @@ class LanDiscoveryManager(
         sinceEpochMillis: Long?
     ) {
         start()
+        val requestId = UUID.randomUUID().toString()
         val message = baseMessage(TYPE_STRATEGY_UPDATE)
+            .put("requestId", requestId)
             .put("secret", localSecret())
             .put("controlToken", localControlToken())
             .put("role", role.name)
             .put("rangeMode", rangeMode.name)
         sinceEpochMillis?.let { message.put("sinceEpochMillis", it) }
         scope.launch {
-            sendRepeated(message, InetAddress.getByName(host), 2, 180L)
-            onLog("已发送零删除设备策略：${role.label}")
+            val waiter = CompletableDeferred<Unit>()
+            strategyAckWaiters[requestId] = waiter
+            val address = InetAddress.getByName(host)
+            val retryJob = launch {
+                while (isActive && !waiter.isCompleted) {
+                    send(message, address)
+                    delay(STRATEGY_RETRY_INTERVAL_MS)
+                }
+            }
+            val acknowledged = withTimeoutOrNull(STRATEGY_ACK_TIMEOUT_MS) { waiter.await() } != null
+            retryJob.cancel()
+            strategyAckWaiters.remove(requestId, waiter)
+            onLog(
+                if (acknowledged) {
+                    "对方已确认零删除设备策略：${role.label}"
+                } else {
+                    "对方未确认设备策略：${role.label}；已停止重发，请确认设备在线后重试"
+                }
+            )
         }
     }
 
@@ -806,6 +826,7 @@ class LanDiscoveryManager(
                 }
             }
             TYPE_STRATEGY_UPDATE -> {
+                val requestId = message.optString("requestId")
                 val secret = message.optString("secret")
                 val controlToken = message.optString("controlToken")
                 val role = parseRole(message.optString("role"))
@@ -815,6 +836,12 @@ class LanDiscoveryManager(
                     role != null && rangeMode != null &&
                     (rangeMode == SyncRangeMode.ALL || since != null)
                 ) {
+                    if (requestId.isNotBlank()) {
+                        val ack = baseMessage(TYPE_STRATEGY_ACK)
+                            .put("requestId", requestId)
+                            .put("controlToken", localControlToken())
+                        scope.launch { send(ack, sender) }
+                    }
                     _strategyUpdates.tryEmit(
                         StrategyUpdate(
                             remoteDeviceId,
@@ -827,6 +854,11 @@ class LanDiscoveryManager(
                         )
                     )
                 }
+            }
+            TYPE_STRATEGY_ACK -> {
+                val controlToken = message.optString("controlToken")
+                if (!isValidTrustedControl(remoteDeviceId, controlToken)) return
+                strategyAckWaiters.remove(message.optString("requestId"))?.complete(Unit)
             }
             TYPE_SYNC_PREPARE -> {
                 val requestId = message.optString("requestId")
@@ -1100,6 +1132,7 @@ class LanDiscoveryManager(
         private const val TYPE_TRUSTED_HELLO = "trusted_hello"
         private const val TYPE_TRUSTED_ACK = "trusted_ack"
         private const val TYPE_STRATEGY_UPDATE = "strategy_update"
+        private const val TYPE_STRATEGY_ACK = "strategy_ack"
         private const val TYPE_SYNC_PREPARE = "sync_prepare"
         private const val TYPE_SYNC_READY = "sync_ready"
         private const val TYPE_SYNC_WAITING = "sync_waiting"
@@ -1110,6 +1143,8 @@ class LanDiscoveryManager(
         private const val PREPARE_TIMEOUT_MS = 120_000L
         private const val PREPARE_RETRY_INTERVAL_MS = 4_000L
         private const val PAIR_RETRY_INTERVAL_MS = 3_000L
+        private const val STRATEGY_RETRY_INTERVAL_MS = 500L
+        private const val STRATEGY_ACK_TIMEOUT_MS = 5_000L
         private const val ACTIVITY_FINISH_RETRY_INTERVAL_MS = 500L
         private const val ACTIVITY_FINISH_ACK_TIMEOUT_MS = 5_000L
         private const val STORAGE_CHECK_TIMEOUT_MS = 10_000L
