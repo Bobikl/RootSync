@@ -1093,7 +1093,7 @@ private fun ServerPage(state: SyncUiState, viewModel: SyncViewModel, padding: Pa
             )
         }
 
-        SectionCard(title = "设备能力", subtitle = "ROOT 弹窗由当前 ROOT 管理器提供") {
+        SectionCard(title = "设备能力", subtitle = "使用 libsu 向 Magisk/ROOT 管理器发起授权；拒绝后可再次点击请求") {
             state.capabilities.checks.forEachIndexed { index, check ->
                 CapabilityRow(check)
                 if (index != state.capabilities.checks.lastIndex) HorizontalDivider()
@@ -1105,7 +1105,7 @@ private fun ServerPage(state: SyncUiState, viewModel: SyncViewModel, padding: Pa
             ) {
                 if (state.isChecking) {
                     CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
-                } else Text("重新检查")
+                } else Text(if (state.capabilities.rootGranted) "重新检查" else "请求 Magisk / ROOT 授权")
             }
         }
         Spacer(Modifier.height(8.dp))
@@ -1222,13 +1222,19 @@ private fun StatusHero(state: SyncUiState, onRefresh: () -> Unit, refreshEnabled
                         fontWeight = FontWeight.SemiBold
                     )
                     Text(
-                        "Android 15/16 · arm64 · rsync 3.4.4",
+                        if (state.capabilities.rootGranted) {
+                            "Android 15/16 · arm64 · rsync 3.4.4"
+                        } else {
+                            "点击“请求 ROOT”，并在 Magisk 弹窗中选择允许"
+                        },
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.78f)
                     )
                 }
                 if (state.isChecking) CircularProgressIndicator(Modifier.size(28.dp), strokeWidth = 3.dp)
-                else TextButton(onClick = onRefresh, enabled = refreshEnabled) { Text("刷新") }
+                else TextButton(onClick = onRefresh, enabled = refreshEnabled) {
+                    Text(if (state.capabilities.rootGranted) "刷新" else "请求 ROOT")
+                }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 StatusPill("ROOT", state.capabilities.rootGranted)

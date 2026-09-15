@@ -69,6 +69,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     val state: StateFlow<SyncUiState> = _state.asStateFlow()
     @Volatile private var pauseRequested = false
     @Volatile private var lastTransferPersistMillis = 0L
+    private var runtimeCleanupAttempted = false
     private val transferSpeedSamples = ArrayDeque<TransferSpeedSample>()
     private var localTransferItemCount = 0
     private var lastTransferItemUiMillis = 0L
@@ -109,10 +110,6 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         diagnosticLogger.append("STATE", diagnosticStateHeader())
         if (preferences.contains(TransferForegroundService.PREF_PENDING_ACTION_MESSAGE)) {
             preferences.edit { remove(TransferForegroundService.PREF_PENDING_ACTION_MESSAGE) }
-        }
-        viewModelScope.launch {
-            val cleanup = engine.cleanupStaleRuntimeProcesses(::streamLog)
-            appendLog(if (cleanup.success) "INFO" else "ERROR", cleanup.summary)
         }
         _state.value.transferRecord?.takeIf { it.status == TransferStatus.RUNNING }?.let { record ->
             _state.update {
@@ -262,6 +259,11 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             appendLog("INFO", "开始 ROOT、内置 rsync 与目录检查")
             val before = _state.value
             val capabilities = engine.probe(before.sourcePath, before.destinationPath)
+            if (capabilities.rootGranted && !runtimeCleanupAttempted) {
+                runtimeCleanupAttempted = true
+                val cleanup = engine.cleanupStaleRuntimeProcesses(::streamLog)
+                appendLog(if (cleanup.success) "INFO" else "ERROR", cleanup.summary)
+            }
             _state.update { current ->
                 val detected = capabilities.detectedMediaPath
                 val canReplaceSource = current.sourcePath == SyncUiState.DEFAULT_BILI_PATH ||

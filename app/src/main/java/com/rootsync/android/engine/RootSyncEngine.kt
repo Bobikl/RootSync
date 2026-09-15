@@ -11,6 +11,7 @@ import com.rootsync.android.domain.DeviceCapabilities
 import com.rootsync.android.domain.SyncRangeMode
 import com.rootsync.android.domain.SyncRole
 import com.rootsync.android.root.CommandResult
+import com.rootsync.android.root.RootAuthorization
 import com.rootsync.android.root.RootShell
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -66,22 +67,28 @@ class RootSyncEngine(private val context: Context) {
 
     suspend fun probe(sourcePath: String, destinationPath: String): DeviceCapabilities {
         val checks = mutableListOf<CapabilityCheck>()
-        val root = try {
-            shell.execute("id -u")
-        } catch (error: Exception) {
-            return DeviceCapabilities(
-                checks = listOf(
-                    CapabilityCheck("ROOT 授权", CheckState.FAIL, error.message ?: "无法启动 su")
-                )
-            )
-        }
-        val hasRoot = root.exitCode == 0 && root.output.any { it.trim() == "0" }
+        val authorization = RootAuthorization.request(
+            packageName = context.packageName,
+            forceRetry = true
+        )
         checks += CapabilityCheck(
             "ROOT 授权",
-            if (hasRoot) CheckState.PASS else CheckState.FAIL,
-            if (hasRoot) "UID 0 已授权" else root.text.ifBlank { "su 未返回 UID 0" }
+            if (authorization.granted) CheckState.PASS else CheckState.FAIL,
+            authorization.detail
         )
-        if (!hasRoot) return DeviceCapabilities(checks = checks)
+        if (!authorization.granted) return DeviceCapabilities(checks = checks)
+
+        val rootManager = runCatching {
+            shell.execute("su -v 2>/dev/null || magisk -v 2>/dev/null || true")
+                .output
+                .firstOrNull { it.isNotBlank() }
+                ?.trim()
+        }.getOrNull()
+        checks += CapabilityCheck(
+            "ROOT 管理器",
+            if (rootManager != null) CheckState.PASS else CheckState.WARNING,
+            rootManager ?: "ROOT 已授权，但管理器未报告版本"
+        )
 
         val bundledVersionResult = shell.execute(
             "${SafeInput.shellQuote(bundledRsyncPath)} --version 2>/dev/null | head -n 1"

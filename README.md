@@ -3,9 +3,10 @@
 面向已 ROOT Android 手机的局域网 rsync 同步工具，依据
 `Android_ROOT_rsync_开发大纲.md` 开发。当前版本为 arm64 技术验证 APK。
 
-## 当前版本（0.2.53）
+## 当前版本（0.2.54）
 
 - Kotlin、Jetpack Compose、Material 3；`compileSdk/targetSdk 36`，适配 Android 15/16；
+- ROOT 授权接入官方 libsu 6.0.0：启动时串行触发 Magisk/ROOT 管理器授权、校验 UID 0，并提供明确的“请求 ROOT”重试入口；
 - APK 内置经上游签名验证的 **rsync 3.4.4 arm64**，无需额外安装 ROOT rsync 模块；
 - 内置 arm64 `syncmeta`，快照并恢复目录 mtime；两个原生 ELF 均使用 16 KB LOAD 对齐；
 - 支持“只发送”“只接收”和“双向同步”，双向模式按较新修改时间收敛；
@@ -98,11 +99,11 @@
 
 APK 输出：`app/build/outputs/apk/debug/app-debug.apk`
 
-已构建版本：`dist/RootSync-v0.2.30-debug-arm64.apk`
+已构建版本：`dist/RootSync-v0.2.54-debug-arm64.apk`
 
 ## 两机使用
 
-1. 两台手机安装相同 APK，授予 ROOT，并连接同一 Wi-Fi。
+1. 两台手机安装相同 APK，打开后点击“请求 ROOT”，在 Magisk/ROOT 管理器弹窗中选择允许，并连接同一 Wi-Fi。
 2. 两端进入“服务”，确认本机发送源、本机接收目录和监听端口，然后启动服务。
 3. 进入“同步”并点击“自动扫描局域网”；点击设备，对方选择“允许连接”。
 4. 为该设备选择“只发送”“只接收”或“双向同步”，再选择全部内容或指定时间至今，保存设备策略。
@@ -111,6 +112,12 @@ APK 输出：`app/build/outputs/apk/debug/app-debug.apk`
 
 自动发现和首次连接弹窗要求对方 RootSync 处于打开状态。完成配对并启动 rsync
 服务后，rsync daemon 可独立运行，另一台设备可按已保存的 IP 和策略连接。
+
+### Magisk/ROOT 授权排查
+
+- 调试 APK 在 Magisk 超级用户列表中的包名是 `com.rootsync.android.debug`；正式 APK 是 `com.rootsync.android`。
+- 若曾选择拒绝或没有出现弹窗，请在 Magisk/ROOT 管理器中清除拒绝记录或手动允许对应包名，再回到“服务 → 设备能力”点击“请求 Magisk / ROOT 授权”。
+- 授权成功后“ROOT 授权”会显示 UID 0，“ROOT 管理器”会显示 `su -v` 返回的实现或版本。
 
 0.2.30 使用带设备控制令牌认证的局域网控制协议 v7；建议两端同时安装 v0.2.30，
 以完整支持接收目录确认和等待状态显示。

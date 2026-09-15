@@ -11,8 +11,8 @@ android {
         applicationId = "com.rootsync.android"
         minSdk = 26
         targetSdk = 36
-        versionCode = 55
-        versionName = "0.2.53"
+        versionCode = 56
+        versionName = "0.2.54"
 
         ndk {
             abiFilters += "arm64-v8a"
@@ -60,6 +60,7 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.material3:material3")
+    implementation("com.github.topjohnwu.libsu:core:6.0.0")
 
     testImplementation("junit:junit:4.13.2")
 }
