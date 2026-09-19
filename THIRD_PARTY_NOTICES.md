@@ -16,13 +16,3 @@ signature are under `native/rsync/vendor`.
 
 The included popt source uses its permissive license. Its notice is available at
 `native/rsync/src/popt/COPYING`.
-
-## libsu 6.0.0
-
-- Project: libsu
-- Upstream: https://github.com/topjohnwu/libsu
-- Component: `core`
-- License: Apache License 2.0
-
-RootSync uses libsu to request, cache, and verify the app's ROOT shell authorization.
-No optional libsu service or remote-filesystem component is included.

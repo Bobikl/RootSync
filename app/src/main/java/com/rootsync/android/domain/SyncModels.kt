@@ -44,6 +44,17 @@ data class DeviceCapabilities(
     val checks: List<CapabilityCheck> = emptyList()
 )
 
+data class StrategyRevision(val counter: Long = 0, val writerId: String = "") : Comparable<StrategyRevision> {
+    override fun compareTo(other: StrategyRevision): Int =
+        compareValuesBy(this, other, StrategyRevision::counter, StrategyRevision::writerId)
+    fun next(writer: String): StrategyRevision = StrategyRevision(Math.addExact(counter, 1L), writer)
+    val valid: Boolean get() = counter > 0 && counter < Long.MAX_VALUE && writerId.isNotBlank()
+}
+
+enum class StrategyStatus { UNPAIRED, PENDING, CONFIRMED, UPGRADE_REQUIRED }
+
+data class StrategyAcknowledgement(val deviceId: String, val revision: StrategyRevision)
+
 data class PeerProfile(
     val id: String,
     val deviceId: String,
@@ -52,6 +63,11 @@ data class PeerProfile(
     val port: Int = SyncUiState.DEFAULT_RSYNC_PORT,
     val secret: String,
     val controlToken: String = "",
+    val strategyRevision: StrategyRevision = StrategyRevision(),
+    val confirmedStrategyRevision: StrategyRevision? = null,
+    val queuedStrategy: StrategyUpdate? = null,
+    val queuedRole: SyncRole? = null,
+    val queuedRoleRevision: StrategyRevision? = null,
     val role: SyncRole = SyncRole.RECEIVE_ONLY,
     val rangeMode: SyncRangeMode = SyncRangeMode.ALL,
     val sinceEpochMillis: Long? = null,
@@ -107,7 +123,9 @@ data class StrategyUpdate(
     val secret: String,
     val role: SyncRole,
     val rangeMode: SyncRangeMode,
-    val sinceEpochMillis: Long?
+    val sinceEpochMillis: Long?,
+    val requestId: String = "",
+    val revision: StrategyRevision = StrategyRevision()
 )
 
 data class SyncPrepareRequest(
@@ -120,7 +138,9 @@ data class SyncPrepareRequest(
     val rangeMode: SyncRangeMode,
     val sinceEpochMillis: Long?,
     val untilEpochMillis: Long,
-    val isPreview: Boolean
+    val isPreview: Boolean,
+    val strategyRevision: StrategyRevision = StrategyRevision(),
+    val strictChecksum: Boolean = false
 )
 
 data class SyncPrepareResult(
@@ -154,7 +174,9 @@ data class DirectoryCreationPrompt(
     val deviceId: String,
     val deviceName: String,
     val path: String,
-    val isPreview: Boolean
+    val isPreview: Boolean,
+    val strategyRevision: StrategyRevision = StrategyRevision(),
+    val strictChecksum: Boolean = false
 )
 
 data class SyncActivityUpdate(
@@ -236,6 +258,7 @@ data class SyncUiState(
     val hasUnsavedProfileChanges: Boolean = false,
     val discoveredDevices: List<DiscoveredDevice> = emptyList(),
     val onlineDeviceIds: Set<String> = emptySet(),
+    val incompatibleDeviceIds: Set<String> = emptySet(),
     val isScanning: Boolean = false,
     val isCheckingPeerOnline: Boolean = false,
     val pendingPairRequest: PairRequest? = null,
@@ -273,8 +296,21 @@ data class SyncUiState(
     val isSelectedPeerOnline: Boolean
         get() = selectedPairedDeviceId?.let { it in onlineDeviceIds } ?: true
 
+    val strategyStatus: StrategyStatus
+        get() {
+            val profile = profiles.firstOrNull { it.id == selectedProfileId }
+                ?: return StrategyStatus.UNPAIRED
+            if (profile.deviceId.startsWith("manual:")) return StrategyStatus.UNPAIRED
+            if (profile.deviceId in incompatibleDeviceIds) return StrategyStatus.UPGRADE_REQUIRED
+            return if (profile.queuedStrategy == null && profile.queuedRole == null && profile.strategyRevision.valid &&
+                profile.confirmedStrategyRevision == profile.strategyRevision) StrategyStatus.CONFIRMED
+            else StrategyStatus.PENDING
+        }
+    val selectedStrategyPending: Boolean
+        get() = strategyStatus == StrategyStatus.PENDING || strategyStatus == StrategyStatus.UPGRADE_REQUIRED
+
     val canStartTransfer: Boolean
-        get() = canOperate && !isCheckingPeerOnline && isSelectedPeerOnline && !hasUnsavedProfileChanges
+        get() = canOperate && !isCheckingPeerOnline && isSelectedPeerOnline && !hasUnsavedProfileChanges && !selectedStrategyPending
 
     companion object {
         const val DEFAULT_RSYNC_PORT = 8873

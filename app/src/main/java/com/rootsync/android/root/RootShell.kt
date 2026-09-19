@@ -1,10 +1,13 @@
 package com.rootsync.android.root
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicReference
 
 data class CommandResult(
@@ -15,48 +18,32 @@ data class CommandResult(
     val text: String get() = output.joinToString("\n")
 }
 
-class RootShell {
-    private val activeProcess = AtomicReference<Process?>(null)
+class RootShell internal constructor(private val startProcess: (List<String>) -> Process) {
+    constructor() : this(RootProcess::start)
+
+    private val activeJob = AtomicReference<Job?>(null)
     private val executeMutex = Mutex()
 
+    // No execution deadline: rsync may transfer for hours, including silent periods.
     suspend fun execute(
         command: String,
         onLine: (String) -> Unit = {},
-        maxCapturedLines: Int = DEFAULT_MAX_CAPTURED_LINES
+        maxCapturedLines: Int = 2_000
     ): CommandResult = executeMutex.withLock {
-        withContext(Dispatchers.IO) {
-            val process = ProcessBuilder("su", "-c", command)
-                .redirectErrorStream(true)
-                .start()
-            activeProcess.set(process)
-            val lines = ArrayDeque<String>()
-            var totalOutputLines = 0
+        coroutineScope {
+            val job = currentCoroutineContext()[Job]!!
+            activeJob.set(job)
             try {
-                process.inputStream.bufferedReader().useLines { stream ->
-                    stream.forEach { line ->
-                        totalOutputLines += 1
-                        if (maxCapturedLines > 0) {
-                            if (lines.size >= maxCapturedLines) lines.removeFirst()
-                            lines.addLast(line)
-                        }
-                        onLine(line)
-                    }
+                withContext(Dispatchers.IO) {
+                    RootProcess.execute(listOf("su", "-c", command), onLine, maxCapturedLines, startProcess)
                 }
-                CommandResult(process.waitFor(), lines.toList(), totalOutputLines)
             } finally {
-                activeProcess.compareAndSet(process, null)
+                activeJob.compareAndSet(job, null)
             }
         }
     }
 
     fun cancel() {
-        activeProcess.getAndSet(null)?.let { process ->
-            process.destroy()
-            if (process.isAlive) process.destroyForcibly()
-        }
-    }
-
-    private companion object {
-        const val DEFAULT_MAX_CAPTURED_LINES = 2_000
+        activeJob.get()?.cancel(CancellationException("ROOT 命令已取消"))
     }
 }

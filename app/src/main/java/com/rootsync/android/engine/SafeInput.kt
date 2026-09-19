@@ -116,6 +116,10 @@ object RsyncServerLogParser {
     }
 }
 
+/**
+ * Exact/verification lists must be NUL-delimited relative paths without trailing slash or root dot.
+ * rsync expands the immediate children of a listed dir/ even with --no-recursive.
+ */
 object RsyncCommandBuilder {
     fun verifyPull(
         rsyncPath: String,
@@ -160,17 +164,20 @@ object RsyncCommandBuilder {
         backupRunId: String,
         filesFrom: String?,
         dryRun: Boolean,
-        strictChecksum: Boolean = false
+        strictChecksum: Boolean = false,
+        exactFileList: Boolean = false
     ): String {
         require(SafeInput.isValidIpv4(host))
         require(SafeInput.validateStoragePath(destination) == null)
         require(port in 1024..65535)
         require(backupRunId.matches(Regex("[0-9]{8}-[0-9]{6}-[0-9]{3}")))
         require(filesFrom == null || filesFrom.startsWith("/data/"))
+        require(!exactFileList || filesFrom != null) { "exactFileList requires filesFrom" }
 
         val args = mutableListOf(
             rsyncPath,
             "-rlt",
+            "--modify-window=-1",
             "--human-readable",
             "--info=progress2,stats2",
             "--out-format=${RsyncOutputParser.ITEM_PREFIX}%i|%n%L|%l",
@@ -188,6 +195,8 @@ object RsyncCommandBuilder {
             "--password-file=$passwordFile"
         )
         filesFrom?.let { args += listOf("--files-from=$it", "--from0") }
+        // Override -r from -rlt; callers must also avoid trailing slashes in list entries.
+        if (exactFileList) args += listOf("--no-recursive", "--dirs", "--no-implied-dirs")
         if (strictChecksum) args += "--checksum"
         // 单向和双向都不允许较旧来源覆盖目标端更新版本；目标端独有文件也始终保留。
         args += "--update"
@@ -207,17 +216,20 @@ object RsyncCommandBuilder {
         backupRunId: String,
         filesFrom: String?,
         dryRun: Boolean,
-        strictChecksum: Boolean = false
+        strictChecksum: Boolean = false,
+        exactFileList: Boolean = false
     ): String {
         require(SafeInput.isValidIpv4(host))
         require(SafeInput.validateStoragePath(source) == null)
         require(port in 1024..65535)
         require(backupRunId.matches(Regex("[0-9]{8}-[0-9]{6}-[0-9]{3}")))
         require(filesFrom == null || filesFrom.startsWith("/data/"))
+        require(!exactFileList || filesFrom != null) { "exactFileList requires filesFrom" }
 
         val args = mutableListOf(
             rsyncPath,
             "-rlt",
+            "--modify-window=-1",
             "--human-readable",
             "--info=progress2,stats2",
             "--out-format=${RsyncOutputParser.ITEM_PREFIX}%i|%n%L|%l",
@@ -235,6 +247,8 @@ object RsyncCommandBuilder {
             "--password-file=$passwordFile"
         )
         filesFrom?.let { args += listOf("--files-from=$it", "--from0") }
+        // Override -r from -rlt; callers must also avoid trailing slashes in list entries.
+        if (exactFileList) args += listOf("--no-recursive", "--dirs", "--no-implied-dirs")
         if (strictChecksum) args += "--checksum"
         args += "--update"
         if (dryRun) args += listOf("--dry-run", "--itemize-changes")
@@ -260,6 +274,10 @@ object RsyncCommandBuilder {
         val args = mutableListOf(
             rsyncPath,
             "-rlt",
+            "--modify-window=-1",
+            // No recursion; the same exact-list path contract applies to verification.
+            "--no-recursive",
+            "--dirs",
             "--checksum",
             "--dry-run",
             "--itemize-changes",

@@ -1,23 +1,21 @@
 # RootSync APK
 
-- 文件：`RootSync-v0.2.30-debug-arm64.apk`
+- 文件：`RootSync-v0.2.55-debug-arm64.apk`
 - applicationId：`com.rootsync.android.debug`
-- versionCode / versionName：`32` / `0.2.30-debug`
+- versionCode / versionName：`57` / `0.2.55-debug`
 - minSdk / targetSdk：`26` / `36`
 - ABI：`arm64-v8a`
-- APK SHA-256：`EC864F8D20D44BE4E131BB557806F9216FB13920C8B9059F67642576A36EAE8F`
-- 内置 rsync 3.4.4 SHA-256：`38FF6DE1B36F18CE391DF512713192F3129B733C8F2FE55122DA26B0A600A6E9`
-- 签名：Android Debug，APK Signature Scheme v2
+- 文件大小：12,674,450 字节
+- APK SHA-256：`1572B1793C06B3AF5E2443775BF6B5093F97D9F5863BCD85F9BD1070B16D7758`
+- 签名证书 SHA-256：`9ac1989e811dca262387317264b7ecfc72535278c2c6af0cf44b40344811db12`
+- 签名与 v0.2.54 相同；APK Signature Scheme v2 验证通过，可覆盖安装。
+- APK 16 KB 对齐检查与 syncmeta ELF 16 KB LOAD 对齐检查通过。
 
-v0.2.27 将 rsync 人类可读单位和界面容量统一为十进制 SI，修复大型目录同步总量与
-实际传输量相差约 7.37% 的问题。v0.2.28 在开始任务前主动探测所选配对设备，离线时
-禁止预览、传输和继续。v0.2.29 在任务期间锁定同步页全部配置控件，仅保留暂停或取消。
+本次更新：ROOT 直接授权与管理器异步识别、只读清单差异计划、
+Android/data ROOT 文件夹选择器、双端互补策略确认。
 
-v0.2.30 在接收目录不存在时由接收设备弹窗确认是否创建，等待期间发送设备显示
-“对方正在选择操作”。拒绝或 110 秒无响应时不会创建目录，也不会启动 rsync 写入；
-同意后才通过 ROOT 创建并继续。后台收到请求时同时显示前台服务通知，便于用户返回确认。
+控制协议升级到 8，两端应同时安装 v0.2.55。
+已通过 87 项 JVM 单元测试、11 组 SHA-256 向量及 34 组清单解析测试。
+构建与 Lint 通过；当前未连接 ROOT 实机，双端验收清单见 docs/验证-v0.2.55.md。
 
-零删除保护保持不变：目标端独有文件不会删除，被更新文件的旧版本保存在
-`.rootsync-history/<同步时间>/`，完整性校验命令同样不包含任何删除或写入选项。
-
-建议两端同时安装 v0.2.30。完整分步版本见 `docs/修复回滚清单.md`。
+APK 另存于 X:\临时同步，副本 SHA-256 一致。

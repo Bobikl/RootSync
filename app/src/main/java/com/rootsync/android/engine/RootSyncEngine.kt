@@ -21,6 +21,9 @@ import java.net.Inet4Address
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.security.SecureRandom
+import java.util.UUID
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.CancellationException
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 
@@ -65,11 +68,16 @@ class RootSyncEngine(private val context: Context) {
             }
         }
 
-    suspend fun probe(sourcePath: String, destinationPath: String): DeviceCapabilities {
+    suspend fun probe(
+        sourcePath: String,
+        destinationPath: String,
+        forceRetry: Boolean = false,
+        onRootGranted: () -> Unit = {}
+    ): DeviceCapabilities {
         val checks = mutableListOf<CapabilityCheck>()
         val authorization = RootAuthorization.request(
             packageName = context.packageName,
-            forceRetry = true
+            forceRetry = forceRetry
         )
         checks += CapabilityCheck(
             "ROOT 授权",
@@ -78,16 +86,11 @@ class RootSyncEngine(private val context: Context) {
         )
         if (!authorization.granted) return DeviceCapabilities(checks = checks)
 
-        val rootManager = runCatching {
-            shell.execute("su -v 2>/dev/null || magisk -v 2>/dev/null || true")
-                .output
-                .firstOrNull { it.isNotBlank() }
-                ?.trim()
-        }.getOrNull()
+        onRootGranted()
         checks += CapabilityCheck(
             "ROOT 管理器",
-            if (rootManager != null) CheckState.PASS else CheckState.WARNING,
-            rootManager ?: "ROOT 已授权，但管理器未报告版本"
+            CheckState.PASS,
+            RootAuthorization.managerName ?: "ROOT 已授权，正在识别管理器"
         )
 
         val bundledVersionResult = shell.execute(
@@ -241,7 +244,9 @@ class RootSyncEngine(private val context: Context) {
         rangeMode: SyncRangeMode = SyncRangeMode.ALL,
         sinceEpochMillis: Long? = null,
         untilEpochMillis: Long = System.currentTimeMillis(),
-        allowCreateDestination: Boolean = false
+        allowCreateDestination: Boolean = false,
+        previewOnly: Boolean = false,
+        strictChecksum: Boolean = false
     ): EngineResult = withContext(Dispatchers.IO) {
         onLog(
             "DIAG_SERVER_PREPARE mode=${mode?.name ?: "MANUAL"} range=${rangeMode.name} " +
@@ -266,7 +271,7 @@ class RootSyncEngine(private val context: Context) {
                 return@withContext EngineResult(false, "发送源目录不存在或不可读：$sourcePath")
             }
         }
-        if (servesReceiveModule) {
+        if (servesReceiveModule && !previewOnly) {
             val destinationReady = shell.execute(
                 if (allowCreateDestination) {
                     "mkdir -p ${SafeInput.shellQuote(destinationPath)} && " +
@@ -293,8 +298,24 @@ class RootSyncEngine(private val context: Context) {
         }
         onLog("DIAG_SERVER_BIND address=$bindAddress port=$port rsync=$rsyncPath")
 
+        val oldServer = stopServer(onLog)
+        if (!oldServer.success) return@withContext oldServer
+        listOf("source.manifest", "destination.manifest", "source.snapshot", "source.files").forEach {
+            val old = File(metadataDir, it)
+            check(!old.exists() || old.delete()) { "无法清理旧会话清单" }
+        }
+        // Preview only writes app-private metadata, never the user's sync directories.
+        onLog("正在读取双方所需的目录清单（不修改同步目录）…")
+        if (servesSendModule) buildManifest(sourcePath, strictChecksum,
+            File(metadataDir, "source.manifest"), onLog)
+        if (servesReceiveModule) {
+            if (servesSendModule && sourcePath == destinationPath) {
+                File(metadataDir, "source.manifest").copyTo(File(metadataDir, "destination.manifest"), overwrite = true)
+            } else buildManifest(destinationPath, strictChecksum, File(metadataDir, "destination.manifest"), onLog)
+        }
+
         val snapshot = File(metadataDir, "source.snapshot")
-        if (servesSendModule) {
+        if (servesSendModule && mode == null) {
             onLog("正在生成发送源目录时间快照…")
             val snapshotResult = shell.execute(
                 listOf(syncMetaPath, "snapshot", sourcePath, snapshot.absolutePath)
@@ -328,24 +349,21 @@ class RootSyncEngine(private val context: Context) {
         val lockFile = File(runtimeDir, "rsyncd.lock")
         val logFile = File(runtimeDir, "rsyncd.log")
         val modules = buildString {
-            if (servesSendModule) append(
-                """
-                [send]
-                path = $sourcePath
-                read only = true
-                auth users = sync-user
-                secrets file = ${secrets.absolutePath}
-
+            append("""
                 [meta]
                 path = ${metadataDir.absolutePath}
                 read only = true
                 auth users = sync-user
                 secrets file = ${secrets.absolutePath}
-                """.trimIndent()
-            )
-            if (servesSendModule && servesReceiveModule) append("\n\n")
-            if (servesReceiveModule) append(
-                """
+            """.trimIndent())
+            if (servesSendModule) append("\n\n" + """
+                [send]
+                path = $sourcePath
+                read only = true
+                auth users = sync-user
+                secrets file = ${secrets.absolutePath}
+            """.trimIndent())
+            if (servesReceiveModule && !previewOnly) append("\n\n" + """
                 [receive]
                 path = $destinationPath
                 read only = false
@@ -353,8 +371,7 @@ class RootSyncEngine(private val context: Context) {
                 munge symlinks = true
                 auth users = sync-user
                 secrets file = ${secrets.absolutePath}
-                """.trimIndent()
-            )
+            """.trimIndent())
         }
         config.writeText(
             """
@@ -520,6 +537,8 @@ class RootSyncEngine(private val context: Context) {
         bidirectional: Boolean,
         dryRun: Boolean,
         strictChecksum: Boolean = false,
+        plannedItems: List<PlanItem>? = null,
+        directoryTimes: List<PlanItem>? = null,
         onLog: (String) -> Unit,
         onProgress: (Float) -> Unit,
         onItem: (RsyncItem) -> Unit,
@@ -541,9 +560,11 @@ class RootSyncEngine(private val context: Context) {
         if (!writeRootOwnedSecret(password, secret)) {
             return@withContext EngineResult(false, "无法准备 ROOT 所有的客户端密钥文件")
         }
+        if (plannedItems?.isEmpty() == true) return@withContext EngineResult(true, "没有需要接收的项目")
         val remoteSnapshot = File(runtimeDir, "remote.snapshot")
         val remoteFileList = File(runtimeDir, "remote.files")
-        if (rangeMode == SyncRangeMode.SINCE) {
+        if (plannedItems != null) writePlannedFiles(remoteFileList, plannedItems)
+        if (plannedItems == null && rangeMode == SyncRangeMode.SINCE) {
             onLog("下载发送端指定时间范围文件清单…")
             val listResult = downloadMetadata(
                 rsyncPath = rsyncPath,
@@ -562,7 +583,7 @@ class RootSyncEngine(private val context: Context) {
                 )
             }
         }
-        if (!dryRun) {
+        if (!dryRun && plannedItems == null) {
             onLog("下载发送端目录时间清单…")
             val snapshotResult = downloadMetadata(
                 rsyncPath = rsyncPath,
@@ -580,7 +601,9 @@ class RootSyncEngine(private val context: Context) {
 
         val operation = if (bidirectional) "双向同步·接收阶段" else "只接收"
         onLog(if (dryRun) "开始${operation}差异预览…" else "开始${operation}增量传输…")
-        val integrityCapture = TransferIntegrityCapture()
+        val integrityCapture = TransferIntegrityCapture(parseItems = plannedItems == null).also { capture ->
+            plannedItems?.filter { it.file.kind == PlanFileKind.FILE }?.forEach { capture.relativeFiles += it.path }
+        }
         val command = RsyncCommandBuilder.pull(
             rsyncPath = rsyncPath,
             host = host,
@@ -588,7 +611,8 @@ class RootSyncEngine(private val context: Context) {
             destination = destinationPath,
             passwordFile = password.absolutePath,
             backupRunId = backupRunId(),
-            filesFrom = remoteFileList.absolutePath.takeIf { rangeMode == SyncRangeMode.SINCE },
+            filesFrom = remoteFileList.absolutePath.takeIf { plannedItems != null || rangeMode == SyncRangeMode.SINCE },
+            exactFileList = plannedItems != null,
             dryRun = dryRun,
             strictChecksum = strictChecksum
         )
@@ -609,7 +633,8 @@ class RootSyncEngine(private val context: Context) {
         }
         if (dryRun) return@withContext EngineResult(true, previewSummary())
 
-        onLog("按目录深度从深到浅恢复 mtime…")
+        if (plannedItems != null) writeDirectorySnapshot(remoteSnapshot, directoryTimes ?: plannedItems)
+        onLog("按目录深度从深到浅恢复本次计划内目录的 mtime…")
         val restore = shell.execute(
             listOf(syncMetaPath, "restore", destinationPath, remoteSnapshot.absolutePath)
                 .joinToString(" ") { SafeInput.shellQuote(it) },
@@ -659,6 +684,7 @@ class RootSyncEngine(private val context: Context) {
         bidirectional: Boolean,
         dryRun: Boolean,
         strictChecksum: Boolean = false,
+        plannedItems: List<PlanItem>? = null,
         onLog: (String) -> Unit,
         onProgress: (Float) -> Unit,
         onItem: (RsyncItem) -> Unit,
@@ -680,8 +706,10 @@ class RootSyncEngine(private val context: Context) {
         if (!writeRootOwnedSecret(password, secret)) {
             return@withContext EngineResult(false, "无法准备 ROOT 所有的客户端密钥文件")
         }
+        if (plannedItems?.isEmpty() == true) return@withContext EngineResult(true, "没有需要发送的项目")
         val localFileList = File(runtimeDir, "local.files")
-        if (rangeMode == SyncRangeMode.SINCE) {
+        if (plannedItems != null) writePlannedFiles(localFileList, plannedItems)
+        if (plannedItems == null && rangeMode == SyncRangeMode.SINCE) {
             onLog("正在生成本机指定时间范围文件清单…")
             val listResult = createTimeFileList(
                 rootPath = sourcePath,
@@ -694,7 +722,9 @@ class RootSyncEngine(private val context: Context) {
         }
         val operation = if (bidirectional) "双向同步·发送阶段" else "只发送"
         onLog(if (dryRun) "开始${operation}差异预览…" else "开始${operation}增量传输…")
-        val integrityCapture = TransferIntegrityCapture()
+        val integrityCapture = TransferIntegrityCapture(parseItems = plannedItems == null).also { capture ->
+            plannedItems?.filter { it.file.kind == PlanFileKind.FILE }?.forEach { capture.relativeFiles += it.path }
+        }
         val command = RsyncCommandBuilder.push(
             rsyncPath = rsyncPath,
             host = host,
@@ -702,7 +732,8 @@ class RootSyncEngine(private val context: Context) {
             source = sourcePath,
             passwordFile = password.absolutePath,
             backupRunId = backupRunId(),
-            filesFrom = localFileList.absolutePath.takeIf { rangeMode == SyncRangeMode.SINCE },
+            filesFrom = localFileList.absolutePath.takeIf { plannedItems != null || rangeMode == SyncRangeMode.SINCE },
+            exactFileList = plannedItems != null,
             dryRun = dryRun,
             strictChecksum = strictChecksum
         )
@@ -809,6 +840,8 @@ class RootSyncEngine(private val context: Context) {
                     if (mismatches.size < MAX_REPORTED_INTEGRITY_MISMATCHES) {
                         mismatches += item.relativePath
                     }
+                } else if (line.contains(RsyncOutputParser.ITEM_PREFIX) && item == null) {
+                    mismatches += "无法解析校验输出，需重新检查"
                 } else if (!line.contains(RsyncOutputParser.ITEM_PREFIX)) {
                     onLog(line)
                 }
@@ -831,6 +864,96 @@ class RootSyncEngine(private val context: Context) {
         }
         onLog("INTEGRITY_VERIFY_PASSED count=${safeFiles.size} 已同步文件内容一致")
         return EngineResult(true, "${safeFiles.size} 个已同步文件完整性校验通过")
+    }
+
+    suspend fun buildManifest(
+        path: String,
+        strict: Boolean,
+        output: File = File(runtimeDir, "scan-${UUID.randomUUID()}.manifest"),
+        onLog: (String) -> Unit
+    ): DirectoryManifest = withContext(Dispatchers.IO) {
+        require(SafeInput.validateStoragePath(path) == null) { "同步目录路径无效" }
+        val command = listOf(syncMetaPath, "manifest", path, output.absolutePath,
+            if (strict) "1" else "0").joinToString(" ") { SafeInput.shellQuote(it) }
+        val pid = File(runtimeDir, "scan.pid")
+        ensureLifecycleWatchdog(bundledRsyncPath, onLog)
+        try {
+            val result = shell.execute("umask 077; echo \$\$ > ${SafeInput.shellQuote(pid.absolutePath)}; exec $command", onLog)
+            check(result.exitCode == 0) { "读取目录清单失败：${result.text.takeLast(500)}" }
+            val accessible = shell.execute("chown ${Process.myUid()}:${Process.myUid()} ${SafeInput.shellQuote(output.absolutePath)} && chmod 600 ${SafeInput.shellQuote(output.absolutePath)}")
+            check(accessible.exitCode == 0) { "无法读取 ROOT 生成的目录清单" }
+            DirectoryManifest.read(output)
+        } finally {
+            withContext(NonCancellable) { cancelScanProcess() }
+            if (output.parentFile == runtimeDir) output.delete()
+        }
+    }
+
+    suspend fun createSyncPlan(
+        rsyncPath: String, host: String, port: Int, secret: String,
+        localPath: String, role: SyncRole, strict: Boolean,
+        rangeMode: SyncRangeMode, sinceEpochMillis: Long?, untilEpochMillis: Long,
+        onLog: (String) -> Unit
+    ): SyncPlan = withContext(Dispatchers.IO) {
+        require(SafeInput.isValidIpv4(host) && port in 1024..65535)
+        onLog(if (strict) "正在计算本机清单和 SHA-256（大目录需要较长时间，可取消）…" else "正在读取本机只读目录清单…")
+        val local = buildManifest(localPath, strict, onLog = onLog).toPlanTree()
+        if (role != SyncRole.RECEIVE_ONLY) check(local.exists) { "发送源目录不存在" }
+        val password = File(runtimeDir, "client.password")
+        check(writeRootOwnedSecret(password, secret)) { "无法准备清单连接密钥" }
+        val remoteFile = File(runtimeDir, "remote-${UUID.randomUUID()}.manifest")
+        try {
+            val remoteName = if (role == SyncRole.SEND_ONLY) "destination.manifest" else "source.manifest"
+            val result = downloadMetadata(rsyncPath, host, port, password, remoteName, remoteFile, onLog)
+            check(result.success) { "无法获取对方目录清单，请确认两端均已升级并重新准备服务：${result.summary}" }
+            check(shell.execute("chown ${Process.myUid()}:${Process.myUid()} ${SafeInput.shellQuote(remoteFile.absolutePath)} && chmod 600 ${SafeInput.shellQuote(remoteFile.absolutePath)}").exitCode == 0)
+            val remote = DirectoryManifest.read(remoteFile).toPlanTree()
+            if (role != SyncRole.SEND_ONLY) check(remote.exists) { "对方发送源目录不存在" }
+            val plan = SyncPlanner.build(local, remote, role, rangeMode, sinceEpochMillis, untilEpochMillis)
+            // Full UTF-8 plan is retained privately; the UI pages the complete in-memory list.
+            File(runtimeDir, "last-sync-plan.tsv").bufferedWriter(Charsets.UTF_8).use { writer ->
+                writer.appendLine("action\tbytes\tpath\treason")
+                plan.items.forEach { item ->
+                    fun escape(value: String) = value.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
+                    writer.appendLine("${item.action}\t${item.bytes}\t${escape(item.path)}\t${escape(item.reason)}")
+                }
+            }
+            onLog("清单比较完成：${plan.summary}")
+            plan
+        } finally { remoteFile.delete() }
+    }
+
+    private fun writePlannedFiles(output: File, items: List<PlanItem>) {
+        check(!output.exists() || output.delete()) { "无法替换旧任务文件清单" }
+        output.outputStream().buffered().use { stream ->
+            items.map { it.path }.distinct().sorted().forEach {
+                stream.write(it.toByteArray(Charsets.UTF_8)); stream.write(0)
+            }
+        }
+    }
+
+    private fun writeDirectorySnapshot(output: File, items: List<PlanItem>) {
+        check(!output.exists() || output.delete()) { "无法替换旧目录快照" }
+        val directories = items.filter { it.file.kind == PlanFileKind.DIRECTORY }
+        output.outputStream().buffered().use { stream ->
+            fun number(value: Long, count: Int) { repeat(count) { stream.write((value ushr (it * 8)).toInt() and 255) } }
+            stream.write(byteArrayOf(82, 83, 77, 69, 84, 65, 49, 0))
+            number(1, 4); number(directories.size.toLong(), 8)
+            directories.forEach { item ->
+                val path = item.path.toByteArray(Charsets.UTF_8)
+                number(item.file.seconds, 8); number(item.file.nanos.toLong(), 4)
+                number(path.size.toLong(), 4); stream.write(path)
+            }
+        }
+    }
+
+    private suspend fun cancelScanProcess() {
+        val pidFile = SafeInput.shellQuote(File(runtimeDir, "scan.pid").absolutePath)
+        val executable = SafeInput.shellQuote(syncMetaPath)
+        controlShell.execute("p=$pidFile; if [ -s \"\$p\" ]; then pid=\$(cat \"\$p\"); " +
+            "case \"\$pid\" in *[!0-9]*|'') ;; *) if [ -r /proc/\$pid/cmdline ] && " +
+            "tr '\\000' ' ' < /proc/\$pid/cmdline | grep -Fq $executable; then " +
+            "kill -KILL \"\$pid\" 2>/dev/null || true; fi ;; esac; fi; rm -f \"\$p\"")
     }
 
     private suspend fun createTimeFileList(
@@ -865,13 +988,13 @@ class RootSyncEngine(private val context: Context) {
         onLog: (String) -> Unit
     ): EngineResult {
         val command = listOf(
-            rsyncPath, "-rt", "--timeout=60", "--contimeout=15",
+            rsyncPath, "-rt", "--timeout=60", "--contimeout=15", "--max-size=64m",
             "--password-file=${passwordFile.absolutePath}",
             "rsync://sync-user@$host:$port/meta/$remoteName",
             destination.absolutePath
         ).joinToString(" ") { SafeInput.shellQuote(it) }
-        val result = shell.execute(command, onLog)
-        return if (result.exitCode == 0) EngineResult(true, "$remoteName 已下载")
+        val result = shell.execute("umask 077; echo \$\$ > ${SafeInput.shellQuote(File(runtimeDir, "transfer.pid").absolutePath)}; exec $command", onLog)
+        return if (result.exitCode == 0 && destination.exists()) EngineResult(true, "$remoteName 已下载")
         else EngineResult(false, "下载 $remoteName 失败", result.exitCode)
     }
 
@@ -908,8 +1031,8 @@ class RootSyncEngine(private val context: Context) {
                 .find(line)?.groupValues?.getOrNull(1)?.toIntOrNull()
             if (item != null) {
                 parsedItemCount += 1
-                if (item.itemizedChange.getOrNull(1) != 'd') {
-                    integrityCapture?.relativeFiles?.add(item.relativePath.trimEnd('/'))
+                if (item.itemizedChange.getOrNull(1) != 'd' && integrityCapture?.parseItems == true) {
+                    integrityCapture.relativeFiles.add(item.relativePath.trimEnd('/'))
                 }
                 onItem(item)
             } else if (line.contains(RsyncOutputParser.ITEM_PREFIX)) {
@@ -936,6 +1059,7 @@ class RootSyncEngine(private val context: Context) {
     private enum class VerificationDirection { PULL, PUSH }
 
     private data class TransferIntegrityCapture(
+        val parseItems: Boolean = true,
         val relativeFiles: MutableSet<String> = linkedSetOf(),
         var observedBytes: Long = 0L
     )
@@ -975,15 +1099,17 @@ class RootSyncEngine(private val context: Context) {
             append("name=\$(tr '\\000' ' ' < /proc/$appProcessId/cmdline); ")
             append("case \"\$name\" in ${SafeInput.shellQuote(appProcessName)}*) alive=1 ;; esac; fi; ")
             append("active=0; for pid_file in ")
+            append(SafeInput.shellQuote(File(runtimeDir, "scan.pid").absolutePath)).append(' ')
             append(SafeInput.shellQuote(transferPidFile.absolutePath)).append(' ')
             append(SafeInput.shellQuote(daemonPidFile.absolutePath)).append("; do ")
             append("if [ -s \"\$pid_file\" ]; then child=\$(cat \"\$pid_file\"); ")
             append("case \"\$child\" in *[!0-9]*|'') ;; *) ")
             append("if [ -r \"/proc/\$child/cmdline\" ] && kill -0 \"\$child\" 2>/dev/null && ")
-            append("tr '\\000' ' ' < \"/proc/\$child/cmdline\" | grep -Fq 'rsync'; then active=1; fi ;; esac; fi; done; ")
+            append("tr '\\000' ' ' < \"/proc/\$child/cmdline\" | grep -Eq 'rsync|libsyncmeta[.]so'; then active=1; fi ;; esac; fi; done; ")
             append("if [ \"\$alive\" -eq 1 ] && [ \"\$active\" -eq 1 ]; then idle=0; sleep 2; continue; fi; ")
             append("if [ \"\$alive\" -eq 1 ]; then idle=\$((idle + 1)); ")
             append("if [ \"\$idle\" -lt 5 ]; then sleep 2; continue; fi; rm -f ")
+            append(SafeInput.shellQuote(File(runtimeDir, "scan.pid").absolutePath)).append(' ')
             append(SafeInput.shellQuote(transferPidFile.absolutePath)).append(' ')
             append(SafeInput.shellQuote(daemonPidFile.absolutePath)).append("; exit 0; fi; ")
             append(runtimeCleanupCommand(includeWatchdog = false))
@@ -1023,12 +1149,13 @@ class RootSyncEngine(private val context: Context) {
         val watchdogScriptFile = File(runtimeDir, "lifecycle-watchdog.sh")
         return buildString {
             append("for pid_file in ")
+            append(SafeInput.shellQuote(File(runtimeDir, "scan.pid").absolutePath)).append(' ')
             append(SafeInput.shellQuote(transferPidFile.absolutePath)).append(' ')
             append(SafeInput.shellQuote(daemonPidFile.absolutePath)).append("; do ")
             append("if [ -s \"\$pid_file\" ]; then pid=\$(cat \"\$pid_file\"); ")
             append("case \"\$pid\" in *[!0-9]*|'') ;; *) ")
             append("if [ -r \"/proc/\$pid/cmdline\" ] && ")
-            append("tr '\\000' ' ' < \"/proc/\$pid/cmdline\" | grep -Fq 'rsync'; then ")
+            append("tr '\\000' ' ' < \"/proc/\$pid/cmdline\" | grep -Eq 'rsync|libsyncmeta[.]so'; then ")
             append("kill -INT \"\$pid\" 2>/dev/null || true; sleep 0.2; ")
             append("kill -KILL \"\$pid\" 2>/dev/null || true; fi ;; esac; fi; ")
             append("rm -f \"\$pid_file\"; done; ")
@@ -1134,6 +1261,7 @@ class RootSyncEngine(private val context: Context) {
         LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSS"))
 
     suspend fun cancel(): EngineResult = withContext(Dispatchers.IO) {
+        cancelScanProcess()
         val pidFile = File(runtimeDir, "transfer.pid")
         val command =
             "pid_file=${SafeInput.shellQuote(pidFile.absolutePath)}; " +

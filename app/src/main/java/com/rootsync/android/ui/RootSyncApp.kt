@@ -78,6 +78,8 @@ import com.rootsync.android.domain.DiscoveredDevice
 import com.rootsync.android.domain.PeerProfile
 import com.rootsync.android.domain.SyncActivityType
 import com.rootsync.android.domain.SyncRangeMode
+import com.rootsync.android.domain.StrategyStatus
+import com.rootsync.android.root.RootAuthorization
 import com.rootsync.android.domain.SyncRole
 import com.rootsync.android.domain.SyncUiState
 import com.rootsync.android.domain.TransferStatus
@@ -225,6 +227,7 @@ fun RootSyncApp(viewModel: SyncViewModel) {
 
 @Composable
 private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: PaddingValues) {
+    val previewPlan by viewModel.previewPlan.collectAsStateWithLifecycle()
     val context = LocalContext.current
     var confirmProfileDeletion by remember { mutableStateOf(false) }
     var confirmRecordDeletion by remember { mutableStateOf(false) }
@@ -311,13 +314,13 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
     }
     if (confirmTransferStart) {
         val pausedRecord = state.transferRecord?.takeIf { it.status == TransferStatus.PAUSED }
-        val peerName = pausedRecord?.peerName ?: state.profileName.ifBlank { state.remoteHost }
-        val host = pausedRecord?.host ?: state.remoteHost
-        val role = pausedRecord?.role ?: state.role
-        val rangeMode = pausedRecord?.rangeMode ?: state.rangeMode
-        val since = pausedRecord?.sinceEpochMillis ?: state.sinceEpochMillis
-        val sourcePath = pausedRecord?.sourcePath ?: state.sourcePath
-        val destinationPath = pausedRecord?.destinationPath ?: state.destinationPath
+        val peerName = state.profileName.ifBlank { state.remoteHost }
+        val host = state.remoteHost
+        val role = state.role
+        val rangeMode = state.rangeMode
+        val since = state.sinceEpochMillis
+        val sourcePath = state.sourcePath
+        val destinationPath = state.destinationPath
         AlertDialog(
             onDismissRequest = { confirmTransferStart = false },
             title = { Text(if (pausedRecord == null) "确认开始同步" else "确认继续同步") },
@@ -325,6 +328,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text("设备：$peerName（$host）")
                     Text("策略：${role.label} · ${rangeMode.label}")
+                    if (pausedRecord != null) Text("重新扫描，按当前已确认策略继续；不复用旧计划。")
                     if (rangeMode == SyncRangeMode.SINCE) Text("起始：${formatSyncTime(since)}")
                     when (role) {
                         SyncRole.SEND_ONLY -> Text("本机发送目录：$sourcePath")
@@ -500,6 +504,19 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
             title = "同步策略",
             subtitle = "先选方向，再选同步全部内容或指定时间至今"
         ) {
+            Text("当前设置：本机 ${state.role.label} · 对端 ${state.role.opposite().label}")
+            Text(
+                when {
+                    state.hasUnsavedProfileChanges -> "本机目录或范围有未保存修改；请保存后再执行。"
+                    state.strategyStatus == StrategyStatus.CONFIRMED -> "双方策略已确认"
+                    state.strategyStatus == StrategyStatus.PENDING -> "策略待确认：等待对端确认；预览与正式传输暂不可用。"
+                    state.strategyStatus == StrategyStatus.UPGRADE_REQUIRED -> "对端需要升级才能确认策略；预览与正式传输暂不可用。"
+                    else -> "未配对／手动设备：未建立双方策略确认。"
+                },
+                color = if (state.hasUnsavedProfileChanges || state.selectedStrategyPending)
+                    MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall
+            )
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 SyncRole.entries.forEach { role ->
                     FilterChip(
@@ -511,11 +528,11 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                             Text(
                                 when (role) {
                                     SyncRole.SEND_ONLY ->
-                                        "发送给${state.profileName.ifBlank { "远端" }}（对方接收）"
+                                        "本机只发送 → 对端只接收"
                                     SyncRole.RECEIVE_ONLY ->
-                                        "从${state.profileName.ifBlank { "远端" }}接收"
+                                        "本机只接收 ← 对端只发送"
                                     SyncRole.BIDIRECTIONAL ->
-                                        "与${state.profileName.ifBlank { "远端" }}双向同步"
+                                        "本机双向同步 ↔ 对端双向同步"
                                 }
                             )
                         }
@@ -627,7 +644,8 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
 
         SectionCard(title = "本机目录") {
             when (state.role) {
-                SyncRole.SEND_ONLY -> OutlinedTextField(
+                SyncRole.SEND_ONLY -> FolderPathField(
+                    requireWritable = false,
                     value = state.sourcePath,
                     onValueChange = viewModel::setSourcePath,
                     enabled = configurationEnabled,
@@ -635,7 +653,8 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                     minLines = 2,
                     modifier = Modifier.fillMaxWidth()
                 )
-                SyncRole.RECEIVE_ONLY -> OutlinedTextField(
+                SyncRole.RECEIVE_ONLY -> FolderPathField(
+                    requireWritable = true,
                     value = state.destinationPath,
                     onValueChange = viewModel::setDestinationPath,
                     enabled = configurationEnabled,
@@ -643,7 +662,8 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                     minLines = 2,
                     modifier = Modifier.fillMaxWidth()
                 )
-                SyncRole.BIDIRECTIONAL -> OutlinedTextField(
+                SyncRole.BIDIRECTIONAL -> FolderPathField(
+                    requireWritable = true,
                     value = state.sourcePath,
                     onValueChange = viewModel::setBidirectionalPath,
                     enabled = configurationEnabled,
@@ -760,9 +780,15 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
             }
         }
 
+        SyncPlanPanel(
+            plan = previewPlan,
+            scanning = state.isPreviewing,
+            statusText = state.previewStatusText
+        )
+
         SectionCard(
-            title = state.transferPanelTitle,
-            subtitle = "已识别 ${state.transferItemCount} 个差异/传输文件或目录"
+            title = "扫描／传输动态（非完整计划）",
+            subtitle = "${state.transferPanelTitle} · 已记录 ${state.transferItemCount} 项；完整预览请查看上方计划"
         ) {
             Surface(
                 color = MaterialTheme.colorScheme.surfaceContainerHighest,
@@ -801,7 +827,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                         if (state.previewStatusText == null) {
                             Text(
                                 if (state.isBusy) "正在扫描文件夹，请稍候…"
-                                else "点击差异预览后，变化文件和目录会显示在这里。",
+                                else "这里保留扫描／正式传输动态；完整差异请查看上方计划。",
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
@@ -812,7 +838,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                     }
                     if (state.transferFoldersTruncated) {
                         Text(
-                            "项目较多，仅显示前 400 个文件或目录。",
+                            "动态记录已截断（最多 400 项），不是完整计划；请查看上方全量计划。",
                             color = MaterialTheme.colorScheme.tertiary,
                             style = MaterialTheme.typography.labelMedium
                         )
@@ -1036,7 +1062,8 @@ private fun ServerPage(state: SyncUiState, viewModel: SyncViewModel, padding: Pa
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth()
             )
-            OutlinedTextField(
+            FolderPathField(
+                requireWritable = false,
                 value = state.sourcePath,
                 onValueChange = viewModel::setSourcePath,
                 enabled = serverConfigurationEnabled,
@@ -1044,7 +1071,8 @@ private fun ServerPage(state: SyncUiState, viewModel: SyncViewModel, padding: Pa
                 minLines = 2,
                 modifier = Modifier.fillMaxWidth()
             )
-            OutlinedTextField(
+            FolderPathField(
+                requireWritable = true,
                 value = state.destinationPath,
                 onValueChange = viewModel::setDestinationPath,
                 enabled = serverConfigurationEnabled,
@@ -1093,7 +1121,7 @@ private fun ServerPage(state: SyncUiState, viewModel: SyncViewModel, padding: Pa
             )
         }
 
-        SectionCard(title = "设备能力", subtitle = "使用 libsu 向 Magisk/ROOT 管理器发起授权；拒绝后可再次点击请求") {
+        SectionCard(title = "设备能力", subtitle = "自动适配 KernelSU / Magisk；先验证已有权限") {
             state.capabilities.checks.forEachIndexed { index, check ->
                 CapabilityRow(check)
                 if (index != state.capabilities.checks.lastIndex) HorizontalDivider()
@@ -1105,7 +1133,7 @@ private fun ServerPage(state: SyncUiState, viewModel: SyncViewModel, padding: Pa
             ) {
                 if (state.isChecking) {
                     CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
-                } else Text(if (state.capabilities.rootGranted) "重新检查" else "请求 Magisk / ROOT 授权")
+                } else Text(if (state.capabilities.rootGranted) "重新检查" else "重新检测 ROOT 权限")
             }
         }
         Spacer(Modifier.height(8.dp))
@@ -1198,7 +1226,43 @@ private fun LogsPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
 }
 
 @Composable
+private fun FolderPathField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    enabled: Boolean,
+    label: @Composable () -> Unit,
+    requireWritable: Boolean,
+    modifier: Modifier = Modifier,
+    minLines: Int = 2,
+    supportingText: (@Composable () -> Unit)? = null
+) {
+    var choosing by remember { mutableStateOf(false) }
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        OutlinedTextField(
+            value = value, onValueChange = onValueChange, enabled = enabled,
+            label = label, minLines = minLines, supportingText = supportingText,
+            modifier = Modifier.fillMaxWidth()
+        )
+        OutlinedButton(onClick = { choosing = true }, enabled = enabled) {
+            Text("选择文件夹")
+        }
+    }
+    if (choosing) {
+        RootFolderPicker(
+            initialPath = value,
+            requireWritable = requireWritable,
+            onDismiss = { choosing = false },
+            onSelected = { selected ->
+                onValueChange(selected)
+                choosing = false
+            }
+        )
+    }
+}
+
+@Composable
 private fun StatusHero(state: SyncUiState, onRefresh: () -> Unit, refreshEnabled: Boolean = true) {
+    val rootManager by RootAuthorization.managerState.collectAsStateWithLifecycle()
     Card(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
         shape = RoundedCornerShape(26.dp),
@@ -1213,7 +1277,8 @@ private fun StatusHero(state: SyncUiState, onRefresh: () -> Unit, refreshEnabled
                 Column(Modifier.weight(1f)) {
                     Text(
                         when {
-                            state.isChecking -> "正在检查设备"
+                            state.isChecking && state.capabilities.rootGranted -> "ROOT 已授权，检查引擎中"
+                            state.isChecking -> "正在验证 ROOT 权限"
                             state.capabilities.rootGranted && state.capabilities.rsyncPath != null -> "已准备好同步"
                             state.capabilities.rootGranted -> "内置 rsync 不可执行"
                             else -> "需要 ROOT 授权"
@@ -1223,9 +1288,9 @@ private fun StatusHero(state: SyncUiState, onRefresh: () -> Unit, refreshEnabled
                     )
                     Text(
                         if (state.capabilities.rootGranted) {
-                            "Android 15/16 · arm64 · rsync 3.4.4"
+                            "Android 15/16 · arm64 · rsync 3.4.4 · ${rootManager ?: "ROOT 管理器未识别"}"
                         } else {
-                            "点击“请求 ROOT”，并在 Magisk 弹窗中选择允许"
+                            "请在 ROOT 管理器中允许本应用，再点击检测"
                         },
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.78f)

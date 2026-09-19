@@ -14,6 +14,10 @@ import com.rootsync.android.domain.PairRequest
 import com.rootsync.android.domain.RemoteStorageCheckRequest
 import com.rootsync.android.domain.RemoteStorageCheckResult
 import com.rootsync.android.domain.StrategyUpdate
+import com.rootsync.android.domain.StrategyRevision
+import com.rootsync.android.domain.StrategyLogic
+import com.rootsync.android.domain.PreparationLedger
+import com.rootsync.android.domain.StrategyAcknowledgement
 import com.rootsync.android.domain.SyncActivityType
 import com.rootsync.android.domain.SyncActivityUpdate
 import com.rootsync.android.domain.SyncPrepareRequest
@@ -80,9 +84,21 @@ class LanDiscoveryManager(
     private val trustedReconnectTimes = ConcurrentHashMap<String, Long>()
     private val prepareWaiters = ConcurrentHashMap<String, CompletableDeferred<SyncPrepareResult>>()
     private val storageCheckWaiters = ConcurrentHashMap<String, CompletableDeferred<RemoteStorageCheckResult>>()
+    private val preparationLedger = PreparationLedger()
+    private val cancelAckWaiters = ConcurrentHashMap<String, Pair<String, CompletableDeferred<Unit>>>()
+    private val prepareExpectedPeers = ConcurrentHashMap<String, Pair<String, String>>()
+    private val prepareLastActivity = ConcurrentHashMap<String, Long>()
+    private val _cancelledPreparations = MutableSharedFlow<Pair<String, String>>(extraBufferCapacity = 32)
+    val cancelledPreparations: SharedFlow<Pair<String, String>> = _cancelledPreparations.asSharedFlow()
     private val prepareStatusListeners = ConcurrentHashMap<String, (String) -> Unit>()
     private val activityAckWaiters = ConcurrentHashMap<String, CompletableDeferred<Unit>>()
-    private val strategyAckWaiters = ConcurrentHashMap<String, CompletableDeferred<Unit>>()
+    private data class StrategyWaiter(val deviceId: String, val revision: StrategyRevision, val done: CompletableDeferred<Unit>)
+    private val strategyAckWaiters = ConcurrentHashMap<String, StrategyWaiter>()
+    private val strategySending = ConcurrentHashMap<String, Boolean>()
+    private val _strategyAcknowledgements = MutableSharedFlow<StrategyAcknowledgement>(extraBufferCapacity = 32)
+    val strategyAcknowledgements = _strategyAcknowledgements.asSharedFlow()
+    private val _incompatibleDevices = MutableStateFlow<Set<String>>(emptySet())
+    val incompatibleDevices = _incompatibleDevices.asStateFlow()
     private val resolveQueue = ConcurrentLinkedQueue<NsdServiceInfo>()
     private val resolving = AtomicBoolean(false)
     private val scanGeneration = AtomicInteger(0)
@@ -114,10 +130,7 @@ class LanDiscoveryManager(
     )
     val strategyUpdates: SharedFlow<StrategyUpdate> = _strategyUpdates.asSharedFlow()
 
-    private val _syncPrepareRequests = MutableSharedFlow<SyncPrepareRequest>(
-        extraBufferCapacity = 8,
-        onBufferOverflow = BufferOverflow.DROP_OLDEST
-    )
+    private val _syncPrepareRequests = MutableSharedFlow<SyncPrepareRequest>(extraBufferCapacity = 32)
     val syncPrepareRequests: SharedFlow<SyncPrepareRequest> = _syncPrepareRequests.asSharedFlow()
 
     private val _remoteStorageCheckRequests = MutableSharedFlow<RemoteStorageCheckRequest>(
@@ -279,38 +292,50 @@ class LanDiscoveryManager(
         host: String,
         role: SyncRole,
         rangeMode: SyncRangeMode,
-        sinceEpochMillis: Long?
+        sinceEpochMillis: Long?,
+        expectedDeviceId: String,
+        revision: StrategyRevision
     ) {
+        if (!revision.valid || strategySending.putIfAbsent(expectedDeviceId, true) != null) return
         start()
-        val requestId = UUID.randomUUID().toString()
-        val message = baseMessage(TYPE_STRATEGY_UPDATE)
-            .put("requestId", requestId)
-            .put("secret", localSecret())
-            .put("controlToken", localControlToken())
-            .put("role", role.name)
-            .put("rangeMode", rangeMode.name)
-        sinceEpochMillis?.let { message.put("sinceEpochMillis", it) }
         scope.launch {
-            val waiter = CompletableDeferred<Unit>()
+            val requestId = UUID.randomUUID().toString()
+            val waiter = StrategyWaiter(expectedDeviceId, revision, CompletableDeferred())
             strategyAckWaiters[requestId] = waiter
-            val address = InetAddress.getByName(host)
-            val retryJob = launch {
-                while (isActive && !waiter.isCompleted) {
-                    send(message, address)
-                    delay(STRATEGY_RETRY_INTERVAL_MS)
+            try {
+                val message = baseMessage(TYPE_STRATEGY_UPDATE)
+                    .put("targetDeviceId", expectedDeviceId)
+                    .put("requestId", requestId)
+                    .put("secret", localSecret())
+                    .put("controlToken", localControlToken())
+                    .put("role", role.name)
+                    .put("rangeMode", rangeMode.name)
+                    .put("strategyCounter", revision.counter)
+                    .put("strategyWriter", revision.writerId)
+                sinceEpochMillis?.let { message.put("sinceEpochMillis", it) }
+                val address = InetAddress.getByName(host)
+                withTimeoutOrNull(STRATEGY_ACK_TIMEOUT_MS) {
+                    while (isActive && !waiter.done.isCompleted) {
+                        send(message, address)
+                        withTimeoutOrNull(STRATEGY_RETRY_INTERVAL_MS) { waiter.done.await() }
+                    }
                 }
+            } finally {
+                strategyAckWaiters.remove(requestId, waiter)
+                strategySending.remove(expectedDeviceId)
             }
-            val acknowledged = withTimeoutOrNull(STRATEGY_ACK_TIMEOUT_MS) { waiter.await() } != null
-            retryJob.cancel()
-            strategyAckWaiters.remove(requestId, waiter)
-            onLog(
-                if (acknowledged) {
-                    "对方已确认零删除设备策略：${role.label}"
-                } else {
-                    "对方未确认设备策略：${role.label}；已停止重发，请确认设备在线后重试"
-                }
-            )
         }
+    }
+
+    // Only the consumer that durably applied this revision may acknowledge it.
+    fun acknowledgeStrategy(update: StrategyUpdate) {
+        val ack = baseMessage(TYPE_STRATEGY_ACK)
+            .put("targetDeviceId", update.deviceId)
+            .put("requestId", update.requestId)
+            .put("controlToken", localControlToken())
+            .put("strategyCounter", update.revision.counter)
+            .put("strategyWriter", update.revision.writerId)
+        scope.launch { send(ack, InetAddress.getByName(update.host)) }
     }
 
     suspend fun requestSyncPreparation(
@@ -321,14 +346,21 @@ class LanDiscoveryManager(
         untilEpochMillis: Long,
         isPreview: Boolean,
         timeoutMillis: Long = PREPARE_TIMEOUT_MS,
+        strategyRevision: StrategyRevision = StrategyRevision(),
+        strictChecksum: Boolean = false,
+        expectedDeviceId: String = "",
         onWaiting: (String) -> Unit = {}
     ): SyncPrepareResult? {
+        require(expectedDeviceId.isNotBlank()) { "准备请求必须指定已配对设备 ID" }
         start()
         val requestId = UUID.randomUUID().toString()
         val waiter = CompletableDeferred<SyncPrepareResult>()
         prepareWaiters[requestId] = waiter
         prepareStatusListeners[requestId] = onWaiting
+        prepareExpectedPeers[requestId] = expectedDeviceId to host
+        prepareLastActivity[requestId] = System.nanoTime()
         val message = baseMessage(TYPE_SYNC_PREPARE)
+            .put("targetDeviceId", expectedDeviceId)
             .put("requestId", requestId)
             .put("secret", localSecret())
             .put("controlToken", localControlToken())
@@ -336,6 +368,9 @@ class LanDiscoveryManager(
             .put("rangeMode", rangeMode.name)
             .put("untilEpochMillis", untilEpochMillis)
             .put("isPreview", isPreview)
+            .put("strictChecksum", strictChecksum)
+            .put("strategyCounter", strategyRevision.counter)
+            .put("strategyWriter", strategyRevision.writerId)
         sinceEpochMillis?.let { message.put("sinceEpochMillis", it) }
         val retryJob = scope.launch {
             val address = InetAddress.getByName(host)
@@ -345,12 +380,48 @@ class LanDiscoveryManager(
                 delay(PREPARE_RETRY_INTERVAL_MS)
             }
         }
+        var ready = false
         return try {
-            withTimeoutOrNull(timeoutMillis) { waiter.await() }
+            val result = withTimeoutOrNull(24L * 60 * 60 * 1000) {
+                var result: SyncPrepareResult? = null
+                while (isActive) {
+                    result = withTimeoutOrNull(1_000) { waiter.await() }
+                    if (result != null) break
+                    val lastActivity = prepareLastActivity[requestId] ?: break
+                    if ((System.nanoTime() - lastActivity) / 1_000_000 >= timeoutMillis) break
+                }
+                result
+            }
+            ready = result?.ready == true
+            result
         } finally {
             retryJob.cancel()
             prepareWaiters.remove(requestId, waiter)
             prepareStatusListeners.remove(requestId)
+            prepareExpectedPeers.remove(requestId)
+            prepareLastActivity.remove(requestId)
+            if (!ready) {
+                // Manager scope outlives the cancelled caller; receiver must match both IDs.
+                retryPreparationCancellation(host, expectedDeviceId, requestId)
+            }
+        }
+    }
+
+    private fun retryPreparationCancellation(host: String, peerId: String, requestId: String) {
+        scope.launch {
+            val ack = CompletableDeferred<Unit>()
+            cancelAckWaiters[requestId] = peerId to ack
+            try {
+                val message = baseMessage(TYPE_SYNC_PREPARE_CANCEL)
+                    .put("targetDeviceId", peerId).put("requestId", requestId)
+                    .put("controlToken", localControlToken())
+                val address = InetAddress.getByName(host)
+                repeat(15) {
+                    if (ack.isCompleted) return@launch
+                    send(message, address)
+                    withTimeoutOrNull(1_000) { ack.await() }
+                }
+            } finally { cancelAckWaiters.remove(requestId) }
         }
     }
 
@@ -457,22 +528,26 @@ class LanDiscoveryManager(
     ) {
         start()
         val message = baseMessage(TYPE_SYNC_READY)
+            .put("targetDeviceId", request.deviceId)
             .put("requestId", request.requestId)
             .put("controlToken", localControlToken())
             .put("ready", ready)
             .put("message", messageText.take(240))
             .put("port", port)
         if (ready && !sessionSecret.isNullOrBlank()) message.put("secret", sessionSecret)
-        cachedResponses[request.requestId] = CachedResponse(message.toString(), System.currentTimeMillis())
+        if (!preparationLedger.complete(request.deviceId, request.requestId, message.toString())) return
         scope.launch { send(message, InetAddress.getByName(request.host)) }
     }
 
     fun answerSyncPreparationWaiting(request: SyncPrepareRequest, messageText: String) {
+        // Keep long manifest preparations deduplicated for as long as the owner sends heartbeats.
         start()
         val message = baseMessage(TYPE_SYNC_WAITING)
+            .put("targetDeviceId", request.deviceId)
             .put("requestId", request.requestId)
             .put("controlToken", localControlToken())
             .put("message", messageText.take(240))
+        if (!preparationLedger.waiting(request.deviceId, request.requestId, message.toString())) return
         scope.launch { sendRepeated(message, InetAddress.getByName(request.host), 2, 180L) }
     }
 
@@ -720,14 +795,28 @@ class LanDiscoveryManager(
 
     private fun handlePacket(payload: String, sender: InetAddress) {
         val message = runCatching { JSONObject(payload) }.getOrNull() ?: return
-        if (message.optString("magic") != MAGIC || message.optInt("version") != PROTOCOL_VERSION) return
+        if (message.optString("magic") != MAGIC) return
+        if (message.optInt("version") != PROTOCOL_VERSION) {
+            val id = message.optString("deviceId")
+            if (id.isNotBlank() && id != deviceId) {
+                if (id !in _incompatibleDevices.value) onLog("对方协议版本不兼容，请两端升级到支持协议 8 的版本")
+                _incompatibleDevices.value = _incompatibleDevices.value + id
+            }
+            return
+        }
+        _incompatibleDevices.value = _incompatibleDevices.value - message.optString("deviceId")
         val remoteDeviceId = message.optString("deviceId")
         if (remoteDeviceId.isBlank() || remoteDeviceId == deviceId) return
         val remoteName = message.optString("name").ifBlank { "Android 设备" }
         val remotePort = message.optInt("port", 8873).takeIf { it in 1024..65535 } ?: 8873
         val host = sender.hostAddress ?: return
 
-        when (message.optString("type")) {
+        val type = message.optString("type")
+        if (type in setOf(TYPE_STRATEGY_UPDATE, TYPE_STRATEGY_ACK, TYPE_SYNC_PREPARE,
+                TYPE_SYNC_PREPARE_CANCEL, TYPE_SYNC_PREPARE_CANCEL_ACK, TYPE_SYNC_READY, TYPE_SYNC_WAITING) &&
+            message.optString("targetDeviceId") != deviceId) return
+
+        when (type) {
             TYPE_DISCOVER -> scope.launch { send(baseMessage(TYPE_ANNOUNCE), sender) }
             TYPE_ANNOUNCE -> addOrUpdateDevice(remoteDeviceId, remoteName, host, remotePort)
             TYPE_PAIR_REQUEST -> {
@@ -836,12 +925,9 @@ class LanDiscoveryManager(
                     role != null && rangeMode != null &&
                     (rangeMode == SyncRangeMode.ALL || since != null)
                 ) {
-                    if (requestId.isNotBlank()) {
-                        val ack = baseMessage(TYPE_STRATEGY_ACK)
-                            .put("requestId", requestId)
-                            .put("controlToken", localControlToken())
-                        scope.launch { send(ack, sender) }
-                    }
+                    val revision = StrategyRevision(message.optLong("strategyCounter"), message.optString("strategyWriter"))
+                    if (requestId.isBlank() || !revision.valid ||
+                        revision.writerId !in setOf(deviceId, remoteDeviceId)) return
                     _strategyUpdates.tryEmit(
                         StrategyUpdate(
                             remoteDeviceId,
@@ -850,7 +936,9 @@ class LanDiscoveryManager(
                             secret,
                             role,
                             rangeMode,
-                            since
+                            since,
+                            requestId,
+                            revision
                         )
                     )
                 }
@@ -858,41 +946,39 @@ class LanDiscoveryManager(
             TYPE_STRATEGY_ACK -> {
                 val controlToken = message.optString("controlToken")
                 if (!isValidTrustedControl(remoteDeviceId, controlToken)) return
-                strategyAckWaiters.remove(message.optString("requestId"))?.complete(Unit)
+                val requestId = message.optString("requestId")
+                val expected = strategyAckWaiters[requestId] ?: return
+                val revision = StrategyRevision(message.optLong("strategyCounter"), message.optString("strategyWriter"))
+                if (!StrategyLogic.acceptsAck(expected.deviceId, expected.revision, remoteDeviceId, revision)) return
+                if (strategyAckWaiters.remove(requestId, expected)) {
+                    _strategyAcknowledgements.tryEmit(StrategyAcknowledgement(remoteDeviceId, revision))
+                    expected.done.complete(Unit)
+                }
             }
             TYPE_SYNC_PREPARE -> {
                 val requestId = message.optString("requestId")
-                if (requestId.isBlank()) return
-                cachedResponses[requestId]?.let { cached ->
-                    scope.launch { send(JSONObject(cached.payload), sender) }
+                if (requestId.isBlank() || requestId.length > 128 ||
+                    !isValidTrustedControl(remoteDeviceId, message.optString("controlToken"))) return
+                preparationLedger.get(remoteDeviceId, requestId)?.let { entry ->
+                    if (entry.stage != PreparationLedger.Stage.CANCELLED) entry.response?.let { payload ->
+                        scope.launch { send(JSONObject(payload), sender) }
+                    }
                     return
                 }
-                if (seenIncomingRequests.putIfAbsent(requestId, System.currentTimeMillis()) != null) return
                 val secret = message.optString("secret")
-                val controlToken = message.optString("controlToken")
                 val role = parseRole(message.optString("role"))
                 val rangeMode = parseRangeMode(message.optString("rangeMode"))
                 val since = parseSince(message, rangeMode)
                 val until = message.optLong("untilEpochMillis", -1L)
-                val isPreview = message.optBoolean("isPreview", false)
-                if (secret.length >= 6 && isValidTrustedControl(remoteDeviceId, controlToken) &&
-                    role != null && rangeMode != null &&
-                    (rangeMode == SyncRangeMode.ALL || since != null) && until > 0L
-                ) {
-                    _syncPrepareRequests.tryEmit(
-                        SyncPrepareRequest(
-                            requestId,
-                            remoteDeviceId,
-                            remoteName,
-                            host,
-                            secret,
-                            role,
-                            rangeMode,
-                            since,
-                            until,
-                            isPreview
-                        )
-                    )
+                val revision = StrategyRevision(message.optLong("strategyCounter"), message.optString("strategyWriter"))
+                if (secret.length < 6 || role == null || rangeMode == null ||
+                    (rangeMode == SyncRangeMode.SINCE && (since == null || since > until)) || until <= 0 ||
+                    !revision.valid || revision.writerId !in setOf(deviceId, remoteDeviceId)) return
+                if (!preparationLedger.claim(remoteDeviceId, requestId)) return
+                if (!_syncPrepareRequests.tryEmit(SyncPrepareRequest(requestId, remoteDeviceId,
+                    remoteName, host, secret, role, rangeMode, since, until,
+                    message.optBoolean("isPreview", false), revision, message.optBoolean("strictChecksum", false)))) {
+                    preparationLedger.releaseUnpublished(remoteDeviceId, requestId)
                 }
             }
             TYPE_SYNC_ACTIVITY -> {
@@ -932,10 +1018,29 @@ class LanDiscoveryManager(
                 val messageId = message.optString("messageId")
                 activityAckWaiters.remove(messageId)?.complete(Unit)
             }
+            TYPE_SYNC_PREPARE_CANCEL -> {
+                val requestId = message.optString("requestId")
+                if (requestId.isBlank() || requestId.length > 128 ||
+                    !isValidTrustedControl(remoteDeviceId, message.optString("controlToken"))) return
+                preparationLedger.cancel(remoteDeviceId, requestId)
+                if (!_cancelledPreparations.tryEmit(remoteDeviceId to requestId)) return
+                val ack = baseMessage(TYPE_SYNC_PREPARE_CANCEL_ACK)
+                    .put("targetDeviceId", remoteDeviceId).put("requestId", requestId)
+                    .put("controlToken", localControlToken())
+                scope.launch { send(ack, sender) }
+            }
+            TYPE_SYNC_PREPARE_CANCEL_ACK -> {
+                if (!isValidTrustedControl(remoteDeviceId, message.optString("controlToken"))) return
+                val requestId = message.optString("requestId")
+                val expected = cancelAckWaiters[requestId] ?: return
+                if (expected.first == remoteDeviceId) expected.second.complete(Unit)
+            }
             TYPE_SYNC_READY -> {
                 val requestId = message.optString("requestId")
                 val controlToken = message.optString("controlToken")
                 if (!isValidTrustedControl(remoteDeviceId, controlToken)) return
+                val expected = prepareExpectedPeers[requestId] ?: return
+                if ((expected.first.isNotBlank() && expected.first != remoteDeviceId) || expected.second != host) return
                 val ready = message.optBoolean("ready", false)
                 val secret = message.optString("secret")
                 val result = SyncPrepareResult(
@@ -956,6 +1061,9 @@ class LanDiscoveryManager(
                 val requestId = message.optString("requestId")
                 val controlToken = message.optString("controlToken")
                 if (!isValidTrustedControl(remoteDeviceId, controlToken)) return
+                val expected = prepareExpectedPeers[requestId] ?: return
+                if ((expected.first.isNotBlank() && expected.first != remoteDeviceId) || expected.second != host) return
+                prepareLastActivity[requestId] = System.nanoTime()
                 val status = message.optString("message").ifBlank { "对方正在选择操作" }
                 prepareStatusListeners[requestId]?.let { listener ->
                     runCatching { listener(status) }
@@ -1077,6 +1185,7 @@ class LanDiscoveryManager(
             true
         }
         seenIncomingRequests.entries.removeIf { it.value < cutoff }
+        preparationLedger.expire()
         cachedResponses.entries.removeIf { it.value.createdAtMillis < cutoff }
     }
 
@@ -1116,7 +1225,7 @@ class LanDiscoveryManager(
         const val SCAN_WINDOW_MS = 8_000L
         private const val NSD_SERVICE_TYPE = "_rootsync._tcp."
         private const val MAGIC = "ROOTSYNC_LAN"
-        private const val PROTOCOL_VERSION = 7
+        private const val PROTOCOL_VERSION = 8
         private const val MIN_CONTROL_TOKEN_LENGTH = 32
         private const val UDP_SCAN_BURSTS = 3
         private const val UDP_SCAN_INTERVAL_MS = 700L
@@ -1133,6 +1242,8 @@ class LanDiscoveryManager(
         private const val TYPE_TRUSTED_ACK = "trusted_ack"
         private const val TYPE_STRATEGY_UPDATE = "strategy_update"
         private const val TYPE_STRATEGY_ACK = "strategy_ack"
+        private const val TYPE_SYNC_PREPARE_CANCEL_ACK = "sync_prepare_cancel_ack"
+        private const val TYPE_SYNC_PREPARE_CANCEL = "sync_prepare_cancel"
         private const val TYPE_SYNC_PREPARE = "sync_prepare"
         private const val TYPE_SYNC_READY = "sync_ready"
         private const val TYPE_SYNC_WAITING = "sync_waiting"

@@ -9,6 +9,88 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SafeInputTest {
+
+    @Test
+    fun exactFileListsStayNonRecursiveForBothDirectionsAndAllTransferModes() {
+        for (pull in listOf(true, false)) {
+            for (dryRun in listOf(true, false)) {
+                for (strict in listOf(true, false)) {
+                    val command = transferCommand(pull, dryRun, strict, exact = true)
+                    assertTrue(command.contains("'--files-from=/data/user/0/app/exact.files'"))
+                    assertTrue(command.contains("'--from0'"))
+                    assertTrue(command.contains("'--dirs'"))
+                    assertTrue(command.contains("'--no-recursive'"))
+                    assertTrue(command.indexOf("'--no-recursive'") > command.indexOf("'-rlt'"))
+                    assertTrue(command.contains("'--modify-window=-1'"))
+                    assertTrue(command.contains("'--update'"))
+                    assertEquals(strict, command.contains("'--checksum'"))
+                    assertEquals(dryRun, command.contains("'--dry-run'"))
+                    assertFalse(command.contains("'--recursive'"))
+                    assertFalse(command.contains("--delete"))
+                    assertFalse(command.contains("--remove-source-files"))
+                }
+            }
+        }
+    }
+
+    @Test
+    fun explicitNonExactFileListsKeepLegacyRecursionAndNewerFileProtection() {
+        for (pull in listOf(true, false)) {
+            val command = transferCommand(pull, dryRun = false, strict = false, exact = false)
+            assertTrue(command.contains("'-rlt'"))
+            assertFalse(command.contains("'--no-recursive'"))
+            assertFalse(command.contains("'--dirs'"))
+            assertTrue(command.contains("'--modify-window=-1'"))
+            assertTrue(command.contains("'--update'"))
+        }
+    }
+
+    @Test
+    fun exactModeRejectsMissingFileListForBothDirections() {
+        for (pull in listOf(true, false)) {
+            try {
+                transferCommand(pull, dryRun = false, strict = false, exact = true, filesFrom = null)
+                throw AssertionError("Exact mode must reject a missing file list")
+            } catch (expected: IllegalArgumentException) {
+                assertTrue(expected.message.orEmpty().contains("filesFrom"))
+            }
+        }
+    }
+
+    private fun transferCommand(
+        pull: Boolean,
+        dryRun: Boolean,
+        strict: Boolean,
+        exact: Boolean,
+        filesFrom: String? = "/data/user/0/app/exact.files"
+    ): String = if (pull) {
+        RsyncCommandBuilder.pull(
+            rsyncPath = "/data/app/librsync.so",
+            host = "192.168.1.20",
+            port = 8873,
+            destination = "/storage/emulated/0/receive",
+            passwordFile = "/data/user/0/app/password",
+            backupRunId = "20260809-210000-000",
+            filesFrom = filesFrom,
+            dryRun = dryRun,
+            strictChecksum = strict,
+            exactFileList = exact
+        )
+    } else {
+        RsyncCommandBuilder.push(
+            rsyncPath = "/data/app/librsync.so",
+            host = "192.168.1.20",
+            port = 8873,
+            source = "/storage/emulated/0/send",
+            passwordFile = "/data/user/0/app/password",
+            backupRunId = "20260809-210000-000",
+            filesFrom = filesFrom,
+            dryRun = dryRun,
+            strictChecksum = strict,
+            exactFileList = exact
+        )
+    }
+
     @Test
     fun keepsBothSidesOfDirectionComplementary() {
         assertEquals(SyncRole.RECEIVE_ONLY, SyncRole.SEND_ONLY.opposite())
@@ -67,6 +149,11 @@ class SafeInputTest {
             filesFrom = null,
             dryRun = false
         )
+        listOf(pull, push).forEach { command ->
+            assertTrue(command.contains("'--modify-window=-1'"))
+            assertFalse(command.contains("'--no-recursive'"))
+            assertFalse(command.contains("'--dirs'"))
+        }
         assertTrue(pull.contains("/send/"))
         assertTrue(pull.contains("--dry-run"))
         assertTrue(push.contains("/receive/"))
@@ -153,6 +240,12 @@ class SafeInputTest {
             filesFrom = "/data/user/0/app/integrity.files"
         )
         listOf(pull, push).forEach { command ->
+            assertTrue(command.contains("'--no-recursive'"))
+            assertTrue(command.contains("'--dirs'"))
+            assertTrue(command.indexOf("'--no-recursive'") > command.indexOf("'-rlt'"))
+            assertTrue(command.contains("'--modify-window=-1'"))
+            assertFalse(command.contains("'--update'"))
+            assertFalse(command.contains("'--recursive'"))
             assertTrue(command.contains("--checksum"))
             assertTrue(command.contains("--dry-run"))
             assertTrue(command.contains("--files-from="))
