@@ -331,18 +331,24 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             _state.update { it.copy(isChecking = true, phase = "正在请求 ROOT 并检查能力") }
             appendLog("INFO", "开始 ROOT、内置 rsync 与目录检查")
             val before = _state.value
-            val capabilities = engine.probe(before.sourcePath, before.destinationPath, forceRetry) {
-                _state.update { state ->
-                    state.copy(
-                        capabilities = state.capabilities.copy(rootGranted = true),
-                        phase = "ROOT 已授权，正在检查同步引擎"
-                    )
-                }
-            }
+            val capabilities = engine.probe(
+                before.sourcePath, before.destinationPath, forceRetry,
+                onRootGranted = {
+                    _state.update { it.copy(capabilities = it.capabilities.copy(rootGranted = true),
+                        phase = "ROOT 已授权，正在检测内置引擎") }
+                },
+                onUpdate = { snapshot, phase ->
+                    _state.update { it.copy(capabilities = snapshot, phase = phase) }
+                },
+                onLog = ::streamLog
+            )
+            // Publish all completed checks BEFORE cleanup, never hide readiness behind it.
+            _state.update { it.copy(capabilities = capabilities) }
             if (capabilities.rootGranted && !runtimeCleanupAttempted) {
                 runtimeCleanupAttempted = true
+                _state.update { it.copy(phase = "引擎检测已结束，清理本应用遗留进程（最多2秒）") }
                 val cleanup = engine.cleanupStaleRuntimeProcesses(::streamLog)
-                appendLog(if (cleanup.success) "INFO" else "ERROR", cleanup.summary)
+                appendLog(if (cleanup.success) "INFO" else "WARN", cleanup.summary)
             }
             _state.update { current ->
                 val detected = capabilities.detectedMediaPath

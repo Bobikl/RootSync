@@ -13,6 +13,8 @@ import com.rootsync.android.domain.SyncRole
 import com.rootsync.android.root.CommandResult
 import com.rootsync.android.root.RootAuthorization
 import com.rootsync.android.root.RootShell
+import com.rootsync.android.root.RootProcess
+import com.rootsync.android.root.TimedProbe
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -47,6 +49,7 @@ data class DestinationDirectoryCheck(
 
 class RootSyncEngine(private val context: Context) {
     private val shell = RootShell()
+    private val probeShell = RootShell()
     private val controlShell = RootShell()
     private val watchdogShell = RootShell()
     private val runtimeDir = File(context.filesDir, "runtime").apply { mkdirs() }
@@ -60,11 +63,13 @@ class RootSyncEngine(private val context: Context) {
 
     suspend fun cleanupStaleRuntimeProcesses(onLog: (String) -> Unit): EngineResult =
         withContext(Dispatchers.IO) {
-            val result = controlShell.execute(runtimeCleanupCommand(includeWatchdog = true), onLog)
+            val result = TimedProbe.run("启动清理（仅本应用PID）", 2_000, onLog) {
+                controlShell.execute(StartupCleanup.command(runtimeDir.absolutePath), onLog)
+            }
             if (result.exitCode == 0) {
                 EngineResult(true, "已清理上次异常退出遗留的 rsync 进程")
             } else {
-                EngineResult(false, "遗留 rsync 进程清理失败", result.exitCode)
+                EngineResult(false, "启动清理未完成，已停止等待：" + result.text.take(160), result.exitCode)
             }
         }
 
@@ -72,7 +77,9 @@ class RootSyncEngine(private val context: Context) {
         sourcePath: String,
         destinationPath: String,
         forceRetry: Boolean = false,
-        onRootGranted: () -> Unit = {}
+        onRootGranted: () -> Unit = {},
+        onUpdate: (DeviceCapabilities, String) -> Unit = { _, _ -> },
+        onLog: (String) -> Unit = {}
     ): DeviceCapabilities {
         val checks = mutableListOf<CapabilityCheck>()
         val authorization = RootAuthorization.request(
@@ -93,18 +100,15 @@ class RootSyncEngine(private val context: Context) {
             RootAuthorization.managerName ?: "ROOT 已授权，正在识别管理器"
         )
 
-        val bundledVersionResult = shell.execute(
-            "${SafeInput.shellQuote(bundledRsyncPath)} --version 2>/dev/null | head -n 1"
-        )
+        val bundledVersionResult = nativeProbe(bundledRsyncPath, "--version", "rsync版本", onLog)
         val bundledReady = bundledVersionResult.exitCode == 0 &&
             bundledVersionResult.text.contains("rsync", ignoreCase = true)
-        val externalPath = if (!bundledReady) findExternalRsync() else null
+        val externalPath = if (!bundledReady) findExternalRsync(onLog) else null
         val rsyncPath = if (bundledReady) bundledRsyncPath else externalPath
         val rsyncVersion = when {
             bundledReady -> bundledVersionResult.output.firstOrNull()?.trim()?.plus(" · 内置")
-            externalPath != null -> shell.execute(
-                "${SafeInput.shellQuote(externalPath)} --version 2>/dev/null | head -n 1"
-            ).output.firstOrNull()?.trim()?.plus(" · 外部")
+            externalPath != null -> nativeProbe(externalPath, "--version", "外部rsync版本", onLog)
+                .output.firstOrNull()?.trim()?.plus(" · 外部")
             else -> null
         }
         checks += CapabilityCheck(
@@ -113,7 +117,9 @@ class RootSyncEngine(private val context: Context) {
             rsyncVersion ?: "内置 rsync 无法执行，且未找到外部版本"
         )
 
-        val meta = shell.execute("${SafeInput.shellQuote(syncMetaPath)} version")
+        onUpdate(DeviceCapabilities(rootGranted = true, rsyncPath = rsyncPath,
+            rsyncVersion = rsyncVersion, checks = checks.toList()), "rsync 检测已完成，检查目录时间工具")
+        val meta = nativeProbe(syncMetaPath, "version", "syncmeta版本", onLog)
         val metaReady = meta.exitCode == 0 && meta.text.contains("syncmeta")
         checks += CapabilityCheck(
             "目录时间工具",
@@ -121,7 +127,10 @@ class RootSyncEngine(private val context: Context) {
             meta.output.firstOrNull() ?: "arm64 原生工具不可执行"
         )
 
-        val detectedPath = detectKnownMediaPath()
+        onUpdate(DeviceCapabilities(rootGranted = true, rsyncPath = rsyncPath,
+            rsyncVersion = rsyncVersion, syncMetaReady = metaReady, checks = checks.toList()),
+            "引擎检测已结束，检查目录访问（限时）")
+        val detectedPath = detectKnownMediaPath(onLog)
         val effectiveSource = when {
             sourcePath == com.rootsync.android.domain.SyncUiState.LEGACY_BILI_PATH && detectedPath != null -> detectedPath
             sourcePath == com.rootsync.android.domain.SyncUiState.DEFAULT_BILI_PATH && detectedPath != null -> detectedPath
@@ -129,7 +138,7 @@ class RootSyncEngine(private val context: Context) {
         }
         val sourceError = SafeInput.validateStoragePath(effectiveSource)
         val sourceResult = if (sourceError == null) {
-            shell.execute(
+            probeRoot("目录访问", onLog,
                 "test -d ${SafeInput.shellQuote(effectiveSource)} && " +
                     "test -r ${SafeInput.shellQuote(effectiveSource)}"
             )
@@ -143,17 +152,17 @@ class RootSyncEngine(private val context: Context) {
             },
             sourceError ?: if (sourceResult?.exitCode == 0) {
                 if (effectiveSource == sourcePath) "ROOT 可读取" else "已自动识别：$effectiveSource"
-            } else "目录不存在；请确认应用版本和实际下载目录"
+            } else if (sourceResult?.exitCode == 124) "目录检查超时；正式任务将重新检查" else "目录不存在；请确认应用版本和实际下载目录"
         )
 
         val destinationError = SafeInput.validateStoragePath(destinationPath)
         val destinationResult = if (destinationError == null) {
-            shell.execute(
+            probeRoot("目录访问", onLog,
                 "test -d ${SafeInput.shellQuote(destinationPath)} && " +
                     "test -w ${SafeInput.shellQuote(destinationPath)}"
             )
         } else null
-        val destinationExists = destinationError == null && shell.execute(
+        val destinationExists = destinationError == null && probeRoot("目录访问", onLog,
             "test -d ${SafeInput.shellQuote(destinationPath)}"
         ).exitCode == 0
         checks += CapabilityCheck(
@@ -166,6 +175,8 @@ class RootSyncEngine(private val context: Context) {
             },
             destinationError ?: if (destinationResult?.exitCode == 0) {
                 "ROOT 可写"
+            } else if (destinationResult?.exitCode == 124) {
+                "目录检查超时；正式任务将重新检查"
             } else if (!destinationExists) {
                 "目录不存在；接收任务开始时会询问是否创建"
             } else "目录存在但无法写入"
@@ -181,8 +192,8 @@ class RootSyncEngine(private val context: Context) {
         )
     }
 
-    private suspend fun findExternalRsync(): String? {
-        val result = shell.execute(
+    private suspend fun findExternalRsync(onLog: (String) -> Unit): String? {
+        val result = probeRoot("查找外部rsync", onLog,
             "command -v rsync 2>/dev/null || " +
                 "for p in /data/adb/modules/*/system/bin/rsync /system/bin/rsync /system/xbin/rsync; " +
                 "do [ -x \"\$p\" ] && echo \"\$p\" && break; done"
@@ -190,7 +201,7 @@ class RootSyncEngine(private val context: Context) {
         return result.output.firstOrNull { it.trim().startsWith('/') }?.trim()
     }
 
-    private suspend fun detectKnownMediaPath(): String? {
+    private suspend fun detectKnownMediaPath(onLog: (String) -> Unit): String? {
         val candidates = listOf(
             "/storage/emulated/0/Android/data/tv.danmaku.bili/download",
             "/storage/emulated/0/Android/data/com.danmaku.bili/download",
@@ -199,7 +210,19 @@ class RootSyncEngine(private val context: Context) {
         val command = candidates.joinToString("; ") { path ->
             "if [ -d ${SafeInput.shellQuote(path)} ]; then echo ${SafeInput.shellQuote(path)}; exit 0; fi"
         }
-        return shell.execute(command).output.firstOrNull { it.startsWith("/storage/") }?.trim()
+        return probeRoot("识别默认目录", onLog, command).output.firstOrNull { it.startsWith("/storage/") }?.trim()
+    }
+
+    private suspend fun probeRoot(name: String, onLog: (String) -> Unit, command: String) =
+        TimedProbe.run(name, 1_500, onLog) { probeShell.execute(command, maxCapturedLines = 32) }
+
+    private suspend fun nativeProbe(path: String, argument: String, name: String, onLog: (String) -> Unit): CommandResult {
+        val direct = TimedProbe.run(name + "·应用身份", 1_500, onLog) {
+            withContext(Dispatchers.IO) { RootProcess.execute(listOf(path, argument), maxCapturedLines = 32) }
+        }
+        if (direct.exitCode == 0) return direct
+        return probeRoot(name + "·ROOT回退", onLog,
+            listOf(path, argument).joinToString(" ") { SafeInput.shellQuote(it) })
     }
 
     suspend fun inspectDestinationDirectory(path: String): DestinationDirectoryCheck =
