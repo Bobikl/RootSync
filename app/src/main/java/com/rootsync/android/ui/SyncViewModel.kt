@@ -3,6 +3,7 @@ package com.rootsync.android.ui
 import android.app.Application
 import android.net.Uri
 import android.os.Build
+import android.os.SystemClock
 import android.provider.Settings
 import androidx.core.content.edit
 import androidx.lifecycle.AndroidViewModel
@@ -25,6 +26,7 @@ import com.rootsync.android.domain.SyncActivityUpdate
 import com.rootsync.android.domain.SyncPrepareRequest
 import com.rootsync.android.domain.SyncRangeMode
 import com.rootsync.android.domain.SyncRole
+import com.rootsync.android.domain.ScanProgress
 import com.rootsync.android.domain.SyncUiState
 import com.rootsync.android.domain.TransferRecord
 import com.rootsync.android.domain.TransferStatus
@@ -737,13 +739,14 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     private fun applyTrustedPeerUpdate(update: TrustedPeerUpdate) {
         val current = _state.value
         val existing = current.profiles.firstOrNull { it.deviceId == update.deviceId } ?: return
-        val rotatedSecret = update.secret?.takeIf { it.length >= SyncUiState.MIN_SECRET_LENGTH }
+        val rotatedSecret = update.secret?.takeIf { it.length >= SyncUiState.MIN_SECRET_LENGTH && it != existing.secret }
         val updated = existing.copy(
             name = update.name,
             host = update.host,
             port = update.port,
             secret = rotatedSecret ?: existing.secret
         )
+        if (updated == existing) return
         _state.update { state ->
             val selected = state.selectedProfileId == existing.id
             state.copy(
@@ -753,7 +756,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 portText = if (selected) updated.port.toString() else state.portText,
                 remoteSecret = if (selected) updated.secret else state.remoteSecret,
                 selectedProfileId = if (selected) updated.id else state.selectedProfileId,
-                lastResult = if (rotatedSecret != null) "已恢复与 ${updated.name} 的信任连接" else state.lastResult
+                lastResult = if (rotatedSecret != null && !state.isBusy) "已更新 ${updated.name} 的连接密钥" else state.lastResult
             )
         }
         saveConfig()
@@ -943,7 +946,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        _state.update { it.copy(isBusy = true, phase = "正在为 ${request.name} 准备服务端") }
+        _state.update { it.copy(isBusy = true, phase = "正在为 ${request.name} 准备服务端",
+            scanDetail = "正在准备目录扫描", scanUpdatedMillis = SystemClock.elapsedRealtime()) }
         val foregroundReadyBeforeScan = TransferForegroundService.update(
             context = getApplication(), title = "RootSync 正在准备目录清单",
             detail = "${request.name}：只读扫描中，可由发起端取消", eta = null, progress = null, incoming = true)
@@ -1065,11 +1069,13 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         activeRemotePrepareRequestId = request.requestId
+        _state.update { it.copy(scanDetail = "正在准备目录扫描", scanUpdatedMillis = SystemClock.elapsedRealtime()) }
         remotePrepareJob = viewModelScope.launch {
             val heartbeat = launch {
                 while (isActive) {
                     discovery.answerSyncPreparationWaiting(request,
-                        if (_state.value.pendingDirectoryCreation != null) "等待接收端确认创建目录" else "正在读取目录清单，请稍候")
+                        if (_state.value.pendingDirectoryCreation != null) "等待接收端确认创建目录"
+                        else "${_state.value.scanDetail} · 扫描状态距今 ${((SystemClock.elapsedRealtime() - _state.value.scanUpdatedMillis) / 1000).coerceAtLeast(0)} 秒")
                     delay(2_000)
                 }
             }
@@ -1657,6 +1663,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 secret = current.remoteSecret, peerName = current.profileName.ifBlank { current.remoteHost },
                 progress = 0f, updatedAtMillis = until, message = "正在重新校验双方目录")
             _state.update { it.copy(progress = if (dryRun) null else 0f, isPreviewing = dryRun,
+                previewStartedMillis = SystemClock.elapsedRealtime(), scanUpdatedMillis = SystemClock.elapsedRealtime(),
+                scanDetail = "等待对方准备只读目录清单", previewFraction = null,
                 previewReady = false, lastResult = null, totalSyncBytes = 0, uploadedBytes = 0, downloadedBytes = 0,
                 estimatedCompletionTime = if (dryRun) null else "正在比较双方完整清单…",
                 transferSpeedBytesPerSecond = 0, transferPanelTitle = transferPanelTitle(dryRun, current.role),
@@ -2078,6 +2086,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     state.copy(
                         phase = "${profile.name} 正在准备目录清单",
                         previewStatusText = if (isPreview) waitingText else state.previewStatusText,
+                        scanDetail = waitingText, previewFraction = null, scanUpdatedMillis = SystemClock.elapsedRealtime(),
                         lastResult = waitingText,
                         transferRecord = if (!isPreview) {
                             state.transferRecord?.copy(
@@ -2234,6 +2243,14 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun streamLog(message: String) {
+        ScanProgress.parse(message)?.let { scan ->
+            _state.update { state -> state.copy(scanDetail = scan.detail,
+                scanUpdatedMillis = SystemClock.elapsedRealtime(), previewFraction = scan.fraction,
+                phase = if (state.isBusy) scan.detail else state.phase,
+                previewStatusText = if (state.isPreviewing) scan.detail else state.previewStatusText) }
+            // High-frequency counters belong to progress state, not the persistent log.
+            if (!message.startsWith("PREVIEW_STAGE=")) return
+        }
         when {
             message.startsWith("INTEGRITY_VERIFY_START") -> {
                 _state.update {

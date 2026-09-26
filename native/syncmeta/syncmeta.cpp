@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <stdexcept>
 #include <cerrno>
 #include <cstdint>
@@ -535,6 +536,16 @@ struct DmScan {
     bool strict;
     uint64_t text_bytes=0, wire_bytes=24;
     std::vector<DmEntry> entries;
+    uint64_t hash_bytes=0;
+    std::chrono::steady_clock::time_point last_report {};
+    void report(bool force=false) {
+        const auto now=std::chrono::steady_clock::now();
+        if(!force && now-last_report<std::chrono::milliseconds(500)) return;
+        last_report=now;
+        std::printf("MANIFEST_PROGRESS=%zu HASH_BYTES=%llu\n", entries.size(),
+                    static_cast<unsigned long long>(hash_bytes));
+        std::fflush(stdout);
+    }
     void walk(int fd, const std::string& relative, unsigned depth) {
         dm_require(depth<=256,"manifest directory depth exceeds 256");
         struct stat before {}, after {};
@@ -581,6 +592,8 @@ struct DmScan {
                     total+=static_cast<uint64_t>(n);
                     dm_require(total<=static_cast<uint64_t>(e.info.st_size),"file grew while hashing");
                     sha.update(buffer.data(),static_cast<size_t>(n));
+                    hash_bytes+=static_cast<uint64_t>(n);
+                    report();
                 }
                 dm_require(total==static_cast<uint64_t>(e.info.st_size) &&
                     fstat(input.fd,&opened)==0 && dm_same(e.info,opened),"file changed during hash");
@@ -594,9 +607,7 @@ struct DmScan {
             wire_bytes+=30+e.path.size()+e.target.size()+((strict && e.kind==2)?32:0);
             dm_require(text_bytes<=dm_max_text && wire_bytes<=dm_max_bytes,"manifest exceeds byte budget");
             entries.push_back(e);
-            if(entries.size()%256==0) {
-                std::printf("MANIFEST_PROGRESS=%zu\n",entries.size()); std::fflush(stdout);
-            }
+            report();
             if(e.kind==1) {
                 DmFd child(openat(fd,name.c_str(),O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC));
                 dm_require(child.fd>=0 && fstat(child.fd,&current)==0 &&
@@ -678,6 +689,7 @@ int directory_manifest(const char* root_arg,const char* output_arg,const char* s
         dm_require(root_resolved,"root resolution failed");
         bool strict=std::strcmp(strict_arg,"1")==0;
         DmScan scan {strict,0,24,{}};
+        scan.report(true);
         if(!missing) {
             dm_require(S_ISDIR(root_info.st_mode),"root is not a real directory");
             DmFd input(open(root_arg,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC));
@@ -687,6 +699,7 @@ int directory_manifest(const char* root_arg,const char* output_arg,const char* s
             scan.walk(input.fd,"",0);
             dm_require(lstat(root_arg,&current)==0 && dm_same(root_info,current),"root changed during scan");
         }
+        scan.report(true);
         std::sort(scan.entries.begin(),scan.entries.end(),
             [](const DmEntry& a,const DmEntry& b){return dm_less(a.path,b.path);});
         temporary=output+".tmp.XXXXXX";

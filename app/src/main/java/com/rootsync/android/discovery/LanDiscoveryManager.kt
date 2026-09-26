@@ -8,6 +8,7 @@ import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.SystemClock
 import com.rootsync.android.domain.DiscoveredDevice
 import com.rootsync.android.domain.PairAccepted
 import com.rootsync.android.domain.PairRequest
@@ -81,7 +82,7 @@ class LanDiscoveryManager(
     private val requestCreatedTimes = ConcurrentHashMap<String, Long>()
     private val seenIncomingRequests = ConcurrentHashMap<String, Long>()
     private val cachedResponses = ConcurrentHashMap<String, CachedResponse>()
-    private val trustedReconnectTimes = ConcurrentHashMap<String, Long>()
+    private val trustedReconnectGate = TrustedReconnectGate()
     private val prepareWaiters = ConcurrentHashMap<String, CompletableDeferred<SyncPrepareResult>>()
     private val storageCheckWaiters = ConcurrentHashMap<String, CompletableDeferred<RemoteStorageCheckResult>>()
     private val preparationLedger = PreparationLedger()
@@ -268,8 +269,8 @@ class LanDiscoveryManager(
             .put("secret", localSecret())
             .put("controlToken", localControlToken())
         scope.launch {
-            sendRepeated(message, InetAddress.getByName(device.host), 2, 200L)
             onLog("正在恢复与 ${device.name} 的已信任连接")
+            sendRepeated(message, InetAddress.getByName(device.host), 2, 200L)
         }
     }
 
@@ -887,6 +888,7 @@ class LanDiscoveryManager(
                 if (requestId.isNotBlank() && secret.length >= 6 &&
                     isValidTrustedControl(remoteDeviceId, controlToken)
                 ) {
+                    trustedReconnectGate.confirmed(remoteDeviceId, host, remotePort, trustGeneration(controlToken), SystemClock.elapsedRealtime())
                     addOrUpdateDevice(remoteDeviceId, remoteName, host, remotePort, refreshTrust = false)
                     _trustedPeerUpdates.tryEmit(
                         TrustedPeerUpdate(remoteDeviceId, remoteName, host, remotePort, secret)
@@ -907,6 +909,7 @@ class LanDiscoveryManager(
                 if (expectedDeviceId == remoteDeviceId && secret.length >= 6 &&
                     isValidTrustedControl(remoteDeviceId, controlToken)
                 ) {
+                    trustedReconnectGate.confirmed(remoteDeviceId, host, remotePort, trustGeneration(controlToken), SystemClock.elapsedRealtime())
                     addOrUpdateDevice(remoteDeviceId, remoteName, host, remotePort, refreshTrust = false)
                     _trustedPeerUpdates.tryEmit(
                         TrustedPeerUpdate(remoteDeviceId, remoteName, host, remotePort, secret)
@@ -1123,6 +1126,10 @@ class LanDiscoveryManager(
         return receivedToken.length >= MIN_CONTROL_TOKEN_LENGTH && receivedToken == expectedToken
     }
 
+    // Local pairing-secret rotation must refresh peers even when their endpoint is unchanged.
+    // This private in-memory generation key is never logged or sent over discovery packets.
+    private fun trustGeneration(remoteToken: String) = remoteToken + '\u0000' + localSecret()
+
     private fun addOrUpdateDevice(
         deviceId: String,
         name: String,
@@ -1137,10 +1144,10 @@ class LanDiscoveryManager(
         }
         if (trustedControlToken(deviceId) != null) {
             _trustedPeerUpdates.tryEmit(TrustedPeerUpdate(deviceId, name, host, port))
-            if (refreshTrust) {
-                val now = System.currentTimeMillis()
-                val previous = trustedReconnectTimes.put(deviceId, now) ?: 0L
-                if (now - previous >= TRUST_RECONNECT_COOLDOWN_MS) reconnectTrusted(device)
+            val token = trustedControlToken(deviceId)
+            if (refreshTrust && token != null && trustedReconnectGate.shouldReconnect(
+                    deviceId, host, port, trustGeneration(token), SystemClock.elapsedRealtime())) {
+                reconnectTrusted(device)
             }
         }
     }
@@ -1261,7 +1268,6 @@ class LanDiscoveryManager(
         private const val STORAGE_CHECK_TIMEOUT_MS = 10_000L
         private const val STORAGE_CHECK_RETRY_INTERVAL_MS = 1_000L
         private const val NSD_REREGISTER_DELAY_MS = 500L
-        private const val TRUST_RECONNECT_COOLDOWN_MS = 10_000L
         private const val REQUEST_TTL_MS = 2L * 60L * 1000L
         private const val ACTIVE_PRESENCE_TIMEOUT_MS = 1_500L
         private const val ACTIVE_PRESENCE_PROBE_BURSTS = 3

@@ -15,6 +15,8 @@ import com.rootsync.android.root.RootAuthorization
 import com.rootsync.android.root.RootShell
 import com.rootsync.android.root.RootProcess
 import com.rootsync.android.root.TimedProbe
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -919,20 +921,33 @@ class RootSyncEngine(private val context: Context) {
         onLog: (String) -> Unit
     ): SyncPlan = withContext(Dispatchers.IO) {
         require(SafeInput.isValidIpv4(host) && port in 1024..65535)
-        onLog(if (strict) "正在计算本机清单和 SHA-256（大目录需要较长时间，可取消）…" else "正在读取本机只读目录清单…")
+        onLog("PREVIEW_STAGE=" + if (strict) "扫描本机目录并计算 SHA-256（总量未知，可取消）" else "扫描本机目录（总量未知，可取消）")
         val local = buildManifest(localPath, strict, onLog = onLog).toPlanTree()
         if (role != SyncRole.RECEIVE_ONLY) check(local.exists) { "发送源目录不存在" }
         val password = File(runtimeDir, "client.password")
         check(writeRootOwnedSecret(password, secret)) { "无法准备清单连接密钥" }
         val remoteFile = File(runtimeDir, "remote-${UUID.randomUUID()}.manifest")
         try {
+            onLog("PREVIEW_STAGE=获取对方目录清单")
             val remoteName = if (role == SyncRole.SEND_ONLY) "destination.manifest" else "source.manifest"
             val result = downloadMetadata(rsyncPath, host, port, password, remoteName, remoteFile, onLog)
             check(result.success) { "无法获取对方目录清单，请确认两端均已升级并重新准备服务：${result.summary}" }
             check(shell.execute("chown ${Process.myUid()}:${Process.myUid()} ${SafeInput.shellQuote(remoteFile.absolutePath)} && chmod 600 ${SafeInput.shellQuote(remoteFile.absolutePath)}").exitCode == 0)
+            onLog("PREVIEW_STAGE=解析对方目录清单")
             val remote = DirectoryManifest.read(remoteFile).toPlanTree()
             if (role != SyncRole.SEND_ONLY) check(remote.exists) { "对方发送源目录不存在" }
-            val plan = SyncPlanner.build(local, remote, role, rangeMode, sinceEpochMillis, untilEpochMillis)
+            onLog("PREVIEW_STAGE=校验并比较双方目录清单")
+            val context = currentCoroutineContext()
+            var lastProgressNanos = 0L
+            val plan = SyncPlanner.build(local, remote, role, rangeMode, sinceEpochMillis, untilEpochMillis) { done, total ->
+                context.ensureActive()
+                val now = System.nanoTime()
+                if (done == 0 || done == total || now - lastProgressNanos >= 250_000_000L) {
+                    onLog("PLAN_PROGRESS=$done/$total")
+                    lastProgressNanos = now
+                }
+            }
+            onLog("PREVIEW_STAGE=保存完整差异计划")
             // Full UTF-8 plan is retained privately; the UI pages the complete in-memory list.
             File(runtimeDir, "last-sync-plan.tsv").bufferedWriter(Charsets.UTF_8).use { writer ->
                 writer.appendLine("action\tbytes\tpath\treason")

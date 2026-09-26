@@ -6,6 +6,25 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class SyncPlannerTest {
+    @Test fun comparisonProgressCountsAllPathsEvenWhenNoDifferences() {
+        val a = PlanTree(true, false, (0 until 600).map { PlanFile("f$it", PlanFileKind.FILE, 1, 1, 0) })
+        val progress = mutableListOf<Pair<Int, Int>>()
+        val result = SyncPlanner.build(a, a, SyncRole.BIDIRECTIONAL, SyncRangeMode.ALL, null, 10000) { d, t -> progress += d to t }
+        assertTrue(result.items.isEmpty())
+        assertEquals(0 to 600, progress.first())
+        assertEquals(600 to 600, progress.last())
+        assertTrue(progress.zipWithNext().all { (a, b) -> a.first <= b.first })
+    }
+    @Test fun progressCallbackCanCancelComparison() {
+        val empty = PlanTree(true, false, emptyList())
+        try {
+            SyncPlanner.build(empty, empty, SyncRole.BIDIRECTIONAL, SyncRangeMode.ALL, null, 10000) { _, _ ->
+                throw java.util.concurrent.CancellationException("cancel")
+            }
+            fail("Cancellation must propagate")
+        } catch (_: java.util.concurrent.CancellationException) { }
+    }
+
     private fun f(path: String, size: Long = 10, time: Long = 2, hash: String? = null) =
         PlanFile(path, PlanFileKind.FILE, size, time, 0, hash)
     private fun tree(vararg entries: PlanFile, strict: Boolean = false) = PlanTree(true, strict, entries.toList())

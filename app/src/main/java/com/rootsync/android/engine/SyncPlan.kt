@@ -114,7 +114,8 @@ object SyncPlanner {
         role: SyncRole,
         rangeMode: SyncRangeMode,
         sinceEpochMillis: Long?,
-        untilEpochMillis: Long
+        untilEpochMillis: Long,
+        onProgress: (Int, Int) -> Unit = { _, _ -> }
     ): SyncPlan {
         require(local.strict == remote.strict) { "双方比较模式不同，请重新扫描" }
         require(rangeMode == SyncRangeMode.ALL || sinceEpochMillis != null) { "缺少起始时间" }
@@ -180,7 +181,10 @@ object SyncPlanner {
         }
         // O(n log n) sorting, O(total path length) validation and blocking. Every parent is
         // validated to exist as a directory in its own tree and sorts before its descendants.
-        for (path in (left.keys + right.keys).sorted()) {
+        val paths = (left.keys + right.keys).sorted()
+        onProgress(0, paths.size)
+        for ((index, path) in paths.withIndex()) {
+            if (index > 0 && index % 256 == 0) onProgress(index, paths.size)
             if (path.substringBeforeLast('/', "") in blockedPaths) {
                 blockedPaths += path
                 continue
@@ -207,6 +211,7 @@ object SyncPlanner {
                 }
             }
         }
+        onProgress(paths.size, paths.size)
         return SyncPlan(role, local, remote, result.toList(), untilEpochMillis)
     }
 

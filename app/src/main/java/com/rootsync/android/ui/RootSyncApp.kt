@@ -714,6 +714,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                 )
             }
         }
+        if (state.isPreviewing) PreviewProgressCard(state)
         if (!state.isSelectedPeerOnline && state.selectedPairedDeviceId != null) {
             Text(
                 "所选设备当前离线，差异预览、执行和继续传输已禁用。设备重新回应实时探测后才能开始。",
