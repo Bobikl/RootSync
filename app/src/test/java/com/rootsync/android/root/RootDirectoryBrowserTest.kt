@@ -33,6 +33,19 @@ class RootDirectoryBrowserTest {
         assertEquals(1, Regex("toybox base64").findAll(command).count())
         assertFalse(command.contains("toybox tr"))
         assertFalse(command.contains("encoded="))
+        assertEquals(1, Regex("/system/bin/printf ").findAll(command).count())
+        val loop = command.substringAfter("for entry in").substringBefore("done")
+        assertFalse(loop.contains("printf"))
+        assertTrue(loop.contains("set --"))
+    }
+
+    @Test fun fullBatchPreservesSpecialNamesAndCompletenessAtEveryOffset() {
+        val names = (0 until 100).map { "中文 $it ' \$HOME \t\n " }.toTypedArray()
+        for (offset in listOf(0, 100, 20000)) {
+            val page = RootDirectoryProtocol.parse(batch(*names, more = true), offset, 100)
+            assertEquals(names.map { storage + it }, page.directories)
+            assertEquals(offset + 100, page.nextOffset)
+        }
     }
 
     private val storage = RootDirectoryBrowser.STORAGE

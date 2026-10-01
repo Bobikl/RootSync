@@ -41,6 +41,7 @@ import com.rootsync.android.root.RootDirectoryProtocol
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 
@@ -66,6 +67,16 @@ fun RootFolderPicker(
     var page by remember { mutableStateOf<RootDirectoryPage?>(null) }
     var pageOffset by remember { mutableStateOf(0) }
     var busy by remember { mutableStateOf(false) }
+    var showBusy by remember { mutableStateOf(false) }
+    LaunchedEffect(busy) {
+        showBusy = false
+        if (busy) {
+            // Do not flash a loading row for cached/sub-200ms reads. Actual controls
+            // remain guarded by busy immediately, including final permission checks.
+            delay(200)
+            showBusy = true
+        }
+    }
     var ended by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var retryPath by remember { mutableStateOf(start) }
@@ -278,7 +289,7 @@ fun RootFolderPicker(
                         }
                     }
                 }
-                if (busy) {
+                if (busy && showBusy) {
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         CircularProgressIndicator()
                         Text("正在通过 ROOT 读取／校验…")

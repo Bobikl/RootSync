@@ -124,11 +124,12 @@ internal object RootDirectoryProtocol {
                 "${'$'}base"/*) current="/storage/emulated/0/${'$'}{physical#"${'$'}base"/}" ;;
                 *) exit 74 ;;
             esac
-            printf 'RFP2\n'
-            # One encoder for a whole page, not four child processes for every name.
-            # NUL framing preserves Unicode, spaces and embedded line breaks.
+            echo RFP2
+            # Android mksh printf is an EXTERNAL program, not a builtin. Collect names
+            # in positional parameters, then format and encode the entire page once.
+            # Never interpolate filenames into code or echo them; NUL framing is lossless.
             {
-                printf '%s\000' "${'$'}current"
+                set -- "${'$'}current"
                 n=0
                 count=0
                 more=0
@@ -143,13 +144,13 @@ internal object RootDirectoryProtocol {
                             more=1
                             break
                         fi
-                        printf '%s\000' "${'$'}{entry#./}"
+                        set -- "${'$'}@" "${'$'}{entry#./}"
                         count=${'$'}((count + 1))
                     done
                 fi
-                printf '\000END:%s\000' "${'$'}more"
+                /system/bin/printf '%s\000' "${'$'}@" '' "END:${'$'}more"
             } | /system/bin/toybox base64 -w 0 || exit 73
-            printf '\n'
+            echo
         """.trimIndent()
     }
 
