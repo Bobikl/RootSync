@@ -10,6 +10,31 @@ import org.junit.Test
 import java.util.Base64
 
 class RootDirectoryBrowserTest {
+    private fun batch(vararg names: String, more: Boolean = false): CommandResult {
+        val payload = (listOf(storage) + names + listOf("", "END:${if (more) 1 else 0}", "")).joinToString("\u0000")
+        return CommandResult(0, listOf("RFP2", encoded(payload)))
+    }
+    @Test fun batchEncodingMatchesLegacyForUnicodeAndControlCharacters() {
+        val names = arrayOf("中文", "a\nb", "尾空格 ", "a'b", "\$HOME;", ".hidden")
+        assertEquals(RootDirectoryProtocol.parse(response(*names), 0, 100),
+            RootDirectoryProtocol.parse(batch(*names), 0, 100))
+        assertEquals(102, RootDirectoryProtocol.parse(batch("a", "b", more = true), 100, 2).nextOffset)
+        assertTrue(RootDirectoryProtocol.parse(batch(), 0, 0).directories.isEmpty())
+    }
+    @Test fun batchRequiresCompleteFrameBoundedSizeAndUniqueNames() {
+        for (result in listOf(CommandResult(0, listOf("RFP2", encoded(storage))),
+                batch("a").copy(totalOutputLines = 9), batch("a", "a"),
+                CommandResult(0, listOf("RFP2", "A".repeat(65540))))) {
+            assertThrows(IllegalStateException::class.java) { RootDirectoryProtocol.parse(result, 0, 100) }
+        }
+    }
+    @Test fun pageUsesExactlyOneEncoderAndNoPerNameProcess() {
+        val command = RootDirectoryProtocol.command(storage, 0, 100)
+        assertEquals(1, Regex("toybox base64").findAll(command).count())
+        assertFalse(command.contains("toybox tr"))
+        assertFalse(command.contains("encoded="))
+    }
+
     private val storage = RootDirectoryBrowser.STORAGE
     private fun encoded(value: String) = Base64.getEncoder().encodeToString(value.toByteArray(Charsets.UTF_8))
     private fun response(vararg names: String, more: Boolean = false): CommandResult =

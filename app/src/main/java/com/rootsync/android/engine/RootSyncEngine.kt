@@ -52,6 +52,7 @@ data class DestinationDirectoryCheck(
 class RootSyncEngine(private val context: Context) {
     private val shell = RootShell()
     private val probeShell = RootShell()
+    private val storageShell = RootShell()
     private val controlShell = RootShell()
     private val watchdogShell = RootShell()
     private val runtimeDir = File(context.filesDir, "runtime").apply { mkdirs() }
@@ -1323,10 +1324,20 @@ class RootSyncEngine(private val context: Context) {
         return bytes.joinToString("") { "%02x".format(it.toInt() and 0xff) }
     }
 
-    fun availableStorageBytes(path: String): Long? {
-        if (SafeInput.validateStoragePath(path) != null) return null
-        return runCatching { StatFs(path).availableBytes.coerceAtLeast(0L) }.getOrNull()
-    }
+    suspend fun availableStorageBytes(path: String, onLog: (String) -> Unit = {}): Long? =
+        withContext(Dispatchers.IO) {
+            if (SafeInput.validateStoragePath(path) != null) return@withContext null
+            val direct = runCatching { StatFs(path).availableBytes }.getOrNull()?.takeIf { it >= 0 }
+            if (direct != null) return@withContext direct
+            onLog("SPACE_QUERY appStatFs=unavailable ROOT回退 path=$path")
+            val result = TimedProbe.run("ROOT剩余空间", 3_000, onLog) {
+                storageShell.execute(StorageSpaceProbe.command(path), maxCapturedLines = 16)
+            }
+            val available = StorageSpaceProbe.parse(result)
+            onLog(if (available != null) "SPACE_QUERY ROOT可用字节=$available path=$path"
+                else "SPACE_QUERY 失败 exit=${result.exitCode} detail=${result.text.take(300)}")
+            available
+        }
 
     fun localIpv4(): String = try {
         val connectivity = context.getSystemService(ConnectivityManager::class.java)

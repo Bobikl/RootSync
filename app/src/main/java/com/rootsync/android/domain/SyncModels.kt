@@ -72,7 +72,8 @@ data class PeerProfile(
     val rangeMode: SyncRangeMode = SyncRangeMode.ALL,
     val sinceEpochMillis: Long? = null,
     val sourcePath: String = SyncUiState.DEFAULT_BILI_PATH,
-    val destinationPath: String = SyncUiState.DEFAULT_BILI_PATH
+    val destinationPath: String = SyncUiState.DEFAULT_BILI_PATH,
+    val strictContentCheck: Boolean = false
 )
 
 data class DiscoveredDevice(
@@ -93,7 +94,8 @@ data class PairRequest(
     val controlToken: String,
     val role: SyncRole,
     val rangeMode: SyncRangeMode,
-    val sinceEpochMillis: Long?
+    val sinceEpochMillis: Long?,
+    val strictContentCheck: Boolean = false
 )
 
 data class PairAccepted(
@@ -105,7 +107,8 @@ data class PairAccepted(
     val controlToken: String,
     val role: SyncRole,
     val rangeMode: SyncRangeMode,
-    val sinceEpochMillis: Long?
+    val sinceEpochMillis: Long?,
+    val strictContentCheck: Boolean = false
 )
 
 data class TrustedPeerUpdate(
@@ -125,7 +128,8 @@ data class StrategyUpdate(
     val rangeMode: SyncRangeMode,
     val sinceEpochMillis: Long?,
     val requestId: String = "",
-    val revision: StrategyRevision = StrategyRevision()
+    val revision: StrategyRevision = StrategyRevision(),
+    val strictContentCheck: Boolean = false
 )
 
 data class SyncPrepareRequest(

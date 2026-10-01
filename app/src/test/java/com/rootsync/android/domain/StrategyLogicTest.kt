@@ -4,6 +4,45 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class StrategyLogicTest {
+    @Test fun rangeSinceAndComparisonConvergeFromEitherSide() {
+        val b = PeerProfile("b", "A", "A", "192.168.1.1", secret = "secret", role = SyncRole.RECEIVE_ONLY)
+        val fromA = StrategyUpdate("A", "A", "192.168.1.1", "secret", SyncRole.SEND_ONLY,
+            SyncRangeMode.SINCE, 1234, revision = StrategyRevision(9, "A"), strictContentCheck = true)
+        val changed = StrategyLogic.apply(b, fromA)
+        assertEquals(SyncRole.RECEIVE_ONLY, changed.role)
+        assertEquals(SyncRangeMode.SINCE, changed.rangeMode)
+        assertEquals(1234L, changed.sinceEpochMillis)
+        assertTrue(changed.strictContentCheck)
+        val back = StrategyUpdate("B", "B", "192.168.1.2", "secret", SyncRole.RECEIVE_ONLY,
+            SyncRangeMode.ALL, null, revision = StrategyRevision(10, "B"), strictContentCheck = false)
+        val a = StrategyLogic.apply(profile.copy(strictContentCheck = true), back)
+        assertEquals(SyncRole.SEND_ONLY, a.role)
+        assertEquals(SyncRangeMode.ALL, a.rangeMode)
+        assertFalse(a.strictContentCheck)
+    }
+    @Test fun equalRevisionWithDifferentComparisonCannotBeAcknowledged() {
+        val update = update().copy(strictContentCheck = true)
+        val applied = StrategyLogic.apply(profile, update)
+        assertEquals(StrategyLogic.Decision.DUPLICATE, StrategyLogic.receive(applied, update))
+        assertEquals(StrategyLogic.Decision.INVALID, StrategyLogic.receive(applied, update.copy(strictContentCheck = false)))
+    }
+    @Test fun preparationRequiresSameRangeDateAndComparison() {
+        val p = profile.copy(rangeMode = SyncRangeMode.SINCE, sinceEpochMillis = 100, strictContentCheck = true)
+        val q = SyncPrepareRequest("r", "B", "B", "192.168.1.2", "secret", SyncRole.RECEIVE_ONLY,
+            SyncRangeMode.SINCE, 100, 1000, false, p.strategyRevision, true)
+        assertTrue(StrategyLogic.matchesRequest(p, q))
+        assertFalse(StrategyLogic.matchesRequest(p, q.copy(strictChecksum = false)))
+        assertFalse(StrategyLogic.matchesRequest(p, q.copy(sinceEpochMillis = 101)))
+        assertFalse(StrategyLogic.matchesRequest(p, q.copy(rangeMode = SyncRangeMode.ALL)))
+    }
+    @Test fun strictConflictUsesRevisionOrderingNotLastArrival() {
+        val newer = update(counter = 5).copy(strictContentCheck = true)
+        val applied = StrategyLogic.apply(profile, newer)
+        assertEquals(StrategyLogic.Decision.STALE, StrategyLogic.receive(applied, update(counter = 4)))
+        assertEquals(profile.sourcePath, applied.sourcePath)
+        assertEquals(profile.destinationPath, applied.destinationPath)
+    }
+
     private val profile = PeerProfile("profile", "B", "设备", "192.168.1.2", secret = "secret",
         controlToken = "control", role = SyncRole.SEND_ONLY, sourcePath = "/source",
         destinationPath = "/destination", strategyRevision = StrategyRevision(2, "A"))

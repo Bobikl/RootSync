@@ -312,7 +312,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             remoteSecret = selected?.secret ?: preferences.getString("remoteSecret", "").orEmpty(),
             role = resolvedRole,
             rangeMode = selected?.rangeMode ?: fallbackRangeMode,
-            strictContentCheck = preferences.getBoolean("strictContentCheck", false),
+            strictContentCheck = selected?.strictContentCheck ?: preferences.getBoolean("strictContentCheck", false),
             sinceEpochMillis = if (selected != null) selected.sinceEpochMillis else fallbackSince,
             profiles = profiles,
             selectedProfileId = selected?.id,
@@ -438,28 +438,52 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun commitRole(profile: PeerProfile, value: SyncRole, revision: StrategyRevision? = null) {
         val updated = profile.copy(role = value, queuedRole = null, queuedRoleRevision = null)
-        if (!proposeStrategy(updated, revision)) return
-        _state.update {
-            if (it.selectedProfileId == profile.id) it.copy(role = value, previewReady = false) else it
-        }
-    }
-    fun setRangeMode(value: SyncRangeMode) {
-        updateConfig {
-            copy(
-                rangeMode = value,
-                sinceEpochMillis = if (value == SyncRangeMode.SINCE) {
-                    sinceEpochMillis ?: System.currentTimeMillis() - DEFAULT_RANGE_MILLIS
-                } else sinceEpochMillis,
-                previewReady = false
-            )
-        }
-    }
-    fun setSinceEpochMillis(value: Long) {
-        updateConfig { copy(sinceEpochMillis = value.coerceAtLeast(1L), previewReady = false) }
+        commitSharedOptions(updated, revision)
     }
 
-    fun setStrictContentCheck(enabled: Boolean) = updateConfig(profileDraft = false) {
-        copy(strictContentCheck = enabled, previewReady = false)
+    private fun commitSharedOptions(profile: PeerProfile, revision: StrategyRevision? = null) {
+        if (!proposeStrategy(profile, revision)) return
+        _state.update { state ->
+            if (state.selectedProfileId == profile.id) state.copy(role = profile.role,
+                rangeMode = profile.rangeMode, sinceEpochMillis = profile.sinceEpochMillis,
+                strictContentCheck = profile.strictContentCheck, previewReady = false) else state
+        }
+        saveConfig()
+    }
+
+    private fun changeSharedOptions(change: (SyncUiState) -> SyncUiState) {
+        if (strategyTaskActive()) { appendLog("INFO", "任务运行期间不能修改同步范围或比较方式"); return }
+        val current = _state.value
+        val changed = change(current)
+        val profile = current.profiles.firstOrNull { it.id == current.selectedProfileId }
+        _previewPlan.value = null
+        if (profile == null) {
+            updateConfig(profileDraft = false) { change(this) }
+            return
+        }
+        val updated = profile.copy(rangeMode = changed.rangeMode, sinceEpochMillis = changed.sinceEpochMillis,
+            strictContentCheck = changed.strictContentCheck)
+        if (updated != profile) commitSharedOptions(updated)
+    }
+
+    fun setRangeMode(value: SyncRangeMode) = changeSharedOptions { state ->
+        state.copy(rangeMode = value,
+            sinceEpochMillis = if (value == SyncRangeMode.SINCE)
+                state.sinceEpochMillis ?: System.currentTimeMillis() - DEFAULT_RANGE_MILLIS
+                else state.sinceEpochMillis,
+            previewReady = false)
+    }
+
+    fun setSinceEpochMillis(value: Long) {
+        if (value <= 0 || value > System.currentTimeMillis()) {
+            _state.update { it.copy(lastResult = "同步起始时间必须早于或等于当前时间") }
+            return
+        }
+        changeSharedOptions { it.copy(sinceEpochMillis = value, previewReady = false) }
+    }
+
+    fun setStrictContentCheck(enabled: Boolean) = changeSharedOptions {
+        it.copy(strictContentCheck = enabled, previewReady = false)
     }
 
     private fun updateConfig(
@@ -521,6 +545,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     confirmedStrategyRevision = null,
                     role = current.role,
                     rangeMode = current.rangeMode,
+                    strictContentCheck = current.strictContentCheck,
                     sinceEpochMillis = current.sinceEpochMillis,
                     sourcePath = current.sourcePath,
                     destinationPath = current.destinationPath
@@ -557,6 +582,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 remoteSecret = profile.secret,
                 role = profile.role,
                 rangeMode = profile.rangeMode,
+                strictContentCheck = profile.strictContentCheck,
                 sinceEpochMillis = profile.sinceEpochMillis,
                 sourcePath = profile.sourcePath,
                 destinationPath = profile.destinationPath,
@@ -579,6 +605,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 remoteSecret = "",
                 role = SyncRole.RECEIVE_ONLY,
                 rangeMode = SyncRangeMode.ALL,
+                strictContentCheck = false,
                 sinceEpochMillis = null,
                 transferRecord = null,
                 previewReady = false,
@@ -646,7 +673,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             device = device,
             role = current.role,
             rangeMode = current.rangeMode,
-            sinceEpochMillis = current.sinceEpochMillis
+            sinceEpochMillis = current.sinceEpochMillis,
+            strictContentCheck = current.strictContentCheck
         )
         _state.update { it.copy(lastResult = "等待 ${device.name} 确认连接") }
     }
@@ -672,7 +700,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         controlToken = controlToken,
         role = role.opposite(),
         rangeMode = rangeMode,
-        sinceEpochMillis = sinceEpochMillis
+        sinceEpochMillis = sinceEpochMillis,
+        strictContentCheck = strictContentCheck
     )
 
     private fun upsertPairedDevice(device: PairAccepted) {
@@ -691,6 +720,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             queuedRoleRevision = null,
             role = device.role,
             rangeMode = device.rangeMode,
+            strictContentCheck = device.strictContentCheck,
             sinceEpochMillis = device.sinceEpochMillis,
             destinationPath = existing.destinationPath
         ) ?: PeerProfile(
@@ -708,6 +738,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             queuedRoleRevision = null,
             role = device.role,
             rangeMode = device.rangeMode,
+            strictContentCheck = device.strictContentCheck,
             sinceEpochMillis = device.sinceEpochMillis,
             sourcePath = current.sourcePath,
             destinationPath = current.destinationPath
@@ -725,6 +756,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 remoteSecret = profile.secret,
                 role = profile.role,
                 rangeMode = profile.rangeMode,
+                strictContentCheck = profile.strictContentCheck,
                 sinceEpochMillis = profile.sinceEpochMillis,
                 sourcePath = profile.sourcePath,
                 destinationPath = profile.destinationPath,
@@ -792,7 +824,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         discovery.sendStrategy(
             host = profile.host, role = profile.role, rangeMode = profile.rangeMode,
             sinceEpochMillis = profile.sinceEpochMillis, expectedDeviceId = profile.deviceId,
-            revision = profile.strategyRevision
+            revision = profile.strategyRevision,
+            strictContentCheck = profile.strictContentCheck
         )
     }
 
@@ -834,9 +867,9 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             // Preserve all local paths and unrelated drafts. Only untouched strategy fields follow.
             state.copy(
                 role = if (selected) updated.role else state.role,
-                rangeMode = if (selected && state.rangeMode == existing.rangeMode) updated.rangeMode else state.rangeMode,
-                sinceEpochMillis = if (selected && state.sinceEpochMillis == existing.sinceEpochMillis)
-                    updated.sinceEpochMillis else state.sinceEpochMillis,
+                rangeMode = if (selected) updated.rangeMode else state.rangeMode,
+                sinceEpochMillis = if (selected) updated.sinceEpochMillis else state.sinceEpochMillis,
+                strictContentCheck = if (selected) updated.strictContentCheck else state.strictContentCheck,
                 previewReady = if (selected) false else state.previewReady
             )
         }
@@ -881,9 +914,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         remoteSessionDeviceId = request.deviceId
         remoteSessionStartedAtMillis = System.currentTimeMillis()
 
-        if (!isStrategyConfirmed(profile) || request.strategyRevision != profile.strategyRevision ||
-            request.role.opposite() != profile.role || request.rangeMode != profile.rangeMode ||
-            (profile.rangeMode == SyncRangeMode.SINCE && (request.rangeMode == SyncRangeMode.SINCE && request.sinceEpochMillis != profile.sinceEpochMillis))) {
+        if (!isStrategyConfirmed(profile) || !StrategyLogic.matchesRequest(profile, request)) {
             remoteSessionDeviceId = null
             discovery.answerSyncPreparation(request, false, "两端策略尚未确认一致，请等待策略同步", port)
             sendStrategyProfile(profile)
@@ -1041,11 +1072,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             appendLog("WARN", "已拒绝 ${request.name} 的无会话空间检查")
             return
         }
-        val availableBytes = engine.availableStorageBytes(if (profile.role == SyncRole.BIDIRECTIONAL) profile.sourcePath else profile.destinationPath)
+        val receivePath = if (profile.role == SyncRole.BIDIRECTIONAL) profile.sourcePath else profile.destinationPath
+        val availableBytes = engine.availableStorageBytes(receivePath, ::streamLog)
         if (availableBytes == null) {
             val message = "本机无法读取接收目录剩余空间"
             discovery.answerRemoteStorageCheck(request, false, message, 0L)
-            appendLog("ERROR", "$message：${profile.destinationPath}")
+            appendLog("ERROR", "$message：$receivePath")
             return
         }
         val requiredBytes = requiredStorageBytes(request.expectedDownloadBytes)
@@ -1526,6 +1558,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     current.serverSecret,
                     ::streamLog,
                     rangeMode = current.rangeMode,
+                    strictChecksum = current.strictContentCheck,
                     sinceEpochMillis = current.sinceEpochMillis,
                     untilEpochMillis = System.currentTimeMillis()
                 )
@@ -1716,9 +1749,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     } else {
                         var preflight = EngineResult(true, "空间检查通过")
                         if (plan.downloadBytes > 0) {
-                            val available = engine.availableStorageBytes(current.destinationPath)
+                            val available = engine.availableStorageBytes(current.destinationPath, ::streamLog)
                             val needed = requiredStorageBytes(plan.downloadBytes)
-                            if (available != null && available < needed) preflight = EngineResult(false,
+                            if (available == null) preflight = EngineResult(false, "本机无法读取接收目录剩余空间，未开始传输")
+                            else if (available < needed) preflight = EngineResult(false,
                                 "本机空间不足：需要 ${formatBytes(needed)}，可用 ${formatBytes(available)}")
                         }
                         if (preflight.success && plan.uploadBytes > 0 && profile != null && !profile.deviceId.startsWith("manual:")) {
@@ -2303,7 +2337,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             appendLine("selectedProfile=${current.profileName}/${current.selectedProfileId ?: "manual"}")
             appendLine("remote=${current.remoteHost}:${current.portText}")
             appendLine("role=${current.role.name}")
-            appendLine("range=${current.rangeMode.name} since=${current.sinceEpochMillis ?: "ALL"}")
+            appendLine("range=${current.rangeMode.name} since=${current.sinceEpochMillis ?: "ALL"} strict=${current.strictContentCheck}")
             appendLine("sourcePath=${current.sourcePath}")
             appendLine("destinationPath=${current.destinationPath}")
             appendLine("serverPort=${current.serverPortText} serverRunning=${current.serverRunning}")
@@ -2343,11 +2377,13 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                         put("deviceId", queued.deviceId); put("name", queued.name); put("host", queued.host)
                         put("secret", queued.secret); put("role", queued.role.name)
                         put("rangeMode", queued.rangeMode.name); put("sinceEpochMillis", queued.sinceEpochMillis)
+                        put("strictContentCheck", queued.strictContentCheck)
                         put("requestId", queued.requestId); put("revision", encodeRevision(queued.revision))
                     })
                 }
                 put("role", profile.role.name)
                 put("rangeMode", profile.rangeMode.name)
+                put("strictContentCheck", profile.strictContentCheck)
                 put("sinceEpochMillis", profile.sinceEpochMillis)
                 put("sourcePath", profile.sourcePath)
                 put("destinationPath", profile.destinationPath)
@@ -2385,21 +2421,26 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                             controlToken = item.optString("controlToken")
                                 .takeIf { it.length >= MIN_CONTROL_TOKEN_LENGTH }
                                 ?: legacyControlToken(secret),
-                            strategyRevision = decodeRevision(item.optJSONObject("strategyRevision")) ?: StrategyRevision(),
-                            confirmedStrategyRevision = decodeRevision(item.optJSONObject("confirmedStrategyRevision")),
+                            // Protocol 8 did not confirm comparison mode. Re-negotiate all legacy strategies.
+                            strategyRevision = if (item.has("strictContentCheck"))
+                                decodeRevision(item.optJSONObject("strategyRevision")) ?: StrategyRevision() else StrategyRevision(),
+                            confirmedStrategyRevision = if (item.has("strictContentCheck"))
+                                decodeRevision(item.optJSONObject("confirmedStrategyRevision")) else null,
                             queuedRoleRevision = decodeRevision(item.optJSONObject("queuedRoleRevision")),
                             queuedRole = item.optString("queuedRole").takeIf { it.isNotBlank() }?.let { SyncRole.valueOf(it) },
-                            queuedStrategy = item.optJSONObject("queuedStrategy")?.let { queued ->
+                            queuedStrategy = item.optJSONObject("queuedStrategy")?.takeIf { it.has("strictContentCheck") }?.let { queued ->
                                 StrategyUpdate(queued.getString("deviceId"), queued.getString("name"),
                                     queued.getString("host"), queued.getString("secret"),
                                     SyncRole.valueOf(queued.getString("role")),
                                     SyncRangeMode.valueOf(queued.getString("rangeMode")),
                                     queued.optLong("sinceEpochMillis", -1L).takeIf { it > 0 },
                                     queued.getString("requestId"),
-                                    decodeRevision(queued.optJSONObject("revision")) ?: StrategyRevision())
+                                    decodeRevision(queued.optJSONObject("revision")) ?: StrategyRevision(),
+                                    strictContentCheck = queued.optBoolean("strictContentCheck", false))
                             },
                             role = role,
                             rangeMode = rangeMode,
+                            strictContentCheck = item.optBoolean("strictContentCheck", preferences.getBoolean("strictContentCheck", false)),
                             sinceEpochMillis = since,
                             sourcePath = sourcePath,
                             destinationPath = migrateBiliPath(

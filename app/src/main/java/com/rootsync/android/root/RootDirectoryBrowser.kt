@@ -19,7 +19,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 data class RootDirectoryPage(
     val path: String,
     val directories: List<String>,
-    val nextOffset: Int?
+    val nextOffset: Int?,
+    val fromCache: Boolean = false
 )
 
 /**
@@ -32,14 +33,19 @@ class RootDirectoryBrowser : Closeable {
     private val shell = RootShell()
     private val closed = AtomicBoolean(false)
     private val mutex = Mutex()
+    private val cache = RootDirectoryCache()
 
-    suspend fun list(path: String, offset: Int = 0): RootDirectoryPage = mutex.withLock {
+    suspend fun list(path: String, offset: Int = 0, forceRefresh: Boolean = false): RootDirectoryPage = mutex.withLock {
+        currentCoroutineContext().ensureActive()
+        if (closed.get()) throw CancellationException("目录浏览器已关闭")
         require(offset >= 0 && offset <= Int.MAX_VALUE - PAGE_SIZE)
         val normalized = RootDirectoryProtocol.normalize(path)
+        if (forceRefresh) cache.invalidate(normalized)
+        else cache.get(normalized, offset)?.let { return@withLock it }
         val result = execute(RootDirectoryProtocol.command(normalized, offset, PAGE_SIZE))
         withContext(Dispatchers.Default) {
             RootDirectoryProtocol.parse(result, offset, PAGE_SIZE)
-        }
+        }.also { cache.put(normalized, offset, it) }
     }
 
     /** Rechecks physical containment and ROOT read/search access; optionally requires write access. */
@@ -70,6 +76,7 @@ class RootDirectoryBrowser : Closeable {
 
     override fun close() {
         closed.set(true)
+        cache.clear()
         shell.cancel()
     }
 
@@ -117,34 +124,32 @@ internal object RootDirectoryProtocol {
                 "${'$'}base"/*) current="/storage/emulated/0/${'$'}{physical#"${'$'}base"/}" ;;
                 *) exit 74 ;;
             esac
-            emit() {
-                encoded=${'$'}(printf '%s' "${'$'}2" | /system/bin/toybox base64) || exit 73
-                encoded=${'$'}(printf '%s' "${'$'}encoded" | /system/bin/toybox tr -d '\r\n') || exit 73
-                printf '%s:%s\n' "${'$'}1" "${'$'}encoded"
-            }
-            printf 'RFP1\n'
-            emit P "${'$'}current"
-            n=0
-            count=0
-            more=0
-            if [ $limit -gt 0 ]; then
-                # Disjoint globs include hidden directories, excluding dot and dot-dot.
-                # No recursion or raw filenames on stdout.
-                for entry in ./* ./.[!.]* ./..?*; do
-                    [ -d "${'$'}entry" ] || continue
-                    if [ "${'$'}n" -lt $offset ]; then
-                        n=${'$'}((n + 1))
-                        continue
-                    fi
-                    if [ "${'$'}count" -ge $limit ]; then
-                        more=1
-                        break
-                    fi
-                    emit D "${'$'}{entry#./}"
-                    count=${'$'}((count + 1))
-                done
-            fi
-            printf 'END:%s\n' "${'$'}more"
+            printf 'RFP2\n'
+            # One encoder for a whole page, not four child processes for every name.
+            # NUL framing preserves Unicode, spaces and embedded line breaks.
+            {
+                printf '%s\000' "${'$'}current"
+                n=0
+                count=0
+                more=0
+                if [ $limit -gt 0 ]; then
+                    for entry in ./* ./.[!.]* ./..?*; do
+                        [ -d "${'$'}entry" ] || continue
+                        if [ "${'$'}n" -lt $offset ]; then
+                            n=${'$'}((n + 1))
+                            continue
+                        fi
+                        if [ "${'$'}count" -ge $limit ]; then
+                            more=1
+                            break
+                        fi
+                        printf '%s\000' "${'$'}{entry#./}"
+                        count=${'$'}((count + 1))
+                    done
+                fi
+                printf '\000END:%s\000' "${'$'}more"
+            } | /system/bin/toybox base64 -w 0 || exit 73
+            printf '\n'
         """.trimIndent()
     }
 
@@ -160,6 +165,20 @@ internal object RootDirectoryProtocol {
             }
         }
         val lines = result.output
+        if (lines.firstOrNull() == "RFP2") {
+            check(result.totalOutputLines == 2 && lines.size == 2 && lines[1].length <= 65536) {
+                "目录响应不完整或过大"
+            }
+            val fields = decode(lines[1]).split('\u0000')
+            check(fields.size in 4..(limit + 4) && fields.last() == "" &&
+                fields[fields.size - 3] == "" && fields[fields.size - 2] in listOf("END:0", "END:1")) {
+                "目录分页响应不完整"
+            }
+            fun encode(value: String) = Base64.getEncoder().encodeToString(value.toByteArray(Charsets.UTF_8))
+            val framed = listOf("RFP1", "P:${encode(fields.first())}") +
+                fields.subList(1, fields.size - 3).map { "D:${encode(it)}" } + fields[fields.size - 2]
+            return parse(CommandResult(0, framed), offset, limit)
+        }
         check(result.totalOutputLines == lines.size &&
             lines.size in 3..(limit + 3) &&
             lines.first() == "RFP1" &&

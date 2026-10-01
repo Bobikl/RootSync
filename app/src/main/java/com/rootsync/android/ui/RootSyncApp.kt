@@ -586,7 +586,7 @@ private fun SyncPage(state: SyncUiState, viewModel: SyncViewModel, padding: Padd
                 }
             }
             Text(
-                "该范围同时适用于只发送、只接收和双向同步。",
+                "同步范围、起始时间和比较方式会自动同步到对端；本机目录仍独立保存。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )

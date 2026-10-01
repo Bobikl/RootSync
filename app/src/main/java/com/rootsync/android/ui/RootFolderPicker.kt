@@ -85,7 +85,7 @@ fun RootFolderPicker(
         }
     }
 
-    fun navigate(path: String, offset: Int = 0) {
+    fun navigate(path: String, offset: Int = 0, forceRefresh: Boolean = false) {
         if (busy || ended) return
         busy = true
         error = null
@@ -93,7 +93,7 @@ fun RootFolderPicker(
         retryOffset = offset
         scope.launch {
             try {
-                val loaded = browser.list(path, offset)
+                val loaded = browser.list(path, offset, forceRefresh)
                 if (!ended) {
                     page = loaded
                     pageOffset = offset
@@ -227,7 +227,7 @@ fun RootFolderPicker(
                         item {
                             Text(error.orEmpty(), color = MaterialTheme.colorScheme.error)
                             TextButton(
-                                onClick = { navigate(retryPath, retryOffset) },
+                                onClick = { navigate(retryPath, retryOffset, forceRefresh = true) },
                                 enabled = !busy && !ended
                             ) { Text("重新读取") }
                         }
@@ -258,7 +258,7 @@ fun RootFolderPicker(
                         }
                         item {
                             Text(
-                                "每页最多 ${RootDirectoryBrowser.PAGE_SIZE} 个目录；目录变化时请刷新。",
+                                (if (current.fromCache) "短时缓存 · " else "") + "每页最多 ${RootDirectoryBrowser.PAGE_SIZE} 个目录；目录变化时请刷新。",
                                 style = MaterialTheme.typography.bodySmall
                             )
                             Row {
@@ -271,7 +271,7 @@ fun RootFolderPicker(
                                     enabled = current.nextOffset != null && !busy && !ended
                                 ) { Text("下一页") }
                                 TextButton(
-                                    onClick = { navigate(current.path) },
+                                    onClick = { navigate(current.path, forceRefresh = true) },
                                     enabled = !busy && !ended
                                 ) { Text("刷新") }
                             }

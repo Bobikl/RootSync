@@ -227,11 +227,12 @@ class LanDiscoveryManager(
         device: DiscoveredDevice,
         role: SyncRole,
         rangeMode: SyncRangeMode,
-        sinceEpochMillis: Long?
+        sinceEpochMillis: Long?,
+        strictContentCheck: Boolean = false
     ) {
         start()
         val requestId = UUID.randomUUID().toString()
-        outgoingPairRequests[requestId] = PairIntent(role, rangeMode, sinceEpochMillis)
+        outgoingPairRequests[requestId] = PairIntent(role, rangeMode, sinceEpochMillis, strictContentCheck)
         requestCreatedTimes[requestId] = System.currentTimeMillis()
         val message = baseMessage(TYPE_PAIR_REQUEST)
             .put("requestId", requestId)
@@ -239,6 +240,7 @@ class LanDiscoveryManager(
             .put("controlToken", localControlToken())
             .put("role", role.name)
             .put("rangeMode", rangeMode.name)
+            .put("strictContentCheck", strictContentCheck)
         sinceEpochMillis?.let { message.put("sinceEpochMillis", it) }
         scope.launch {
             val address = InetAddress.getByName(device.host)
@@ -295,7 +297,8 @@ class LanDiscoveryManager(
         rangeMode: SyncRangeMode,
         sinceEpochMillis: Long?,
         expectedDeviceId: String,
-        revision: StrategyRevision
+        revision: StrategyRevision,
+        strictContentCheck: Boolean = false
     ) {
         if (!revision.valid || strategySending.putIfAbsent(expectedDeviceId, true) != null) return
         start()
@@ -311,6 +314,7 @@ class LanDiscoveryManager(
                     .put("controlToken", localControlToken())
                     .put("role", role.name)
                     .put("rangeMode", rangeMode.name)
+                    .put("strictContentCheck", strictContentCheck)
                     .put("strategyCounter", revision.counter)
                     .put("strategyWriter", revision.writerId)
                 sinceEpochMillis?.let { message.put("sinceEpochMillis", it) }
@@ -800,7 +804,7 @@ class LanDiscoveryManager(
         if (message.optInt("version") != PROTOCOL_VERSION) {
             val id = message.optString("deviceId")
             if (id.isNotBlank() && id != deviceId) {
-                if (id !in _incompatibleDevices.value) onLog("对方协议版本不兼容，请两端升级到支持协议 8 的版本")
+                if (id !in _incompatibleDevices.value) onLog("对方协议版本不兼容，请两端升级到支持协议 9 的版本")
                 _incompatibleDevices.value = _incompatibleDevices.value + id
             }
             return
@@ -848,7 +852,8 @@ class LanDiscoveryManager(
                             controlToken,
                             role,
                             rangeMode,
-                            since
+                            since,
+                            strictContentCheck = message.optBoolean("strictContentCheck", false)
                         )
                     )
                 }
@@ -871,7 +876,8 @@ class LanDiscoveryManager(
                             controlToken,
                             intent.role,
                             intent.rangeMode,
-                            intent.sinceEpochMillis
+                            intent.sinceEpochMillis,
+                            strictContentCheck = intent.strictContentCheck
                         )
                     )
                 }
@@ -941,7 +947,8 @@ class LanDiscoveryManager(
                             rangeMode,
                             since,
                             requestId,
-                            revision
+                            revision,
+                            strictContentCheck = message.optBoolean("strictContentCheck", false)
                         )
                     )
                 }
@@ -1232,7 +1239,7 @@ class LanDiscoveryManager(
         const val SCAN_WINDOW_MS = 8_000L
         private const val NSD_SERVICE_TYPE = "_rootsync._tcp."
         private const val MAGIC = "ROOTSYNC_LAN"
-        private const val PROTOCOL_VERSION = 8
+        private const val PROTOCOL_VERSION = 9
         private const val MIN_CONTROL_TOKEN_LENGTH = 32
         private const val UDP_SCAN_BURSTS = 3
         private const val UDP_SCAN_INTERVAL_MS = 700L
@@ -1277,7 +1284,8 @@ class LanDiscoveryManager(
     private data class PairIntent(
         val role: SyncRole,
         val rangeMode: SyncRangeMode,
-        val sinceEpochMillis: Long?
+        val sinceEpochMillis: Long?,
+        val strictContentCheck: Boolean
     )
 
     private data class CachedResponse(val payload: String, val createdAtMillis: Long)
